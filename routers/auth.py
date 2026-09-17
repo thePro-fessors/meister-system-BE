@@ -13,6 +13,10 @@ from database import get_db, get_redis
 from sr_format import *
 from core.security import create_access_token, get_current_user
 
+# 보안을 위하여 더미 데이터를 통한 보안 검증을 진행합니다.
+# DUMMY_HASH는 bcrypt 알고리즘을 통하여 "dummy_password"를 해시한 값입니다.
+DUMMY_HASH = "$2b$12$e86g5Y7hZ4k7l.W2j9X0..mK1N8p3R5s7T9v1X3z5B7d9F1h3J5l."
+
 router = APIRouter(
     prefix="/auth",
     tags=["auth", "database"],
@@ -41,21 +45,11 @@ async def login(req: LoginRequest, conn: asyncmy.Connection = Depends(get_db)):
         """
         await cur.execute(sql_cmd, (req.username,))
         user = await cur.fetchone()
-    if not user:
-        return JSONResponse(
-            status_code=401,
-            content=SrFormat(
-                status_code=401,
-                success=False,
-                data=None,
-                error=Error(
-                    code="INVALID_CREDENTIAL",
-                    message="아이디 혹은 비밀번호가 올바르지 않습니다."
-                )
-            ).model_dump()
-        )
 
-    if not pwd_context.verify(req.password, user["password"]):
+    hash_data = user["password"] if user else DUMMY_HASH
+    hash_valid = pwd_context.verify(req.password, hash_data)
+
+    if not user or not hash_valid:
         return JSONResponse(
             status_code=401,
             content=SrFormat(
@@ -168,3 +162,4 @@ async def logout(
         success=True,
         data={"message": "로그아웃되었습니다."}
     ).model_dump()
+1
