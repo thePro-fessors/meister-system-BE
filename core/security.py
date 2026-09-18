@@ -1,7 +1,8 @@
 import os
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict
+from enum import StrEnum
+from typing import Any, Callable, Dict, Sequence
 
 import jwt
 from fastapi import Depends, HTTPException
@@ -21,6 +22,13 @@ JWT_ALGORITHM = os.getenv("JWT_ALGORITHM", "HS256")
 ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "240"))
 
 security = HTTPBearer(auto_error=False)
+
+
+class UserRole(StrEnum):
+    """사용자 역할 열거형"""
+    STUDENT = "student"
+    TEACHER = "teacher"
+    ADMIN = "admin"
 
 
 def create_access_token(data: dict, expires_delta: timedelta | None = None) -> str:
@@ -142,3 +150,49 @@ async def get_current_user(
         "exp": payload.get("exp"),
         "token": token,
     }
+
+
+class RoleChecker:
+    """역할 기반 접근 제어 (RBAC) 검증기"""
+
+    def __init__(self, allowed_roles: Sequence[str | UserRole]):
+        self.allowed_roles = {str(r) for r in allowed_roles}
+
+    def __call__(self, current_user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
+        user_role = current_user.get("role")
+        if user_role not in self.allowed_roles:
+            raise HTTPException(
+                status_code=403,
+                detail=SrFormat(
+                    status_code=403,
+                    success=False,
+                    data=None,
+                    error=Error(
+                        code="FORBIDDEN",
+                        message="해당 리소스에 접근할 권한이 없습니다.",
+                    ),
+                ).model_dump(),
+            )
+        return current_user
+
+
+def require_roles(*roles: str | UserRole) -> Callable[..., Dict[str, Any]]:
+    """지정된 역할 목록 중 하나 이상을 가진 사용자만 접근을 허용하는 의존성 팩토리
+
+    예시:
+        @router.get("/admin/overview")
+        async def admin_overview(user: dict = Depends(require_roles(UserRole.ADMIN))):
+            ...
+
+        @router.get("/teacher/students")
+        async def get_students(user: dict = Depends(require_roles("teacher", "admin"))):
+            ...
+    """
+    return RoleChecker(roles)
+
+
+# 자주 사용되는 단축 의존성 (Pre-configured Dependencies)
+require_student = require_roles(UserRole.STUDENT)
+require_teacher = require_roles(UserRole.TEACHER)
+require_admin = require_roles(UserRole.ADMIN)
+require_staff = require_roles(UserRole.TEACHER, UserRole.ADMIN)
