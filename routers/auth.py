@@ -162,4 +162,3 @@ async def logout(
         success=True,
         data={"message": "로그아웃되었습니다."}
     ).model_dump()
-1
