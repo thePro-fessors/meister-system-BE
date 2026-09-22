@@ -47,6 +47,7 @@ async def login(req: LoginRequest, conn: asyncmy.Connection = Depends(get_db)):
         user = await cur.fetchone()
 
     hash_data = user["password"] if user else DUMMY_HASH
+    # 왜 비밀번호 검증을 여기서 할까? : bcrypt 알고리즘의 연산 시간을 기반으로 계정이 있는지 확인하는 공격법이 있다더라
     hash_valid = pwd_context.verify(req.password, hash_data)
 
     if not user or not hash_valid:
@@ -161,4 +162,81 @@ async def logout(
         status_code=200,
         success=True,
         data={"message": "로그아웃되었습니다."}
+    ).model_dump()
+
+@router.get("/me")
+async def get_my_info(
+        current_user: dict = Depends(get_current_user),
+        conn: asyncmy.Connection = Depends(get_db)
+):
+    user_uuid = current_user["uuid"]
+
+    async with conn.cursor(cursor=DictCursor) as cur:
+        sql_cmd = """
+            SELECT * FROM users
+            WHERE uuid = %s AND is_deleted = FALSE
+            LIMIT 1
+        """
+        await cur.execute(sql_cmd, (user_uuid,))
+        user = await cur.fetchone()
+        if not user:
+            return JSONResponse(
+                status_code=404,
+                content=SrFormat(
+                    status_code=404,
+                    success=False,
+                    data=None,
+                    error=Error(
+                        code="NOT_FOUND",
+                        message="유저를 찾을 수 없습니다."
+                    )
+                ).model_dump()
+            )
+    role_map = {0: "student", 1: "teacher", 2: "admin"}
+    role_str = role_map.get(user["role"], "student")
+
+    students, teachers = None, None
+
+    if user["role"] == 0:
+        async with conn.cursor(cursor=DictCursor) as cur:
+            sql_cmd = """
+                SELECT * FROM students s
+                LEFT JOIN student_academic_records sa 
+                    ON s.student_id = sa.student_id
+                    AND sa.year_id = (SELECT year_id FROM academic_years WHERE year = %s LIMIT 1)
+                WHERE s.uuid = %s AND s.is_deleted = FALSE                
+                LIMIT 1
+            """
+            await cur.execute(sql_cmd, (await get_current_year(), user_uuid))
+            students = await cur.fetchone()
+    elif user["role"] == 1:
+        async with conn.cursor(cursor=DictCursor) as cur:
+            sql_cmd = """
+                SELECT * FROM teachers
+                WHERE uuid = %s AND is_deleted = FALSE
+                LIMIT 1
+            """
+            await cur.execute(sql_cmd, (user_uuid,))
+            teachers = await cur.fetchone()
+
+    user_name = students["name"] if students else (teachers["name"] if teachers else user["id"])
+
+    return SrFormat(
+        status_code=200,
+        success=True,
+        data={
+            "user": {"uuid": user_uuid,
+                     "id": user["id"],
+                     "name": user_name,
+                     "email": user["email"],
+                     "schoolEmail": students["email"] if students else (teachers["email"] if teachers else None),
+                     "role": role_str,
+                     "studentId": students["student_id"] if students else None,
+                     "grade": students["grade"] if students else None,
+                     "classNo": students["class"] if students else None,
+                     "number": students["number"] if students else None,
+                     "teacherId": teachers["teachers_id"] if teachers else None,
+                     "homeroom": f"{teachers['grade']}-{teachers['class']}" if teachers and teachers["grade"] and teachers["class"] else None
+            }
+        }
     ).model_dump()
