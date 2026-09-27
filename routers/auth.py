@@ -1,4 +1,7 @@
 import uuid
+from typing import Optional
+import secrets
+from core.email import send_otp_email
 import asyncmy
 from asyncmy.cursors import DictCursor
 from fastapi import APIRouter, Query, HTTPException, Depends
@@ -238,5 +241,103 @@ async def get_my_info(
                      "teacherId": teachers["teachers_id"] if teachers else None,
                      "homeroom": f"{teachers['grade']}-{teachers['class']}" if teachers and teachers["grade"] and teachers["class"] else None
             }
+        }
+    ).model_dump()
+
+class SendOtpRequest(BaseModel):
+    student_grade:Optional[int]
+    student_class:Optional[int]
+    student_number:Optional[int] # 교사 요청건의 경우 위 3개를 무시하십시오.
+    is_it_student:bool = False
+    email:str
+
+@router.post('/send-otp')
+async def send_otp(req: SendOtpRequest, conn: asyncmy.Connection = Depends(get_db), redis: aioredis.Redis = Depends(get_redis)):
+    if not req.email:
+        return JSONResponse(
+            status_code=400,
+            content=SrFormat(
+                status_code=400,
+                success=False,
+                data=None,
+                error=Error(
+                    code="VALIDATION_ERROR",
+                    message="요청이 올바르지 않습니다."
+                )
+            ).model_dump()
+        )
+
+    clean_mail = req.email.strip().lower()
+
+    if not req.is_it_student:
+        async with conn.cursor(cursor=DictCursor) as cur:
+            sql_cmd = """
+            SELECT * FROM teachers t
+            WHERE email = %s AND is_deleted = FALSE
+            LIMIT 1
+            """
+            await cur.execute(sql_cmd, (req.email,))
+            datas = await cur.fetchone()
+    else:
+        async with conn.cursor(cursor=DictCursor) as cur:
+            sql_cmd="""
+            SELECT * FROM students s
+            JOIN student_academic_records sa
+                ON s.student_id = sa.student_id
+            WHERE s.email = %s AND s.is_deleted = FALSE
+                AND sa.year_id = (SELECT year_id FROM academic_years WHERE year = %s LIMIT 1)
+                AND sa.grade = %s AND sa.class = %s AND sa.number = %s
+            LIMIT 1
+            """
+            curr_year = await get_current_year()
+            await cur.execute(sql_cmd, (req.email, curr_year, req.student_grade, req.student_class, req.student_number))
+            datas = await cur.fetchone()
+
+    if not datas:
+        return JSONResponse(
+            status_code=404,
+            content=SrFormat(
+                status_code=404,
+                success=False,
+                data=None,
+                error=Error(
+                    code="NOT_FOUND",
+                    message="유저를 찾을 수 없거나, 요청이 잘못 되었습니다."
+                )
+            ).model_dump()
+        )
+    if datas.get("uuid") is not None:
+        return JSONResponse(
+            status_code=403,
+            content=SrFormat(
+                status_code=403,
+                success=False,
+                data=None,
+                error=Error(
+                    code="FORBIDDEN",
+                    message="이미 가입한 사용자입니다."
+                )
+            ).model_dump()
+        )
+
+    # TRNG를 이용한 난수 생성
+    otp_codes = f"{secrets.randbelow(1000000):06d}"
+    # 더 복잡한 암호화 (각 자리마다 0 ~ 9 중 택 1하여 선택. 10^6 확률)
+    # otp_codes = "".join(secrets.choice("0123456789") for _ in range(8))
+    await redis.setex(f"otp:{clean_mail}", 300, otp_codes)
+
+    # Email 발송
+    await send_otp_email(
+        to_email=clean_mail,
+        otp_code=otp_codes,
+        user_name=datas.get("name", "사용자")
+    )
+
+    return SrFormat(
+        status_code=200,
+        success=True,
+        data={
+            "message" : "Send codes",
+            "expiresIn": 300
         }
     ).model_dump()
