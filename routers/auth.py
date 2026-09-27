@@ -5,7 +5,7 @@ from core.email import send_otp_email
 import asyncmy
 from asyncmy.cursors import DictCursor
 from fastapi import APIRouter, Query, HTTPException, Depends
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 import hashlib
 from pydantic import BaseModel
 from fastapi.responses import JSONResponse
@@ -339,5 +339,104 @@ async def send_otp(req: SendOtpRequest, conn: asyncmy.Connection = Depends(get_d
         data={
             "message" : "Send codes",
             "expiresIn": 300
+        }
+    ).model_dump()
+
+class VerifyOtpRequest(BaseModel):
+    email:str
+    verify_code:str
+
+@router.post("/verify-otp")
+async def verify_otp(req: VerifyOtpRequest, redis: aioredis.Redis = Depends(get_redis)):
+    if not req.email or not req.verify_code:
+        return JSONResponse(
+            status_code=400,
+            content=SrFormat(
+                status_code=400,
+                success=False,
+                data=None,
+                error=Error(
+                    code="VALIDATION_ERROR",
+                    message="요청이 올바르지 않습니다."
+                )
+            ).model_dump()
+        )
+
+    clean_mail = req.email.strip().lower()
+    clean_code = req.verify_code.strip()
+
+    attempt_key = f"otp_attempts:{clean_mail}"
+    otp_key = f"otp:{clean_mail}"
+
+    stored_otp = await redis.get(otp_key)
+
+    if stored_otp is None:
+        return JSONResponse(
+            status_code=400,
+            content=SrFormat(
+                status_code=400,
+                success=False,
+                data=None,
+                error=Error(
+                    code="OTP_EXPIRED",
+                    message="인증번호가 만료되었거나, 발송되지 않았습니다."
+                )
+            ).model_dump()
+        )
+
+    attempts = await redis.incr(attempt_key)
+    if attempts == 1:
+        await redis.expire(attempt_key, 300)
+
+    if attempts > 5:
+        await redis.delete(otp_key)
+        await redis.delete(attempt_key)
+        return JSONResponse(
+            status_code=429,
+            content=SrFormat(
+                status_code=429,
+                success=False,
+                data=None,
+                error=Error(
+                    code="TOO_MANY_REQUESTS",
+                    message="인증번호 입력 횟수를 초과하였습니다."
+                )
+            ).model_dump()
+        )
+
+    if stored_otp != clean_code:
+        remain = 5-attempts
+        times = await  redis.ttl(otp_key)
+        return JSONResponse(
+            status_code=400,
+            content=SrFormat(
+                status_code=400,
+                success=False,
+                data={
+                    "remainingAttempts": remain,
+                    "remainingSeconds": max(0,times)
+                },
+                error=Error(
+                    code="INVALID_OTP",
+                    message="인증번호가 올바르지 않습니다."
+                )
+            ).model_dump()
+        )
+
+    await redis.delete(otp_key)
+    await redis.delete(attempt_key)
+
+    register_token = create_access_token(
+        data={"sub" : clean_mail, "type": "register"},
+        expires_delta=timedelta(minutes=10)
+    )
+
+    return SrFormat(
+        status_code=200,
+        success=True,
+        data={
+            "message" : "Verify OTP codes.",
+            "email" : clean_mail,
+            "registerToken" : register_token
         }
     ).model_dump()
