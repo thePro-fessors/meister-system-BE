@@ -9,7 +9,7 @@ from datetime import datetime, timezone, timedelta
 import hashlib
 from pydantic import BaseModel
 from fastapi.responses import JSONResponse
-from passlib.context import CryptContext
+import bcrypt
 import redis.asyncio as aioredis
 
 from database import get_db, get_redis
@@ -17,7 +17,7 @@ from sr_format import *
 from core.security import create_access_token, get_current_user
 
 # 보안을 위하여 더미 데이터를 통한 보안 검증을 진행합니다.
-# DUMMY_HASH는 bcrypt 알고리즘을 통하여 "dummy_password"를 해시한 값입니다.
+# DUMMY_HASH는 bcrypt 알고리즘을 통하여 "dummy_password"를 rounds=12로 해시한 값입니다.
 DUMMY_HASH = "$2b$12$e86g5Y7hZ4k7l.W2j9X0..mK1N8p3R5s7T9v1X3z5B7d9F1h3J5l."
 
 router = APIRouter(
@@ -25,7 +25,17 @@ router = APIRouter(
     tags=["auth", "database"],
 )
 
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+def hash_password(password: str) -> str:
+    """비밀번호를 bcrypt(rounds=12)로 안전하게 단방향 해싱합니다."""
+    salt = bcrypt.gensalt(rounds=12)
+    return bcrypt.hashpw(password.encode("utf-8"), salt).decode("utf-8")
+
+def verify_password(plain_password: str, hashed_password: str) -> bool:
+    """평문 비밀번호와 해시 비밀번호를 상시 일정한 시간으로 안전하게 대조합니다."""
+    try:
+        return bcrypt.checkpw(plain_password.encode("utf-8"), hashed_password.encode("utf-8"))
+    except Exception:
+        return False
 
 class LoginRequest(BaseModel):
     username: str
@@ -51,7 +61,7 @@ async def login(req: LoginRequest, conn: asyncmy.Connection = Depends(get_db)):
 
     hash_data = user["password"] if user else DUMMY_HASH
     # 왜 비밀번호 검증을 여기서 할까? : bcrypt 알고리즘의 연산 시간을 기반으로 계정이 있는지 확인하는 공격법이 있다더라
-    hash_valid = pwd_context.verify(req.password, hash_data)
+    hash_valid = verify_password(req.password, hash_data)
 
     if not user or not hash_valid:
         return JSONResponse(
