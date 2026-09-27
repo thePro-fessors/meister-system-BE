@@ -1,10 +1,13 @@
 import uuid
 from typing import Optional
 import secrets
+
+from starlette.background import BackgroundTask
+
 from core.email import send_otp_email
 import asyncmy
 from asyncmy.cursors import DictCursor
-from fastapi import APIRouter, Query, HTTPException, Depends
+from fastapi import APIRouter, Query, HTTPException, Depends, BackgroundTasks
 from datetime import datetime, timezone, timedelta
 import hashlib
 from pydantic import BaseModel
@@ -262,7 +265,7 @@ class SendOtpRequest(BaseModel):
     email:str
 
 @router.post('/send-otp')
-async def send_otp(req: SendOtpRequest, conn: asyncmy.Connection = Depends(get_db), redis: aioredis.Redis = Depends(get_redis)):
+async def send_otp(req: SendOtpRequest, background_tasks: BackgroundTasks, conn: asyncmy.Connection = Depends(get_db), redis: aioredis.Redis = Depends(get_redis)):
     if not req.email:
         return JSONResponse(
             status_code=400,
@@ -355,8 +358,8 @@ async def send_otp(req: SendOtpRequest, conn: asyncmy.Connection = Depends(get_d
     # otp_codes = "".join(secrets.choice("0123456789") for _ in range(8))
     await redis.setex(f"otp:{clean_mail}", 300, otp_codes)
 
-    # Email 발송
-    await send_otp_email(
+    background_tasks.add_task(
+        send_otp_email,
         to_email=clean_mail,
         otp_code=otp_codes,
         user_name=datas.get("name", "사용자")
