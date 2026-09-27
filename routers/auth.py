@@ -445,10 +445,8 @@ async def verify_otp(req: VerifyOtpRequest, redis: aioredis.Redis = Depends(get_
     await redis.delete(otp_key)
     await redis.delete(attempt_key)
 
-    register_token = create_access_token(
-        data={"sub" : clean_mail, "type": "register"},
-        expires_delta=timedelta(minutes=10)
-    )
+    register_token = secrets.token_urlsafe(32)
+    await redis.setex(f"register_token:{clean_mail}", 600, register_token)
 
     return SrFormat(
         status_code=200,
