@@ -1,11 +1,16 @@
+import os
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
+from dotenv import load_dotenv
 
 from database import init_db_pool, close_db_pool, init_redis_pool, close_redis_pool
 from routers.auth import router as auth_router
 from sr_format import Error, SrFormat
+
+load_dotenv()
 
 
 @asynccontextmanager
@@ -27,7 +32,33 @@ async def lifespan(app: FastAPI):
     await close_redis_pool()
 
 
-app = FastAPI(lifespan=lifespan)
+app = FastAPI(
+    title="Meister API",
+    description=".... --- -- .",
+    version="1.0.0",
+    lifespan=lifespan
+)
+
+# 🌐 CORS(Cross-Origin Resource Sharing) 설정
+# 환경 변수에 CORS_ORIGINS가 정의되어 있으면 콤마로 파싱하고, 없으면 기본 개발 주소 허용
+env_origins = os.getenv("CORS_ORIGINS")
+if env_origins:
+    origins = [origin.strip() for origin in env_origins.split(",") if origin.strip()]
+else:
+    origins = [
+        "http://localhost:3000",
+        "http://localhost:5173",
+        "http://127.0.0.1:3000",
+        "http://127.0.0.1:5173",
+    ]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # 라우터 등록
 app.include_router(auth_router)
