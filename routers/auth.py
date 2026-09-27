@@ -269,6 +269,25 @@ async def send_otp(req: SendOtpRequest, conn: asyncmy.Connection = Depends(get_d
 
     clean_mail = req.email.strip().lower()
 
+    times = await redis.ttl(f"email_cooldown:{clean_mail}")
+    if times > 0:
+        return JSONResponse(
+            status_code=429,
+            content=SrFormat(
+                status_code=429,
+                success=False,
+                data={
+                    "remainingSeconds": times,
+                },
+                error=Error(
+                    code="RATE_LIMIT_EXCEEDED",
+                    message="너무 많이 요청하였습니다."
+                )
+            ).model_dump()
+        )
+
+    await redis.setex(f"email_cooldown:{clean_mail}", 60, f"{datetime.now()}")
+
     if not req.is_it_student:
         async with conn.cursor(cursor=DictCursor) as cur:
             sql_cmd = """
@@ -406,7 +425,7 @@ async def verify_otp(req: VerifyOtpRequest, redis: aioredis.Redis = Depends(get_
 
     if stored_otp != clean_code:
         remain = 5-attempts
-        times = await  redis.ttl(otp_key)
+        times = await redis.ttl(otp_key)
         return JSONResponse(
             status_code=400,
             content=SrFormat(
