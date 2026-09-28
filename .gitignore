@@ -6,3 +6,5 @@ pyproject.toml
 .idea
 TODO.md
 SECURITY_AND_AUDIT.md
+__pycache__/
+*.pyc

@@ -2,8 +2,6 @@ import uuid
 from typing import Optional
 import secrets
 
-from starlette.background import BackgroundTask
-
 from core.email import send_otp_email
 import asyncmy
 from asyncmy.cursors import DictCursor
@@ -28,6 +26,9 @@ router = APIRouter(
     tags=["auth", "database"],
 )
 
+# 학년도 ID 메모리 캐시 (year -> year_id)
+_YEAR_ID_CACHE: dict[int, int] = {}
+
 def hash_password(password: str) -> str:
     """비밀번호를 bcrypt(rounds=12)로 안전하게 단방향 해싱합니다."""
     salt = bcrypt.gensalt(rounds=12)
@@ -50,6 +51,20 @@ async def get_current_year(date: datetime | None = None) -> int:
     if target.month < 3:
         return target.year - 1
     return target.year
+
+async def get_year_id(conn: asyncmy.Connection, year: int) -> int:
+    """학사년도(year)에 대응하는 year_id를 캐싱하여 불필요한 반복 서브쿼리를 방지합니다."""
+    global _YEAR_ID_CACHE
+    if year in _YEAR_ID_CACHE:
+        return _YEAR_ID_CACHE[year]
+
+    async with conn.cursor(cursor=DictCursor) as cur:
+        await cur.execute("SELECT year_id FROM academic_years WHERE year = %s LIMIT 1", (year,))
+        row = await cur.fetchone()
+        if row:
+            _YEAR_ID_CACHE[year] = row["year_id"]
+            return row["year_id"]
+    return 1  # 기본값 폴백
 
 @router.post("/login")
 async def login(req: LoginRequest, conn: asyncmy.Connection = Depends(get_db)):
@@ -83,8 +98,10 @@ async def login(req: LoginRequest, conn: asyncmy.Connection = Depends(get_db)):
     student_id = None
     students = None
     teachers = None
+    current_yr = await get_current_year(datetime.now())
 
     if user["role"] == 0:
+        year_id = await get_year_id(conn, current_yr)
         async with conn.cursor(cursor=DictCursor) as cur:
             sql_cmd = """
                 SELECT name, student_id AS id
@@ -97,9 +114,9 @@ async def login(req: LoginRequest, conn: asyncmy.Connection = Depends(get_db)):
                 sql_cmd = """
                     SELECT grade, class, number
                     FROM student_academic_records
-                    WHERE student_id = %s AND year_id = (SELECT year_id FROM academic_years WHERE year = %s)
+                    WHERE student_id = %s AND year_id = %s
                 """
-                await cur.execute(sql_cmd, (student_id["id"], await get_current_year(datetime.now())))
+                await cur.execute(sql_cmd, (student_id["id"], year_id))
                 students = await cur.fetchone()
     if user["role"] == 1:
         async with conn.cursor(cursor=DictCursor) as cur:
@@ -128,7 +145,7 @@ async def login(req: LoginRequest, conn: asyncmy.Connection = Depends(get_db)):
         success=True,
         data={
             "token": token,
-            "currentYear": await get_current_year(date=datetime.now()),
+            "currentYear": current_yr,
             "user": {
                 "uuid": user["uuid"],
                 "id": user["id"],
@@ -214,16 +231,18 @@ async def get_my_info(
     students, teachers = None, None
 
     if user["role"] == 0:
+        current_yr = await get_current_year()
+        year_id = await get_year_id(conn, current_yr)
         async with conn.cursor(cursor=DictCursor) as cur:
             sql_cmd = """
                 SELECT * FROM students s
                 LEFT JOIN student_academic_records sa 
                     ON s.student_id = sa.student_id
-                    AND sa.year_id = (SELECT year_id FROM academic_years WHERE year = %s LIMIT 1)
+                    AND sa.year_id = %s
                 WHERE s.uuid = %s AND s.is_deleted = FALSE                
                 LIMIT 1
             """
-            await cur.execute(sql_cmd, (await get_current_year(), user_uuid))
+            await cur.execute(sql_cmd, (year_id, user_uuid))
             students = await cur.fetchone()
     elif user["role"] == 1:
         async with conn.cursor(cursor=DictCursor) as cur:
@@ -258,11 +277,11 @@ async def get_my_info(
     ).model_dump()
 
 class SendOtpRequest(BaseModel):
-    student_grade:Optional[int]
-    student_class:Optional[int]
-    student_number:Optional[int] # 교사 요청건의 경우 위 3개를 무시하십시오.
-    is_it_student:bool = False
-    email:str
+    student_grade: Optional[int] = None
+    student_class: Optional[int] = None
+    student_number: Optional[int] = None # 교사 요청건의 경우 위 3개를 무시하십시오.
+    is_it_student: bool = False
+    email: str
 
 @router.post('/send-otp')
 async def send_otp(req: SendOtpRequest, background_tasks: BackgroundTasks, conn: asyncmy.Connection = Depends(get_db), redis: aioredis.Redis = Depends(get_redis)):
@@ -311,18 +330,19 @@ async def send_otp(req: SendOtpRequest, background_tasks: BackgroundTasks, conn:
             await cur.execute(sql_cmd, (req.email,))
             datas = await cur.fetchone()
     else:
+        current_yr = await get_current_year()
+        year_id = await get_year_id(conn, current_yr)
         async with conn.cursor(cursor=DictCursor) as cur:
-            sql_cmd="""
+            sql_cmd = """
             SELECT * FROM students s
             JOIN student_academic_records sa
                 ON s.student_id = sa.student_id
             WHERE s.email = %s AND s.is_deleted = FALSE
-                AND sa.year_id = (SELECT year_id FROM academic_years WHERE year = %s LIMIT 1)
+                AND sa.year_id = %s
                 AND sa.grade = %s AND sa.class = %s AND sa.number = %s
             LIMIT 1
             """
-            curr_year = await get_current_year()
-            await cur.execute(sql_cmd, (req.email, curr_year, req.student_grade, req.student_class, req.student_number))
+            await cur.execute(sql_cmd, (req.email, year_id, req.student_grade, req.student_class, req.student_number))
             datas = await cur.fetchone()
 
     if not datas:

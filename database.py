@@ -14,11 +14,11 @@ DB_CONFIG = {
     "password": os.getenv("DATABASE_PASSWORD"),
     "database": "swMeister",
     "autocommit": True,
-    "cursorclass": DictCursor
 }
 
 pool = None
 redis_pool = None
+redis_client: aioredis.Redis | None = None
 
 async def init_db_pool():
     global pool
@@ -36,26 +36,27 @@ async def get_db():
         yield conn
 
 async def init_redis_pool():
-    global redis_pool
+    global redis_pool, redis_client
     redis_url = os.getenv("REDIS_URL", "redis://:meister_redis_pw!@localhost:6379/0")
     redis_pool = aioredis.ConnectionPool.from_url(
         redis_url,
         decode_responses=True,
         max_connections=20
     )
+    redis_client = aioredis.Redis(connection_pool=redis_pool)
 
 async def close_redis_pool():
-    global redis_pool
+    global redis_pool, redis_client
+    if redis_client:
+        await redis_client.aclose()
+        redis_client = None
     if redis_pool:
         await redis_pool.disconnect()
         redis_pool = None
 
 async def get_redis() -> AsyncGenerator[aioredis.Redis, None]:
-    global redis_pool
-    if redis_pool is None:
+    """싱글톤 Redis 클라이언트를 재사용하여 연결 오버헤드를 최소화합니다."""
+    global redis_client
+    if redis_client is None:
         await init_redis_pool()
-    client = aioredis.Redis(connection_pool=redis_pool)
-    try:
-        yield client
-    finally:
-        await client.aclose()
+    yield redis_client
