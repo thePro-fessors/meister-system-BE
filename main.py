@@ -60,8 +60,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 라우터 등록
+# 라우터 등록: /auth 및 /api/auth 동시 지원 (FE 호환성 보장)
 app.include_router(auth_router)
+app.include_router(auth_router, prefix="/api")
 
 
 @app.exception_handler(HTTPException)

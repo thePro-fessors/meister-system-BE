@@ -15,6 +15,7 @@ CREATE TABLE certification_areas
 (
   area_id   INT         NOT NULL AUTO_INCREMENT COMMENT '인증 영역 고유 ID',
   year_id   INT         NOT NULL COMMENT '대상 학년도 ID',
+  grade     TINYINT     NOT NULL DEFAULT 1 COMMENT '대상 학년 (1, 2, 3)',
   name      VARCHAR(30) NOT NULL COMMENT '인증 영역',
   max_score INT         NOT NULL,
   PRIMARY KEY (area_id)
@@ -121,19 +122,22 @@ ALTER TABLE students
 
 CREATE TABLE submissions
 (
-  submission_id   INT          NOT NULL AUTO_INCREMENT COMMENT '증빙자료 고유 ID',
-  student_id      INT          NOT NULL COMMENT '학생 고유 ID',
-  item_id         INT          NOT NULL COMMENT '제출 대상 평가 항목',
-  activity_date   DATE         NULL     COMMENT '활동 및 취득일',
-  file_path       VARCHAR(500) NULL     COMMENT '파일 주소',
-  link_url        VARCHAR(500) NULL     COMMENT '링크 주소',
-  description     TEXT         NULL     COMMENT '학생의 설명',
-  status_code     TINYINT      NOT NULL DEFAULT 1 COMMENT '자료 상태 코드',
-  granted_score   DECIMAL(5,2) NULL     COMMENT '최종 점수',
-  reviewer_id     INT          NULL     COMMENT '검토 교사 ID',
-  teacher_comment TEXT         NULL     COMMENT '교사 의견',
-  created_at      DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  is_deleted      BOOL         NULL     DEFAULT FALSE COMMENT 'Soft Delete',
+  submission_id     INT          NOT NULL AUTO_INCREMENT COMMENT '증빙자료 고유 ID',
+  student_id        INT          NOT NULL COMMENT '학생 고유 ID',
+  item_id           INT          NOT NULL COMMENT '제출 대상 평가 항목',
+  detail            VARCHAR(200) NULL     COMMENT '세부 활동명 또는 자격명',
+  activity_date     DATE         NULL     COMMENT '활동 및 취득일',
+  file_path         VARCHAR(500) NULL     COMMENT '파일 저장 경로',
+  original_filename VARCHAR(255) NULL     COMMENT '업로드 원본 파일명',
+  link_url          VARCHAR(500) NULL     COMMENT '링크 주소',
+  description       TEXT         NULL     COMMENT '학생의 설명',
+  status_code       TINYINT      NOT NULL DEFAULT 1 COMMENT '자료 상태 코드',
+  granted_score     DECIMAL(5,2) NULL     COMMENT '최종 점수',
+  reviewer_id       INT          NULL     COMMENT '검토 교사 ID',
+  reviewed_at       DATETIME     NULL     COMMENT '교사 검토 일시',
+  teacher_comment   TEXT         NULL     COMMENT '교사 의견',
+  created_at        DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  is_deleted        BOOL         NULL     DEFAULT FALSE COMMENT 'Soft Delete',
   PRIMARY KEY (submission_id)
 ) COMMENT '증빙자료 관리 테이블';
 
@@ -298,4 +302,4 @@ CREATE INDEX IX_submissions_status_date
   ON submissions (status_code ASC, created_at DESC);
 
 ALTER TABLE student_academic_records ADD CONSTRAINT UQ_student_year UNIQUE (student_id, year_id);
-ALTER TABLE certification_areas ADD CONSTRAINT UQ_year_area_name UNIQUE (year_id, name);
+ALTER TABLE certification_areas ADD CONSTRAINT UQ_year_grade_area_name UNIQUE (year_id, grade, name);
