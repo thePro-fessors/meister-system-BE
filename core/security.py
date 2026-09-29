@@ -1,3 +1,13 @@
+"""
+core/security.py - JWT 인증, 토큰 수명 주기 관리 및 역할 기반 접근 제어(RBAC) 보안 모듈
+
+주요 기능:
+1. JWT Access Token 발급 및 무차별 대입 방지용 JTI(UUID) 삽입
+2. HTTP Bearer 인증 헤더 파싱 및 서명/만료시간 검증
+3. Redis O(1) 블랙리스트 조회를 통한 즉시 로그아웃 세션 무효화
+4. 선언적 RBAC(Role-Based Access Control) 의존성 팩토리 (`require_roles`, `require_student` 등)
+"""
+
 import os
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -15,32 +25,37 @@ from sr_format import Error, SrFormat
 
 load_dotenv()
 
+# ==============================================================================
+# 환경 변수 및 보안 키 설정 (Fail-Fast)
+# ==============================================================================
 JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY")
 if not JWT_SECRET_KEY:
-    raise RuntimeError("ALERT: JWT_SECRET_KEY doesn't exist")
+    raise RuntimeError("ALERT: JWT_SECRET_KEY 환경 변수가 설정되지 않았습니다.")
 JWT_ALGORITHM = os.getenv("JWT_ALGORITHM", "HS256")
 ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "240"))
 
+# auto_error=False로 설정하여 누락 시에도 FastAPI 기본 텍스트 대신 표준 SrFormat 401 JSON을 반환하도록 제어
 security = HTTPBearer(auto_error=False)
 
 
 class UserRole(StrEnum):
-    """사용자 역할 열거형"""
+    """시스템 내 사용자 권한 역할(Role) 열거형"""
     STUDENT = "student"
     TEACHER = "teacher"
     ADMIN = "admin"
 
 
 def create_access_token(data: dict, expires_delta: timedelta | None = None) -> str:
-    """JWT Access Token 발급
+    """
+    사용자 인증 후 전달할 JWT Access Token을 발급합니다.
 
-    요구 필드:
-      - sub: user["uuid"]
-      - id: user["id"]
-      - role: 문자열 ("student", "teacher", "admin")
-      - jti: 고유 UUID
+    페이로드 구성:
+      - sub: user["uuid"] (사용자 고유 UUID)
+      - id: user["id"] (로그인 아이디)
+      - role: "student" | "teacher" | "admin"
+      - jti: 고유 UUID4 (Redis 블랙리스트 등록 및 토큰 고유 식별용)
       - exp: 만료 시각 (기본 240분)
-      - iat: 발급 시각
+      - iat: 발급 시각 (UTC 타임스탬프)
     """
     to_encode = data.copy()
     now = datetime.now(timezone.utc)
@@ -62,7 +77,15 @@ async def get_current_user(
     credentials: HTTPAuthorizationCredentials | None = Depends(security),
     redis: aioredis.Redis = Depends(get_redis),
 ) -> Dict[str, Any]:
-    """JWT 토큰 검증 및 Redis 블랙리스트 확인 의존성"""
+    """
+    FastAPI 의존성 주입용: 요청 헤더의 JWT 토큰을 파싱하고 유효성 및 블랙리스트 등록 여부를 검증합니다.
+    
+    검증 절차:
+    1. Authorization Bearer 헤더 존재 여부 확인 (미존재 시 401 UNAUTHORIZED)
+    2. JWT 서명 위조 및 만료 시간(exp) 확인 (만료 시 401 UNAUTHORIZED)
+    3. 페이로드 내 jti 추출 및 Redis 블랙리스트 키(`blacklist:{jti}`) 존재 여부 O(1) 검사
+    4. 검증 완료 시 사용자 식별 정보 딕셔너리 반환
+    """
     if not credentials or not credentials.credentials:
         raise HTTPException(
             status_code=401,
@@ -123,7 +146,7 @@ async def get_current_user(
             ).model_dump(),
         )
 
-    # Redis 블랙리스트 키 확인: O(1)
+    # Redis 블랙리스트 키 확인: O(1) 초고속 조회
     is_revoked = await redis.get(f"blacklist:{jti}")
     if is_revoked:
         raise HTTPException(
@@ -153,7 +176,12 @@ async def get_current_user(
 
 
 class RoleChecker:
-    """역할 기반 접근 제어 (RBAC) 검증기"""
+    """
+    선언적 역할 기반 접근 제어 (RBAC) 검증 클래스
+    
+    허용된 역할 목록(allowed_roles)을 받아 현재 사용자의 role과 대조하며,
+    권한이 없을 경우 403 FORBIDDEN 표준 에러를 발생시킵니다.
+    """
 
     def __init__(self, allowed_roles: Sequence[str | UserRole]):
         self.allowed_roles = {str(r) for r in allowed_roles}
@@ -177,9 +205,10 @@ class RoleChecker:
 
 
 def require_roles(*roles: str | UserRole) -> Callable[..., Dict[str, Any]]:
-    """지정된 역할 목록 중 하나 이상을 가진 사용자만 접근을 허용하는 의존성 팩토리
+    """
+    지정된 역할 목록 중 하나 이상을 가진 사용자만 접근을 허용하는 의존성 팩토리 함수
 
-    예시:
+    사용 예시:
         @router.get("/admin/overview")
         async def admin_overview(user: dict = Depends(require_roles(UserRole.ADMIN))):
             ...
@@ -191,7 +220,9 @@ def require_roles(*roles: str | UserRole) -> Callable[..., Dict[str, Any]]:
     return RoleChecker(roles)
 
 
-# 자주 사용되는 단축 의존성 (Pre-configured Dependencies)
+# ==============================================================================
+# 사전 구성된 단축 의존성 (Pre-configured Shortcut Dependencies)
+# ==============================================================================
 require_student = require_roles(UserRole.STUDENT)
 require_teacher = require_roles(UserRole.TEACHER)
 require_admin = require_roles(UserRole.ADMIN)
