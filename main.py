@@ -8,6 +8,7 @@ from dotenv import load_dotenv
 
 from database import init_db_pool, close_db_pool, init_redis_pool, close_redis_pool
 from routers.auth import router as auth_router
+from routers.students import router as students_router
 from sr_format import Error, SrFormat
 
 load_dotenv()
@@ -64,6 +65,9 @@ app.add_middleware(
 app.include_router(auth_router)
 app.include_router(auth_router, prefix="/api")
 
+# 학생 업무 라우터 등록 (/api/students)
+app.include_router(students_router)
+
 
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request: Request, exc: HTTPException):
@@ -83,21 +87,17 @@ async def http_exception_handler(request: Request, exc: HTTPException):
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
     first_error = exc.errors()[0] if exc.errors() else {}
-    field = " -> ".join([str(loc) for loc in first_error.get("loc", [])])
-    reason = first_error.get("msg", "입력값이 올바르지 않습니다.")
-
-    detail = f"{field}: {reason}" if field else reason
-
+    msg = first_error.get("msg", "입력 데이터 유효성 검증 실패")
+    field = ".".join(str(x) for x in first_error.get("loc", []))
     return JSONResponse(
         status_code=400,
         content=SrFormat(
             status_code=400,
             success=False,
-            error=Error(code="VALIDATION_ERROR", message=detail),
+            data=None,
+            error=Error(
+                code="VALIDATION_ERROR",
+                message=f"[{field}] {msg}"
+            )
         ).model_dump(),
     )
-
-
-@app.get("/")
-async def root():
-    return SrFormat(status_code=200, success=True, data={"What am I": "I am nothing"})
