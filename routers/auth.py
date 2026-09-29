@@ -1,3 +1,4 @@
+import re
 import uuid
 from typing import Optional
 import secrets
@@ -488,5 +489,190 @@ async def verify_otp(req: VerifyOtpRequest, redis: aioredis.Redis = Depends(get_
             "message" : "Verify OTP codes.",
             "email" : clean_mail,
             "registerToken" : register_token
+        }
+    ).model_dump()
+
+class RegisterRequest(BaseModel):
+    email: str
+    password: str
+    id: str
+    register_token: str
+    role: Optional[int] = None  # 클라이언트가 임의로 보내더라도 서버 판별값으로 덮어씌워 무시됨
+
+# 비밀번호 정규식: 최소 8자 이상, 영문자 1개 이상 및 숫자 1개 이상 포함
+PASSWORD_REGEX = re.compile(r"^(?=.*[A-Za-z])(?=.*\d).{8,}$")
+
+@router.post("/register")
+async def register_user(
+    req: RegisterRequest, 
+    redis: aioredis.Redis = Depends(get_redis), 
+    conn: asyncmy.Connection = Depends(get_db)
+):
+    if not req.email or not req.password or not req.id or not req.register_token:
+        return JSONResponse(
+            status_code=400,
+            content=SrFormat(
+                status_code=400,
+                success=False,
+                data=None,
+                error=Error(
+                    code="VALIDATION_ERROR",
+                    message="필수 인자가 누락되었습니다."
+                )
+            ).model_dump()
+        )
+
+    # 비밀번호 복잡도 정규식 검증 (최소 8자, 영문 + 숫자 조합)
+    if not PASSWORD_REGEX.match(req.password):
+        return JSONResponse(
+            status_code=400,
+            content=SrFormat(
+                status_code=400,
+                success=False,
+                data=None,
+                error=Error(
+                    code="WEAK_PASSWORD",
+                    message="비밀번호는 최소 8자 이상이어야 하며 영문자와 숫자를 각각 1개 이상 포함해야 합니다."
+                )
+            ).model_dump()
+        )
+
+    clean_mail = req.email.strip().lower()
+    stored_token = await redis.get(f"register_token:{clean_mail}")
+    if stored_token is None or stored_token != req.register_token:
+        return JSONResponse(
+            status_code=401,
+            content=SrFormat(
+                status_code=401,
+                success=False,
+                data=None,
+                error=Error(
+                    code="INVALID_REGISTER_TOKEN",
+                    message="토큰이 만료되었거나, 올바르지 않습니다."
+                )
+            ).model_dump()
+        )
+
+    # 1. 서버 기반 권한(Role) 확정 판별 (클라이언트의 권한 상승 위조 원천 방어)
+    determined_role = None
+    target_table = None
+
+    async with conn.cursor(cursor=DictCursor) as cur:
+        # 학생 사전 등록 명단 확인
+        await cur.execute("SELECT student_id, uuid FROM students WHERE email = %s AND is_deleted = FALSE LIMIT 1", (clean_mail,))
+        student_row = await cur.fetchone()
+        if student_row:
+            if student_row.get("uuid") is not None:
+                return JSONResponse(
+                    status_code=403,
+                    content=SrFormat(
+                        status_code=403,
+                        success=False,
+                        data=None,
+                        error=Error(
+                            code="FORBIDDEN",
+                            message="이미 가입된 사용자입니다."
+                        )
+                    ).model_dump()
+                )
+            determined_role = 0
+            target_table = "students"
+        else:
+            # 교사 사전 등록 명단 확인
+            await cur.execute("SELECT teachers_id, uuid FROM teachers WHERE email = %s AND is_deleted = FALSE LIMIT 1", (clean_mail,))
+            teacher_row = await cur.fetchone()
+            if teacher_row:
+                if teacher_row.get("uuid") is not None:
+                    return JSONResponse(
+                        status_code=403,
+                        content=SrFormat(
+                            status_code=403,
+                            success=False,
+                            data=None,
+                            error=Error(
+                                code="FORBIDDEN",
+                                message="이미 가입된 사용자입니다."
+                            )
+                        ).model_dump()
+                    )
+                determined_role = 1
+                target_table = "teachers"
+            else:
+                return JSONResponse(
+                    status_code=404,
+                    content=SrFormat(
+                        status_code=404,
+                        success=False,
+                        data=None,
+                        error=Error(
+                            code="NOT_FOUND",
+                            message="사전 등록된 학생 또는 교사 명단에서 이메일을 찾을 수 없습니다."
+                        )
+                    ).model_dump()
+                )
+
+        # 2. 아이디 중복 검사
+        await cur.execute("SELECT uuid FROM users WHERE id = %s LIMIT 1", (req.id,))
+        if await cur.fetchone():
+            return JSONResponse(
+                status_code=409,
+                content=SrFormat(
+                    status_code=409,
+                    success=False,
+                    data=None,
+                    error=Error(
+                        code="DUPLICATE_ID",
+                        message="이미 사용 중인 아이디입니다."
+                    )
+                ).model_dump()
+            )
+
+    await redis.delete(f"register_token:{clean_mail}")
+
+    user_uuid = str(uuid.uuid4())
+    user_pw = hash_password(req.password)
+
+    try:
+        await conn.autocommit(False)
+        async with conn.cursor(cursor=DictCursor) as cur:
+            sql_cmd = """
+                INSERT INTO users (uuid, id, password, email, role) 
+                VALUES (%s, %s, %s, %s, %s)
+            """
+            await cur.execute(sql_cmd, (user_uuid, req.id, user_pw, clean_mail, determined_role))
+
+            sql_cmd = f"""
+                UPDATE {target_table} SET uuid = %s
+                WHERE email = %s AND is_deleted = FALSE
+            """
+            await cur.execute(sql_cmd, (user_uuid, clean_mail))
+
+        await conn.commit()
+    except Exception as e:
+        await conn.rollback()
+        return JSONResponse(
+            status_code=500,
+            content=SrFormat(
+                status_code=500,
+                success=False,
+                data=None,
+                error=Error(
+                    code="DATABASE_ERROR",
+                    message="회원가입 처리 중 데이터베이스 오류가 발생했습니다."
+                )
+            ).model_dump()
+        )
+    finally:
+        await conn.autocommit(True)
+
+    return SrFormat(
+        status_code=200,
+        success=True,
+        data={
+            "message": "회원가입이 완료되었습니다.",
+            "uuid": user_uuid,
+            "id": req.id,
+            "email": clean_mail,
+            "role": "student" if determined_role == 0 else "teacher"
         }
     ).model_dump()
