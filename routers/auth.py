@@ -676,3 +676,140 @@ async def register_user(
             "role": "student" if determined_role == 0 else "teacher"
         }
     ).model_dump()
+
+class PatchEmailRequest(BaseModel):
+    email: str
+    password: str
+    register_token: str
+
+@router.patch("/email")
+async def patch_email(
+    req: PatchEmailRequest, 
+    current_user: dict = Depends(get_current_user), 
+    conn: asyncmy.Connection = Depends(get_db), 
+    redis: aioredis.Redis = Depends(get_redis)
+):
+    uuid = current_user["uuid"]
+
+    if not req.email or not req.password or not req.register_token:
+        return JSONResponse(
+            status_code=400,
+            content=SrFormat(
+                status_code=400,
+                success=False,
+                data=None,
+                error=Error(
+                    code="VALIDATION_ERROR",
+                    message="필수 인자가 누락되었습니다."
+                )
+            ).model_dump()
+        )
+
+    clean_mail = req.email.strip().lower()
+
+    # 1. 새 이메일 인증 토큰 검증
+    stored_token = await redis.get(f"register_token:{clean_mail}")
+    if stored_token is None or stored_token != req.register_token:
+        return JSONResponse(
+            status_code=401,
+            content=SrFormat(
+                status_code=401,
+                success=False,
+                data=None,
+                error=Error(
+                    code="INVALID_REGISTER_TOKEN",
+                    message="토큰이 만료되었거나, 올바르지 않습니다."
+                )
+            ).model_dump()
+        )
+
+    # 2. 이메일 중복 및 사용자/비밀번호 검증
+    async with conn.cursor(cursor=DictCursor) as cur:
+        await cur.execute("SELECT uuid FROM users WHERE email = %s AND is_deleted = FALSE LIMIT 1", (clean_mail,))
+        existing_user = await cur.fetchone()
+
+        await cur.execute("SELECT * FROM users WHERE uuid = %s AND is_deleted = FALSE LIMIT 1", (uuid,))
+        user_data = await cur.fetchone()
+
+    if existing_user is not None:
+        return JSONResponse(
+            status_code=409,
+            content=SrFormat(
+                status_code=409,
+                success=False,
+                data=None,
+                error=Error(
+                    code="DUPLICATE_EMAIL",
+                    message="이미 사용중인 이메일입니다."
+                )
+            ).model_dump()
+        )
+
+    if user_data is None:
+        return JSONResponse(
+            status_code=404,
+            content=SrFormat(
+                status_code=404,
+                success=False,
+                data=None,
+                error=Error(
+                    code="NOT_FOUND",
+                    message="사용자를 찾을 수 없습니다."
+                )
+            ).model_dump()
+        )
+
+    if not verify_password(req.password, user_data["password"]):
+        return JSONResponse(
+            status_code=401,
+            content=SrFormat(
+                status_code=401,
+                success=False,
+                data=None,
+                error=Error(
+                    code="INVALID_CREDENTIAL",
+                    message="비밀번호가 일치하지 않습니다."
+                )
+            ).model_dump()
+        )
+
+    # 3. 모든 검증 통과 후 1회용 토큰 파기
+    await redis.delete(f"register_token:{clean_mail}")
+
+    # 4. 트랜잭션 기반 이메일 업데이트
+    try:
+        await conn.autocommit(False)
+        async with conn.cursor(cursor=DictCursor) as cur:
+            sql_cmd = """
+                UPDATE users SET email = %s
+                WHERE uuid = %s AND is_deleted = FALSE
+            """
+            await cur.execute(sql_cmd, (clean_mail, uuid))
+
+        await conn.commit()
+    except Exception as e:
+        await conn.rollback()
+        return JSONResponse(
+            status_code=500,
+            content=SrFormat(
+                status_code=500,
+                success=False,
+                data=None,
+                error=Error(
+                    code="DATABASE_ERROR",
+                    message="이메일 업데이트 중 데이터베이스 오류가 발생했습니다."
+                )
+            ).model_dump()
+        )
+    finally:
+        await conn.autocommit(True)
+
+    return SrFormat(
+        status_code=200,
+        success=True,
+        data={
+            "message": "이메일 변경이 완료되었습니다.",
+            "uuid": uuid,
+            "email": clean_mail,
+        }
+    ).model_dump()
