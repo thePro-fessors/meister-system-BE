@@ -4,15 +4,18 @@ import dotenv
 import os
 import redis.asyncio as aioredis
 from typing import AsyncGenerator
+import logging
+
+logger = logging.getLogger("meister.database")
 
 dotenv.load_dotenv()
 
 DB_CONFIG = {
-    "host": "localhost",
-    "port": 3306,
-    "user": "wantogohome",
+    "host": os.getenv("DATABASE_HOST", "localhost"),
+    "port": int(os.getenv("DATABASE_PORT", "3306")),
+    "user": os.getenv("DATABASE_USER", "wantogohome"),
     "password": os.getenv("DATABASE_PASSWORD"),
-    "database": "swMeister",
+    "database": os.getenv("DATABASE_NAME", "swMeister"),
     "autocommit": True,
 }
 
@@ -33,7 +36,13 @@ async def close_db_pool():
 
 async def get_db():
     async with pool.acquire() as conn:
-        yield conn
+        try:
+            yield conn
+        finally:
+            try:
+                await conn.autocommit(True)
+            except Exception:
+                pass
 
 async def init_redis_pool():
     global redis_pool, redis_client
