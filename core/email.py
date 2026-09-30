@@ -5,7 +5,8 @@ import aiosmtplib
 import httpx
 from dotenv import load_dotenv
 
-from core.logger import log_otp
+from core.logger import log_otp, logger
+import html as html_module
 
 load_dotenv()
 
@@ -26,6 +27,8 @@ BREVO_SENDER_EMAIL = os.getenv("BREVO_SENDER_EMAIL", "")
 
 def _create_otp_html(otp_code: str, user_name: str = "사용자") -> str:
     """OTP 이메일 HTML 본문 템플릿"""
+    # [보안 1.3] HTML Injection 방어: 사용자 이름 내 특수문자 이스케이프
+    user_name = html_module.escape(user_name)
     return f"""
     <!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd">
 <html xmlns="http://www.w3.org/1999/xhtml" lang="ko">
@@ -216,12 +219,18 @@ async def send_otp_email(to_email: str, otp_code: str, user_name: str = "사용�
         log_otp(to_email, otp_code)
         return
 
-    if EMAIL_PROVIDER == "smtp":
-        await _send_via_smtp(to_email, subject, html_content)
-        return
+    try:
+        if EMAIL_PROVIDER == "smtp":
+            await _send_via_smtp(to_email, subject, html_content)
+            return
 
-    if EMAIL_PROVIDER == "brevo":
-        await _send_via_brevo(to_email, subject, html_content)
-        return
+        if EMAIL_PROVIDER == "brevo":
+            await _send_via_brevo(to_email, subject, html_content)
+            return
 
-    raise ValueError(f"지원하지 않는 EMAIL_PROVIDER입니다: {EMAIL_PROVIDER}")
+        raise ValueError(f"지원하지 않는 EMAIL_PROVIDER입니다: {EMAIL_PROVIDER}")
+    except Exception as exc:
+        logger.critical(
+            f"[MAIL_DISPATCH_FAILURE] 이메일 발송 실패: to={to_email}, provider={EMAIL_PROVIDER}, error={exc}",
+            extra={"extra_data": {"type": "MAIL_FAILURE", "to": to_email, "provider": EMAIL_PROVIDER, "error": str(exc)}}
+        )
