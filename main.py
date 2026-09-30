@@ -5,6 +5,10 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
+import logging
+import traceback
+
+logger = logging.getLogger("meister.main")
 
 from database import init_db_pool, close_db_pool, init_redis_pool, close_redis_pool
 from routers.auth import router as auth_router
@@ -20,11 +24,13 @@ async def lifespan(app: FastAPI):
     try:
         await init_db_pool()
     except Exception as e:
-        print(f"[Warning] Failed to initialize DB pool: {e}")
+        logger.critical(f"[FATAL] DB 커넥션 풀 초기화 실패 - 서버를 시작할 수 없습니다: {e}")
+        raise
     try:
         await init_redis_pool()
     except Exception as e:
-        print(f"[Warning] Failed to initialize Redis pool: {e}")
+        logger.critical(f"[FATAL] Redis 커넥션 풀 초기화 실패 - 서버를 시작할 수 없습니다: {e}")
+        raise
 
     yield
 
@@ -60,6 +66,18 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# 🔒 보안 응답 헤더 미들웨어 (SECURITY_AND_AUDIT.md 1.7)
+@app.middleware("http")
+async def add_security_headers(request: Request, call_next):
+    response = await call_next(request)
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["X-XSS-Protection"] = "1; mode=block"
+    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
+    return response
 
 # 라우터 등록: /auth 및 /api/auth 동시 지원 (FE 호환성 보장)
 app.include_router(auth_router)
@@ -99,5 +117,26 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
                 code="VALIDATION_ERROR",
                 message=f"[{field}] {msg}"
             )
+        ).model_dump(),
+    )
+
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    """전역 미처리 예외 핸들러: SrFormat 500 응답 보장 및 내부 스택 트레이스 은닉"""
+    logger.critical(
+        f"[UNHANDLED_EXCEPTION] {request.method} {request.url.path} -> {type(exc).__name__}: {exc}\n"
+        f"{traceback.format_exc()}"
+    )
+    return JSONResponse(
+        status_code=500,
+        content=SrFormat(
+            status_code=500,
+            success=False,
+            data=None,
+            error=Error(
+                code="INTERNAL_SERVER_ERROR",
+                message="서버 내부 오류가 발생했습니다."
+            ),
         ).model_dump(),
     )
