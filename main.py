@@ -1,8 +1,10 @@
 import os
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, HTTPException, Request
+from typing import Any, Optional
+import jwt
+from fastapi import FastAPI, HTTPException, Request, Depends, Query
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 import logging
@@ -10,9 +12,17 @@ import traceback
 
 logger = logging.getLogger("meister.main")
 
-from fastapi.staticfiles import StaticFiles
 from core.storage import get_upload_base_dir
-from database import init_db_pool, close_db_pool, init_redis_pool, close_redis_pool
+from core.security import JWT_SECRET_KEY, JWT_ALGORITHM
+from database import init_db_pool, close_db_pool, init_redis_pool, close_redis_pool, get_db, get_redis
+try:
+    import asyncmy
+    from asyncmy.cursors import DictCursor
+except (ImportError, ModuleNotFoundError):
+    class _AsyncmyStub:
+        Connection = Any
+    asyncmy = _AsyncmyStub()  # type: ignore
+    DictCursor = Any  # type: ignore
 from routers.auth import router as auth_router
 from routers.students import router as students_router
 from routers.submissions import router as submissions_router
@@ -93,10 +103,129 @@ app.include_router(students_router)
 # 증빙자료 제출 및 심사 라우터 등록 (/api/submissions)
 app.include_router(submissions_router)
 
-# 📁 정적 파일 업로드 경로 마운트 (TODO.md 5장)
-UPLOAD_DIR = get_upload_base_dir()
-os.makedirs(UPLOAD_DIR, exist_ok=True)
-app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
+# 📁 [보안 3.1] 증빙자료 파일 안전 조회 및 다운로드 (RBAC 및 학생 소유권 인가 검증)
+# 기존 단순 StaticFiles 마운트의 무인가 개인정보 탈취(IDOR) 취약점을 해소
+@app.get(
+    "/uploads/{file_path:path}",
+    summary="증빙자료 파일 안전 조회 및 다운로드 (RBAC 및 소유권 인가 검증)",
+)
+async def get_uploaded_file(
+    file_path: str,
+    request: Request,
+    token: Optional[str] = Query(None, description="브라우저 직접 다운로드 및 미디어 열람용 쿼리 토큰"),
+    conn: Any = Depends(get_db),
+    redis: Any = Depends(get_redis),
+):
+    upload_root = os.path.abspath(get_upload_base_dir())
+    clean_rel_path = os.path.normpath(file_path.strip().lstrip("/\\"))
+    abs_file_path = os.path.abspath(os.path.join(upload_root, clean_rel_path))
+
+    # 1. 인증 토큰 추출 및 검증 (비인가자의 파일 존재 유무 정찰 차단: 401 선검증)
+    auth_header = request.headers.get("Authorization", "")
+    jwt_token = None
+    if auth_header.startswith("Bearer "):
+        jwt_token = auth_header[7:].strip()
+    elif token:
+        jwt_token = token.strip()
+
+    if not jwt_token:
+        return JSONResponse(
+            status_code=401,
+            content=SrFormat(
+                status_code=401,
+                success=False,
+                data=None,
+                error=Error(code="UNAUTHORIZED", message="파일 열람 권한이 없습니다. 인증 토큰이 필요합니다."),
+            ).model_dump(),
+        )
+
+    # 2. 토큰 서명 및 만료/블랙리스트 검증
+    try:
+        payload = jwt.decode(jwt_token, JWT_SECRET_KEY, algorithms=[JWT_ALGORITHM])
+    except jwt.ExpiredSignatureError:
+        return JSONResponse(
+            status_code=401,
+            content=SrFormat(
+                status_code=401,
+                success=False,
+                data=None,
+                error=Error(code="UNAUTHORIZED", message="인증 토큰이 만료되었습니다."),
+            ).model_dump(),
+        )
+    except Exception:
+        return JSONResponse(
+            status_code=401,
+            content=SrFormat(
+                status_code=401,
+                success=False,
+                data=None,
+                error=Error(code="UNAUTHORIZED", message="유효하지 않은 인증 토큰입니다."),
+            ).model_dump(),
+        )
+
+    jti = payload.get("jti")
+    if jti and redis is not None:
+        try:
+            if await redis.get(f"blacklist:{jti}"):
+                return JSONResponse(
+                    status_code=401,
+                    content=SrFormat(
+                        status_code=401,
+                        success=False,
+                        data=None,
+                        error=Error(code="UNAUTHORIZED", message="로그아웃되었거나 폐기된 토큰입니다."),
+                    ).model_dump(),
+                )
+        except Exception:
+            pass
+
+    # 3. 경로 탐색(Path Traversal) 공격 차단 및 파일 실존 확인
+    if not abs_file_path.startswith(upload_root) or not os.path.isfile(abs_file_path):
+        return JSONResponse(
+            status_code=404,
+            content=SrFormat(
+                status_code=404,
+                success=False,
+                data=None,
+                error=Error(code="FILE_NOT_FOUND", message="요청한 파일을 찾을 수 없습니다."),
+            ).model_dump(),
+        )
+
+    # 4. 역할별 인가(RBAC) 및 학생 본인 증빙 소유권 검증 (IDOR 방어)
+    user_uuid = payload.get("sub")
+    user_role = payload.get("role")
+
+    # 관리자 및 교사는 모든 학생의 증빙자료 심사/열람 허용
+    if user_role in ("admin", "teacher", 1, 2):
+        return FileResponse(abs_file_path)
+
+    # 학생은 본인이 제출한 증빙자료만 열람 가능
+    db_web_path = f"/uploads/{clean_rel_path.replace(os.sep, '/')}"
+    async with conn.cursor(cursor=DictCursor) as cur:
+        await cur.execute(
+            """
+            SELECT s.submission_id, s.student_id, st.uuid
+            FROM submissions s
+            JOIN students st ON s.student_id = st.student_id
+            WHERE s.file_path = %s AND s.is_deleted = FALSE
+            LIMIT 1
+            """,
+            (db_web_path,),
+        )
+        row = await cur.fetchone()
+
+    if not row or row["uuid"] != user_uuid:
+        return JSONResponse(
+            status_code=403,
+            content=SrFormat(
+                status_code=403,
+                success=False,
+                data=None,
+                error=Error(code="FORBIDDEN", message="본인이 제출한 증빙자료만 열람할 수 있습니다."),
+            ).model_dump(),
+        )
+
+    return FileResponse(abs_file_path)
 
 
 
