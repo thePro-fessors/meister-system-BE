@@ -16,6 +16,8 @@ from core.storage import (
     get_upload_base_dir,
     save_upload_file,
     validate_file_metadata,
+    validate_file_signature,
+    sanitize_filename,
 )
 
 __all__ = [
@@ -33,5 +35,7 @@ __all__ = [
     "save_upload_file",
     "delete_uploaded_file",
     "validate_file_metadata",
+    "validate_file_signature",
+    "sanitize_filename",
 ]
 

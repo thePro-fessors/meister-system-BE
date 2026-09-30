@@ -6,7 +6,9 @@ core/storage.py - 마이스터 시스템 파일 업로드 및 정적 저장소 �
 - SECURITY_AND_AUDIT.md (확장자 화이트리스트 검사, 50MB 용량 제한, UUID 난수화 경로 저장, 디렉터리 탐색 방어)
 """
 
+import asyncio
 import os
+import re
 import uuid
 from datetime import datetime
 from typing import Any, Dict, Optional, Set, Tuple
@@ -62,17 +64,58 @@ def get_file_extension(filename: Optional[str]) -> str:
 
 
 def sanitize_filename(filename: Optional[str]) -> str:
-    """원본 파일명에서 경로 탐색 문자 및 널 바이트를 제거하고 길이를 제한합니다."""
+    """원본 파일명에서 경로 탐색 문자, 널 바이트, 제어문자, 따옴표를 정제하여 헤더 인젝션을 방어합니다.
+    (SECURITY_AND_AUDIT.md 3.6: Content-Disposition 및 HTTP Response Splitting 방어)
+    """
     if not filename:
         return "unnamed_file"
     # Windows 경로 구분자(\) 및 POSIX 구분자(/) 모두 대응
     normalized = filename.replace("\\", "/")
     # 디렉터리 경로 분리 후 순수 파일명만 취득
     clean_name = os.path.basename(normalized)
-    # 널 바이트 및 제어 문자 제거
-    clean_name = clean_name.replace("\x00", "").strip()
+    # 널 바이트, 제어 문자, 줄바꿈, 따옴표/세미콜론 제거
+    clean_name = re.sub(r'[\r\n\x00-\x1f\x7f-\x9f"\'\\;]+', '', clean_name).strip()
     return clean_name[:255] if clean_name else "unnamed_file"
 
+
+def validate_file_signature(header: bytes, ext: str) -> bool:
+    """파일의 첫 바이트(Magic Bytes)와 확장자의 일치 여부를 검증합니다.
+    (SECURITY_AND_AUDIT.md 3.3: 확장자 위조, WebShell 및 Polyglot 파일 공격 원천 방어)
+    """
+    if not header or not ext:
+        return False
+
+    ext_lower = ext.lower()
+
+    # 1. PDF
+    if ext_lower == ".pdf":
+        return header.startswith(b"%PDF-")
+
+    # 2. 이미지 (JPEG, PNG, GIF, WebP, HEIC/HEIF)
+    if ext_lower in (".jpg", ".jpeg"):
+        return header.startswith(b"\xff\xd8\xff")
+    if ext_lower == ".png":
+        return header.startswith(b"\x89PNG\r\n\x1a\n")
+    if ext_lower == ".gif":
+        return header.startswith(b"GIF87a") or header.startswith(b"GIF89a")
+    if ext_lower == ".webp":
+        return len(header) >= 12 and header.startswith(b"RIFF") and header[8:12] == b"WEBP"
+    if ext_lower in (".heic", ".heif"):
+        return len(header) >= 12 and header[4:8] == b"ftyp" and header[8:12].lower() in (b"heic", b"heix", b"hevc", b"mif1", b"msf1")
+
+    # 3. 압축 (ZIP)
+    if ext_lower == ".zip":
+        return header.startswith(b"PK\x03\x04") or header.startswith(b"PK\x05\x06") or header.startswith(b"PK\x07\x08")
+
+    # 4. 비디오 (MP4, MOV, AVI, WebM)
+    if ext_lower in (".mp4", ".mov"):
+        return len(header) >= 8 and (header[4:8] in (b"ftyp", b"moov", b"mdat", b"wide", b"skip") or b"ftyp" in header[:16])
+    if ext_lower == ".avi":
+        return len(header) >= 12 and header.startswith(b"RIFF") and header[8:12] == b"AVI "
+    if ext_lower == ".webm":
+        return header.startswith(b"\x1a\x45\xdf\xa3")
+
+    return False
 
 
 def validate_file_metadata(file: UploadFile) -> Tuple[bool, Optional[str]]:
@@ -100,10 +143,11 @@ async def save_upload_file(
 
     보안 및 안정성 보장:
     1. 확장자 화이트리스트 사전 검증 (위반 시 INVALID_FILE_TYPE 400 반환)
-    2. 64KB 청크 단위 스트리밍 저장 중 실시간 용량 누적 체크 (50MB 초과 시 FILE_SIZE_EXCEEDED 400)
-    3. 년/월/UUID 기반 파일명 해싱 난수화 경로 생성 (경로 탐색 및 덮어쓰기 공격 원천 차단)
-    4. 예외 발생 또는 용량 초과 시 불완전한 임시 파일 자동 클린업 (Unlink)
-    5. 원본 파일명(original_filename) 및 웹 서빙 경로(file_path) 반환
+    2. 매직 넘버(File Signature) 검증으로 파일 확장자 위조 및 웹쉘 방어
+    3. 64KB 청크 단위 스트리밍 저장 중 실시간 용량 누적 체크 (50MB 초과 시 FILE_SIZE_EXCEEDED 400)
+    4. 비동기 이벤트 루프 블로킹 방지를 위한 asyncio.to_thread 파일 I/O
+    5. 년/월/UUID 기반 파일명 해싱 난수화 경로 생성 (경로 탐색 및 덮어쓰기 공격 원천 차단)
+    6. 예외 발생 또는 용량 초과 시 불완전한 임시 파일 자동 클린업 (Unlink)
     """
     effective_limit = max_size_bytes if max_size_bytes is not None else MAX_FILE_SIZE_BYTES
 
@@ -136,12 +180,31 @@ async def save_upload_file(
     web_path = f"/uploads/{subfolder}/{year_str}/{month_str}/{unique_filename}"
 
     total_bytes = 0
+    is_first_chunk = True
     try:
         with open(disk_path, "wb") as buffer:
             while True:
                 chunk = await file.read(CHUNK_SIZE_BYTES)
                 if not chunk:
                     break
+
+                # [보안 3.3] 첫 청크 매직 넘버(File Signature) 검증
+                if is_first_chunk:
+                    is_first_chunk = False
+                    if not validate_file_signature(chunk[:32], ext):
+                        raise HTTPException(
+                            status_code=status.HTTP_400_BAD_REQUEST,
+                            detail=SrFormat(
+                                status_code=status.HTTP_400_BAD_REQUEST,
+                                success=False,
+                                data=None,
+                                error=Error(
+                                    code="INVALID_FILE_TYPE",
+                                    message=f"파일 확장자({ext})와 실제 파일 시그니처(Magic Bytes)가 일치하지 않습니다.",
+                                ),
+                            ).model_dump(),
+                        )
+
                 total_bytes += len(chunk)
                 if total_bytes > effective_limit:
                     limit_label = f"{effective_limit // (1024 * 1024)}MB" if effective_limit >= 1024 * 1024 else f"{effective_limit}B"
@@ -157,7 +220,8 @@ async def save_upload_file(
                             ),
                         ).model_dump(),
                     )
-                buffer.write(chunk)
+                # [성능 3.4] 동기 파일 쓰기로 인한 이벤트 루프 블로킹 방지
+                await asyncio.to_thread(buffer.write, chunk)
 
         if total_bytes == 0:
             raise HTTPException(
