@@ -10,15 +10,24 @@ routers/students.py - 마이스터 역량인증제 학생 업무 관련 API 라�
 from datetime import datetime, date
 from decimal import Decimal
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlparse
 import math
 
-import asyncmy
-from asyncmy.cursors import DictCursor
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+
+try:
+    import asyncmy
+    from asyncmy.cursors import DictCursor
+except (ImportError, ModuleNotFoundError):
+    class _AsyncmyStub:
+        Connection = Any
+    asyncmy = _AsyncmyStub()  # type: ignore
+    DictCursor = Any  # type: ignore
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from core.security import get_current_user, require_student
+from core.storage import delete_uploaded_file, save_upload_file
 from database import get_db
 from sr_format import Error, SrFormat
 
@@ -141,6 +150,27 @@ def calculate_cert_status(area_results: List[Dict[str, Any]], has_pending: bool)
 
     # 추가 증빙 제출이 필요한 상태
     return "보완 필요"
+
+
+def is_valid_evidence_url(url: Optional[str]) -> bool:
+    """외부 증빙 링크의 유효성(HTTP/HTTPS 프로토콜 및 도메인 구조)을 검증합니다."""
+    if not url:
+        return False
+    try:
+        parsed = urlparse(url)
+        if parsed.scheme not in ("http", "https"):
+            return False
+        host = parsed.netloc.split(":")[0].strip()
+        if not host:
+            return False
+        if host in ("localhost", "127.0.0.1"):
+            return True
+        if "." not in host or host.startswith(".") or host.endswith("."):
+            return False
+        return True
+    except Exception:
+        return False
+
 
 
 # ==============================================================================
@@ -517,3 +547,651 @@ async def get_certification_status(
         data=response_data,
         error=None,
     )
+
+
+# ==============================================================================
+# 3. 증빙자료 신규 제출 비즈니스 로직 및 엔드포인트 (Submission APIs)
+# ==============================================================================
+
+async def handle_submit_evidence(
+    conn: asyncmy.Connection,
+    current_user: Dict[str, Any],
+    student_id_param: Optional[int],
+    item_id_val: Optional[int],
+    detail_val: Optional[str],
+    activity_date_val: Optional[str],
+    description_val: Optional[str],
+    link_url_val: Optional[str],
+    file_val: Optional[UploadFile],
+    year_val: Optional[int] = None,
+    area_val: Optional[str] = None,
+) -> JSONResponse:
+    """
+    증빙자료 신규 제출 처리 공통 핵심 서비스 로직
+    
+    연동 명세:
+    - Tech_spec.md 2.2 (증빙자료 제출)
+    - TODO.md 2.2 (증빙자료 신규 제출 API)
+    - SECURITY_AND_AUDIT.md (소유권 검증, 레이스 컨디션/중복 제출 방어, 트랜잭션 및 파일 클린업)
+    """
+    user_role = current_user.get("role")
+    user_uuid = current_user.get("uuid")
+
+    # 1. 호출 주체 권한(RBAC) 검증: 학생(student 또는 role=0)만 제출 가능
+    if user_role not in ("student", "0", 0):
+        return JSONResponse(
+            status_code=status.HTTP_403_FORBIDDEN,
+            content=SrFormat(
+                status_code=status.HTTP_403_FORBIDDEN,
+                success=False,
+                data=None,
+                error=Error(
+                    code="FORBIDDEN",
+                    message="학생만 증빙자료를 제출할 수 있습니다.",
+                ),
+            ).model_dump(),
+        )
+
+
+    async with conn.cursor(cursor=DictCursor) as cur:
+        # 2. 대상 학생 식별 및 본인 소유권 검증 (Authorization)
+        if student_id_param is not None:
+            await cur.execute(
+                """
+                SELECT student_id, uuid, name, email, is_deleted
+                FROM students
+                WHERE student_id = %s AND is_deleted = FALSE
+                LIMIT 1
+                """,
+                (student_id_param,),
+            )
+            target_student = await cur.fetchone()
+            if not target_student:
+                return JSONResponse(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    content=SrFormat(
+                        status_code=status.HTTP_404_NOT_FOUND,
+                        success=False,
+                        data=None,
+                        error=Error(
+                            code="USER_NOT_FOUND",
+                            message="해당 학생을 찾을 수 없습니다.",
+                        ),
+                    ).model_dump(),
+                )
+
+            if target_student["uuid"] != user_uuid:
+                return JSONResponse(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    content=SrFormat(
+                        status_code=status.HTTP_403_FORBIDDEN,
+                        success=False,
+                        data=None,
+                        error=Error(
+                            code="FORBIDDEN",
+                            message="본인의 증빙자료만 제출할 수 있습니다.",
+                        ),
+                    ).model_dump(),
+                )
+            student_id = target_student["student_id"]
+        else:
+            await cur.execute(
+                """
+                SELECT student_id, uuid, name, email, is_deleted
+                FROM students
+                WHERE uuid = %s AND is_deleted = FALSE
+                LIMIT 1
+                """,
+                (user_uuid,),
+            )
+            target_student = await cur.fetchone()
+            if not target_student:
+                return JSONResponse(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    content=SrFormat(
+                        status_code=status.HTTP_404_NOT_FOUND,
+                        success=False,
+                        data=None,
+                        error=Error(
+                            code="USER_NOT_FOUND",
+                            message="해당 학생 계정의 학적 정보를 찾을 수 없습니다.",
+                        ),
+                    ).model_dump(),
+                )
+            student_id = target_student["student_id"]
+
+        # 3. 필수 입력값 기본 유효성 검증
+        if item_id_val is None:
+            return JSONResponse(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                content=SrFormat(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    success=False,
+                    data=None,
+                    error=Error(
+                        code="VALIDATION_ERROR",
+                        message="평가 항목 ID(item_id)는 필수입니다.",
+                    ),
+                ).model_dump(),
+            )
+
+        clean_detail = (detail_val or "").strip()
+        if not clean_detail:
+            return JSONResponse(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                content=SrFormat(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    success=False,
+                    data=None,
+                    error=Error(
+                        code="VALIDATION_ERROR",
+                        message="세부 활동명 또는 자격명(detail)을 입력해주세요.",
+                    ),
+                ).model_dump(),
+            )
+        if len(clean_detail) > 200:
+            return JSONResponse(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                content=SrFormat(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    success=False,
+                    data=None,
+                    error=Error(
+                        code="VALIDATION_ERROR",
+                        message="세부 활동명(detail)은 최대 200자까지 입력 가능합니다.",
+                    ),
+                ).model_dump(),
+            )
+
+        clean_description = (description_val or "").strip()
+        if not clean_description:
+            return JSONResponse(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                content=SrFormat(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    success=False,
+                    data=None,
+                    error=Error(
+                        code="VALIDATION_ERROR",
+                        message="활동 설명(description)을 입력해주세요.",
+                    ),
+                ).model_dump(),
+            )
+
+        if not activity_date_val:
+            return JSONResponse(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                content=SrFormat(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    success=False,
+                    data=None,
+                    error=Error(
+                        code="VALIDATION_ERROR",
+                        message="활동 일자(activity_date)를 입력해주세요.",
+                    ),
+                ).model_dump(),
+            )
+
+        try:
+            parsed_date = datetime.strptime(str(activity_date_val).strip(), "%Y-%m-%d").date()
+        except ValueError:
+            return JSONResponse(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                content=SrFormat(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    success=False,
+                    data=None,
+                    error=Error(
+                        code="VALIDATION_ERROR",
+                        message="활동 일자 형식이 올바르지 않습니다. (YYYY-MM-DD 형식 필요)",
+                    ),
+                ).model_dump(),
+            )
+
+        if parsed_date > date.today():
+            return JSONResponse(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                content=SrFormat(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    success=False,
+                    data=None,
+                    error=Error(
+                        code="VALIDATION_ERROR",
+                        message="활동 일자는 미래 일자일 수 없습니다.",
+                    ),
+                ).model_dump(),
+            )
+
+        clean_link = (link_url_val or "").strip() or None
+        if clean_link:
+            if not is_valid_evidence_url(clean_link):
+                return JSONResponse(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    content=SrFormat(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        success=False,
+                        data=None,
+                        error=Error(
+                            code="VALIDATION_ERROR",
+                            message="외부 링크는 http:// 또는 https:// 형식의 올바른 웹 주소(도메인 포함)여야 합니다.",
+                        ),
+                    ).model_dump(),
+                )
+            if len(clean_link) > 500:
+                return JSONResponse(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    content=SrFormat(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        success=False,
+                        data=None,
+                        error=Error(
+                            code="VALIDATION_ERROR",
+                            message="외부 링크는 최대 500자까지 입력 가능합니다.",
+                        ),
+                    ).model_dump(),
+                )
+
+
+        # 4. 대상 평가 항목(evaluation_items) 및 소속 영역/학년도 검증
+        await cur.execute(
+            """
+            SELECT 
+                ei.item_id,
+                ei.area_id,
+                ei.name AS item_name,
+                ei.target_grade,
+                ei.max_score AS item_max_score,
+                ei.scoring_type,
+                ei.requires_evidence,
+                ei.is_active,
+                ca.year_id,
+                ca.grade AS area_grade,
+                ca.name AS area_name,
+                ay.year AS academic_year
+            FROM evaluation_items ei
+            JOIN certification_areas ca ON ei.area_id = ca.area_id
+            JOIN academic_years ay ON ca.year_id = ay.year_id
+            WHERE ei.item_id = %s
+            LIMIT 1
+            """,
+            (item_id_val,),
+        )
+        eval_item = await cur.fetchone()
+
+        if not eval_item:
+            return JSONResponse(
+                status_code=status.HTTP_404_NOT_FOUND,
+                content=SrFormat(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    success=False,
+                    data=None,
+                    error=Error(
+                        code="ITEM_NOT_FOUND",
+                        message="해당 평가 항목을 찾을 수 없습니다.",
+                    ),
+                ).model_dump(),
+            )
+
+        if not eval_item["is_active"]:
+            return JSONResponse(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                content=SrFormat(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    success=False,
+                    data=None,
+                    error=Error(
+                        code="VALIDATION_ERROR",
+                        message="비활성화된 평가 항목에는 증빙자료를 제출할 수 없습니다.",
+                    ),
+                ).model_dump(),
+            )
+
+        # 학년도 파라미터(year) 전달 시 평가 항목 학년도와 일치 여부 검증
+        if year_val is not None:
+            try:
+                parsed_year = int(year_val)
+                if parsed_year != eval_item["academic_year"]:
+                    return JSONResponse(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        content=SrFormat(
+                            status_code=status.HTTP_400_BAD_REQUEST,
+                            success=False,
+                            data=None,
+                            error=Error(
+                                code="VALIDATION_ERROR",
+                                message=f"요청한 학년도({parsed_year})와 평가 항목의 대상 학년도({eval_item['academic_year']})가 일치하지 않습니다.",
+                            ),
+                        ).model_dump(),
+                    )
+            except (ValueError, TypeError):
+                return JSONResponse(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    content=SrFormat(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        success=False,
+                        data=None,
+                        error=Error(
+                            code="VALIDATION_ERROR",
+                            message="학년도(year)는 유효한 정수여야 합니다.",
+                        ),
+                    ).model_dump(),
+                )
+
+        # 인증 영역 파라미터(area) 전달 시 평가 항목 영역과 일치 여부 검증
+        if area_val is not None:
+            clean_area = str(area_val).strip()
+            if clean_area and clean_area != eval_item["area_name"] and clean_area != str(eval_item["area_id"]):
+                return JSONResponse(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    content=SrFormat(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        success=False,
+                        data=None,
+                        error=Error(
+                            code="VALIDATION_ERROR",
+                            message=f"요청한 인증 영역({clean_area})과 평가 항목의 소속 영역({eval_item['area_name']})이 일치하지 않습니다.",
+                        ),
+                    ).model_dump(),
+                )
+
+        # 5. 학생의 해당 학년도 학적 정보 조회 및 대상 학년 일치 검증
+
+        await cur.execute(
+            """
+            SELECT grade, class AS class_no, number
+            FROM student_academic_records
+            WHERE student_id = %s AND year_id = %s
+            LIMIT 1
+            """,
+            (student_id, eval_item["year_id"]),
+        )
+        academic_record = await cur.fetchone()
+
+        if not academic_record:
+            return JSONResponse(
+                status_code=status.HTTP_404_NOT_FOUND,
+                content=SrFormat(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    success=False,
+                    data=None,
+                    error=Error(
+                        code="USER_NOT_FOUND",
+                        message=f"{eval_item['academic_year']} 학년도에 등록된 해당 학생의 학적 정보가 존재하지 않습니다.",
+                    ),
+                ).model_dump(),
+            )
+
+        st_grade = academic_record["grade"]
+        area_grade = eval_item["area_grade"]
+        target_grade = eval_item["target_grade"]
+
+        if area_grade and area_grade != 0 and area_grade != st_grade:
+            return JSONResponse(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                content=SrFormat(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    success=False,
+                    data=None,
+                    error=Error(
+                        code="VALIDATION_ERROR",
+                        message=f"해당 평가 항목은 {area_grade}학년 대상입니다. (현재 학생 학년: {st_grade}학년)",
+                    ),
+                ).model_dump(),
+            )
+
+        if target_grade and target_grade != 0 and target_grade != st_grade:
+            return JSONResponse(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                content=SrFormat(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    success=False,
+                    data=None,
+                    error=Error(
+                        code="VALIDATION_ERROR",
+                        message=f"해당 평가 항목은 {target_grade}학년 대상입니다. (현재 학생 학년: {st_grade}학년)",
+                    ),
+                ).model_dump(),
+            )
+
+        # 6. 증빙자료 필수 제출 요건 검증 (requires_evidence)
+        has_file = file_val is not None and bool(file_val.filename and file_val.filename.strip())
+        has_link = bool(clean_link)
+        requires_evidence = bool(eval_item["requires_evidence"])
+
+        if requires_evidence and not (has_file or has_link):
+            return JSONResponse(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                content=SrFormat(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    success=False,
+                    data=None,
+                    error=Error(
+                        code="VALIDATION_ERROR",
+                        message="해당 평가 항목은 증빙자료(첨부파일 또는 외부 링크) 제출이 필수입니다.",
+                    ),
+                ).model_dump(),
+            )
+
+        # 7. 동일 세부활동 및 일자 심사 대기 또는 기인정 건 중복 제출 방어 (DUPLICATE_SUBMISSION)
+        await cur.execute(
+            """
+            SELECT submission_id, status_code
+            FROM submissions
+            WHERE student_id = %s 
+              AND item_id = %s 
+              AND detail = %s 
+              AND activity_date = %s 
+              AND is_deleted = FALSE 
+              AND status_code IN (1, 2, 3)
+            LIMIT 1
+            """,
+            (student_id, item_id_val, clean_detail, parsed_date),
+        )
+        duplicate_sub = await cur.fetchone()
+
+        if duplicate_sub:
+            dup_msg = (
+                "동일한 세부 활동 및 일자의 증빙자료가 이미 인정(승인) 완료되었습니다."
+                if duplicate_sub.get("status_code") == 3
+                else "동일한 세부 활동 및 일자의 증빙자료가 이미 심사 대기 중입니다."
+            )
+            return JSONResponse(
+                status_code=status.HTTP_409_CONFLICT,
+                content=SrFormat(
+                    status_code=status.HTTP_409_CONFLICT,
+                    success=False,
+                    data=None,
+                    error=Error(
+                        code="DUPLICATE_SUBMISSION",
+                        message=dup_msg,
+                    ),
+                ).model_dump(),
+            )
+
+
+    # 8. 첨부파일 저장 처리 (core/storage.py 청크 스트리밍 및 50MB 용량/확장자 검증)
+    saved_file_info = None
+    saved_disk_path = None
+    saved_file_path = None
+    original_filename = None
+
+    if has_file:
+        saved_file_info = await save_upload_file(file_val, subfolder="submissions")
+        saved_file_path = saved_file_info["file_path"]
+        saved_disk_path = saved_file_info["disk_path"]
+        original_filename = saved_file_info["original_filename"]
+
+    # 9. 데이터베이스 트랜잭션 수행 (submissions 및 submissions_logs 원자적 기록)
+    now = datetime.now()
+    try:
+        await conn.autocommit(False)
+        async with conn.cursor(cursor=DictCursor) as cur:
+            await cur.execute(
+                """
+                INSERT INTO submissions (
+                    student_id,
+                    item_id,
+                    detail,
+                    activity_date,
+                    file_path,
+                    original_filename,
+                    link_url,
+                    description,
+                    status_code,
+                    granted_score,
+                    reviewer_id,
+                    reviewed_at,
+                    teacher_comment,
+                    created_at,
+                    is_deleted
+                ) VALUES (
+                    %s, %s, %s, %s, %s,
+                    %s, %s, %s, 1,
+                    NULL, NULL, NULL, NULL, %s,
+                    FALSE
+                )
+                """,
+                (
+                    student_id,
+                    item_id_val,
+                    clean_detail,
+                    parsed_date,
+                    saved_file_path,
+                    original_filename,
+                    clean_link,
+                    clean_description,
+                    now,
+                ),
+            )
+            new_submission_id = cur.lastrowid
+            if not new_submission_id:
+                await cur.execute("SELECT LAST_INSERT_ID() AS last_id")
+                id_row = await cur.fetchone()
+                new_submission_id = id_row["last_id"] if id_row else 0
+
+            # submissions_logs 초기 제출 이력 기록
+            await cur.execute(
+                """
+                INSERT INTO submissions_logs (
+                    submission_id,
+                    modifier_uuid,
+                    action_type,
+                    old_status_code,
+                    new_status_code,
+                    old_score,
+                    new_score,
+                    comment,
+                    created_at
+                ) VALUES (
+                    %s, %s, 'SUBMIT', NULL,
+                    1, NULL, NULL, '증빙자료 최초 제출', %s
+                )
+                """,
+                (
+                    new_submission_id,
+                    user_uuid,
+                    now,
+                ),
+            )
+
+        await conn.commit()
+    except Exception as e:
+        await conn.rollback()
+        # 트랜잭션 실패 시 방금 생성된 디스크 파일 롤백 삭제 (고아 파일 방지)
+        if saved_disk_path:
+            delete_uploaded_file(saved_disk_path)
+        return JSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content=SrFormat(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                success=False,
+                data=None,
+                error=Error(
+                    code="DATABASE_ERROR",
+                    message="증빙자료 제출 처리 중 데이터베이스 오류가 발생했습니다.",
+                ),
+            ).model_dump(),
+        )
+    finally:
+        await conn.autocommit(True)
+
+    # 10. 표준 응답 조립 및 반환 (TODO.md 2.2 / Tech_spec 2.2 규격)
+    response_data = {
+        "id": new_submission_id,
+        "submissionId": new_submission_id,
+        "studentId": student_id,
+        "year": eval_item["academic_year"],
+        "area": eval_item["area_name"],
+        "areaId": eval_item["area_id"],
+        "itemId": eval_item["item_id"],
+        "itemName": eval_item["item_name"],
+        "detail": clean_detail,
+        "activityDate": str(parsed_date),
+        "description": clean_description,
+        "filePath": saved_file_path,
+        "originalFilename": original_filename,
+        "linkUrl": clean_link,
+        "status": "제출완료",
+        "statusCode": 1,
+        "score": None,
+        "submittedAt": now.isoformat(),
+    }
+
+    return JSONResponse(
+        status_code=status.HTTP_200_OK,
+        content=SrFormat(
+            status_code=status.HTTP_200_OK,
+            success=True,
+            data=response_data,
+            error=None,
+        ).model_dump(),
+    )
+
+
+@router.post(
+    "/{student_id}/submissions",
+    summary="학생 증빙자료 신규 제출 API (경로 학생 ID 포함)",
+    response_model=SrFormat,
+)
+async def submit_evidence_for_student(
+    student_id: int,
+    item_id: Optional[int] = Form(None),
+    itemId: Optional[int] = Form(None),
+    detail: Optional[str] = Form(None),
+    activity_date: Optional[str] = Form(None),
+    activityDate: Optional[str] = Form(None),
+    description: Optional[str] = Form(None),
+    link_url: Optional[str] = Form(None),
+    link: Optional[str] = Form(None),
+    year: Optional[int] = Form(None),
+    area: Optional[str] = Form(None),
+    areaId: Optional[str] = Form(None),
+    file: Optional[UploadFile] = File(None),
+    conn: asyncmy.Connection = Depends(get_db),
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """
+    학생 증빙자료 신규 제출 엔드포인트 (경로 학생 식별자 포함)
+    
+    엔드포인트: POST /api/students/{studentId}/submissions
+    """
+    target_item_id = item_id if item_id is not None else itemId
+    target_date = activity_date if activity_date is not None else activityDate
+    target_link = link_url if link_url is not None else link
+    target_area = area if area is not None else areaId
+
+    return await handle_submit_evidence(
+        conn=conn,
+        current_user=current_user,
+        student_id_param=student_id,
+        item_id_val=target_item_id,
+        detail_val=detail,
+        activity_date_val=target_date,
+        description_val=description,
+        link_url_val=target_link,
+        file_val=file,
+        year_val=year,
+        area_val=target_area,
+    )
+
+
