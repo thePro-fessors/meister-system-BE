@@ -16,16 +16,17 @@ import hashlib
 
 import asyncmy
 from asyncmy.cursors import DictCursor
-from fastapi import APIRouter, Query, HTTPException, Depends, BackgroundTasks
+from fastapi import APIRouter, Query, HTTPException, Depends, BackgroundTasks, Request
 from pydantic import BaseModel
 from fastapi.responses import JSONResponse
 import bcrypt
 import redis.asyncio as aioredis
 
 from core.email import send_otp_email
+from core.logger import logger
 from database import get_db, get_redis
 from sr_format import *
-from core.security import create_access_token, get_current_user
+from core.security import create_access_token, get_current_user, get_client_ip
 
 # ==============================================================================
 # 보안 설정 & 타이밍 공격(Timing Attack) 방어용 상수
@@ -131,14 +132,61 @@ PASSWORD_REGEX = re.compile(r"^(?=.*[A-Za-z])(?=.*\d).{8,}$")
 # ==============================================================================
 
 @router.post("/login")
-async def login(req: LoginRequest, conn: asyncmy.Connection = Depends(get_db)):
+async def login(
+    req: LoginRequest,
+    request: Request,
+    conn: asyncmy.Connection = Depends(get_db),
+    redis: aioredis.Redis = Depends(get_redis),
+):
     """
     [POST] /auth/login - 사용자 로그인 및 JWT 세션 토큰 발급
     
     특징:
     - 타이밍 공격 방어: 계정이 없더라도 DUMMY_HASH로 bcrypt 검증을 실행하여 일정한 응답 시간 유지
     - 역할(Role)에 따른 프로필 정보 통합(학생 학적 정보 / 교사 담임 학급 정보)
+    - [보안] 계정별 5회 연속 실패 시 10분간 로그인 차단 (Brute-Force 방어)
+    - [보안] IP별 분당 20회 요청 제한 (DoS 방어, Nginx/프록시 호환)
     """
+    client_ip = get_client_ip(request)
+
+    # ── [보안 1.1] IP별 분당 20회 요청 제한 (DoS 방어) ──
+    ip_limit_key = f"ip_limit:login:{client_ip}"
+    ip_requests = await redis.incr(ip_limit_key)
+    if ip_requests == 1:
+        await redis.expire(ip_limit_key, 60)
+    if ip_requests > 20:
+        logger.warning(f"[LOGIN_IP_BLOCKED] IP={client_ip} 분당 20회 초과")
+        return JSONResponse(
+            status_code=429,
+            content=SrFormat(
+                status_code=429,
+                success=False,
+                data=None,
+                error=Error(
+                    code="TOO_MANY_REQUESTS",
+                    message="너무 많은 로그인 요청이 발생했습니다. 잠시 후 다시 시도해주세요."
+                )
+            ).model_dump()
+        )
+
+    # ── [보안 1.1] 계정별 연속 실패 잠금 확인 ──
+    account_lock_key = f"login_failures:{req.username}"
+    account_locked = await redis.get(account_lock_key)
+    if account_locked and int(account_locked) >= 5:
+        lock_ttl = await redis.ttl(account_lock_key)
+        return JSONResponse(
+            status_code=429,
+            content=SrFormat(
+                status_code=429,
+                success=False,
+                data={"remainingSeconds": max(0, lock_ttl)},
+                error=Error(
+                    code="ACCOUNT_LOCKED",
+                    message="로그인 실패 횟수를 초과하였습니다. 잠시 후 다시 시도해주세요."
+                )
+            ).model_dump()
+        )
+
     async with conn.cursor(cursor=DictCursor) as cur:
         sql_cmd = """
             SELECT uuid, id, password, role, email
@@ -153,18 +201,26 @@ async def login(req: LoginRequest, conn: asyncmy.Connection = Depends(get_db)):
     hash_valid = verify_password(req.password, hash_data)
 
     if not user or not hash_valid:
+        # 실패 카운터 증가 (10분 TTL)
+        failures = await redis.incr(account_lock_key)
+        if failures == 1 or failures >= 5:
+            await redis.expire(account_lock_key, 600)
+        remaining_attempts = max(0, 5 - failures)
         return JSONResponse(
             status_code=401,
             content=SrFormat(
                 status_code=401,
                 success=False,
-                data=None,
+                data={"remainingAttempts": remaining_attempts} if remaining_attempts > 0 else None,
                 error=Error(
                     code="INVALID_CREDENTIAL",
                     message="아이디 혹은 비밀번호가 올바르지 않습니다."
                 )
             ).model_dump()
         )
+
+    # 로그인 성공 시 실패 카운터 초기화
+    await redis.delete(account_lock_key)
 
     student_id = None
     students = None
@@ -372,6 +428,7 @@ async def get_my_info(
 @router.post('/send-otp')
 async def send_otp(
     req: SendOtpRequest, 
+    request: Request,
     background_tasks: BackgroundTasks, 
     conn: asyncmy.Connection = Depends(get_db), 
     redis: aioredis.Redis = Depends(get_redis)
@@ -385,6 +442,7 @@ async def send_otp(
     3. 60초 재발송 쿨다운(email_cooldown) 적용 (429 TOO_MANY_REQUESTS)
     4. TRNG 기반 암호학적 6자리 난수 생성 후 Redis에 5분(300초) 보관
     5. BackgroundTasks로 비동기 메일 발송하여 API 응답 지연을 0.05초 이하로 유지
+    6. [보안] IP별 1시간당 10회 OTP 발송 제한 (Distributed Email Bombing 방어, 프록시 호환)
     """
     if not req.email:
         return JSONResponse(
@@ -401,6 +459,27 @@ async def send_otp(
         )
 
     clean_mail = req.email.strip().lower()
+    client_ip = get_client_ip(request)
+
+    # ── [보안 1.2] IP별 1시간당 10회 OTP 발송 제한 (Distributed Email Bombing 방어) ──
+    ip_otp_key = f"ip_otp_limit:{client_ip}"
+    ip_otp_count = await redis.incr(ip_otp_key)
+    if ip_otp_count == 1:
+        await redis.expire(ip_otp_key, 3600)
+    if ip_otp_count > 10:
+        logger.warning(f"[OTP_IP_BLOCKED] IP={client_ip} 시간당 10회 초과")
+        return JSONResponse(
+            status_code=429,
+            content=SrFormat(
+                status_code=429,
+                success=False,
+                data=None,
+                error=Error(
+                    code="TOO_MANY_REQUESTS",
+                    message="해당 IP에서 너무 많은 인증 요청이 발생했습니다. 잠시 후 다시 시도해주세요."
+                )
+            ).model_dump()
+        )
 
     # 60초 재발송 쿨다운 체크
     times = await redis.ttl(f"email_cooldown:{clean_mail}")
@@ -754,9 +833,25 @@ async def register_user(
 
             sql_cmd = f"""
                 UPDATE {target_table} SET uuid = %s
-                WHERE email = %s AND is_deleted = FALSE
+                WHERE email = %s AND uuid IS NULL AND is_deleted = FALSE
             """
             await cur.execute(sql_cmd, (user_uuid, clean_mail))
+
+            # [보안 1.5] Race Condition 방어: 동시 요청으로 이미 UUID가 할당된 경우 롤백
+            if cur.rowcount != 1:
+                await conn.rollback()
+                return JSONResponse(
+                    status_code=409,
+                    content=SrFormat(
+                        status_code=409,
+                        success=False,
+                        data=None,
+                        error=Error(
+                            code="CONFLICT",
+                            message="이미 가입 처리가 완료된 계정입니다."
+                        )
+                    ).model_dump()
+                )
 
         await conn.commit()
     except Exception as e:
@@ -845,9 +940,21 @@ async def patch_email(
         )
 
     # 2. 이메일 중복 및 사용자/비밀번호 검증
+    #    [보안 1.4] users뿐 아니라 students, teachers 테이블도 중복 검사
     async with conn.cursor(cursor=DictCursor) as cur:
         await cur.execute("SELECT uuid FROM users WHERE email = %s AND is_deleted = FALSE LIMIT 1", (clean_mail,))
         existing_user = await cur.fetchone()
+
+        if not existing_user:
+            await cur.execute("SELECT student_id FROM students WHERE email = %s AND is_deleted = FALSE LIMIT 1", (clean_mail,))
+            existing_student = await cur.fetchone()
+            if not existing_student:
+                await cur.execute("SELECT teachers_id FROM teachers WHERE email = %s AND is_deleted = FALSE LIMIT 1", (clean_mail,))
+                existing_teacher = await cur.fetchone()
+                existing_user = existing_teacher
+
+            else:
+                existing_user = existing_student
 
         await cur.execute("SELECT * FROM users WHERE uuid = %s AND is_deleted = FALSE LIMIT 1", (uuid,))
         user_data = await cur.fetchone()
@@ -861,7 +968,7 @@ async def patch_email(
                 data=None,
                 error=Error(
                     code="DUPLICATE_EMAIL",
-                    message="이미 사용중인 이메일입니다."
+                    message="이미 사용 중인 이메일입니다."
                 )
             ).model_dump()
         )
@@ -898,14 +1005,31 @@ async def patch_email(
     await redis.delete(f"register_token:{clean_mail}")
 
     # 4. 트랜잭션 기반 이메일 업데이트
+    #    [보안 1.4] users와 대상 테이블(students/teachers)의 이메일을 원자적으로 동시 UPDATE
     try:
         await conn.autocommit(False)
         async with conn.cursor(cursor=DictCursor) as cur:
+            # 현재 사용자의 이전 이메일 조회 (하위 테이블 WHERE 조건용)
+            old_email = user_data["email"]
+
             sql_cmd = """
                 UPDATE users SET email = %s
                 WHERE uuid = %s AND is_deleted = FALSE
             """
             await cur.execute(sql_cmd, (clean_mail, uuid))
+
+            # 역할(role)에 따라 하위 테이블도 동기화
+            user_role = user_data["role"]
+            if user_role == 0:  # 학생
+                await cur.execute(
+                    "UPDATE students SET email = %s WHERE uuid = %s AND is_deleted = FALSE",
+                    (clean_mail, uuid)
+                )
+            elif user_role == 1:  # 교사
+                await cur.execute(
+                    "UPDATE teachers SET email = %s WHERE uuid = %s AND is_deleted = FALSE",
+                    (clean_mail, uuid)
+                )
 
         await conn.commit()
     except Exception as e:
