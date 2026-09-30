@@ -10,10 +10,14 @@ import traceback
 
 logger = logging.getLogger("meister.main")
 
+from fastapi.staticfiles import StaticFiles
+from core.storage import get_upload_base_dir
 from database import init_db_pool, close_db_pool, init_redis_pool, close_redis_pool
 from routers.auth import router as auth_router
 from routers.students import router as students_router
+from routers.submissions import router as submissions_router
 from sr_format import Error, SrFormat
+
 
 load_dotenv()
 
@@ -85,6 +89,15 @@ app.include_router(auth_router, prefix="/api")
 
 # 학생 업무 라우터 등록 (/api/students)
 app.include_router(students_router)
+
+# 증빙자료 제출 및 심사 라우터 등록 (/api/submissions)
+app.include_router(submissions_router)
+
+# 📁 정적 파일 업로드 경로 마운트 (TODO.md 5장)
+UPLOAD_DIR = get_upload_base_dir()
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
+
 
 
 @app.exception_handler(HTTPException)
