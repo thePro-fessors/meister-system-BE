@@ -7,7 +7,7 @@ routers/students.py - 마이스터 역량인증제 학생 업무 관련 API 라�
 - TODO.md 2.1 (인증 현황 조회 API: GET /api/students/{studentId}/certification-status)
 """
 
-from datetime import datetime
+from datetime import datetime, date
 from decimal import Decimal
 from typing import Any, Dict, List, Optional
 import math
@@ -337,6 +337,7 @@ async def get_certification_status(
         #    - 상태 코드: 1(제출완료), 2(검토중), 3(인정완료)
         #    - 최상위인정형(scoring_type=8) 및 항목별 최대점 처리를 위해 항목 ID와 점수 산정 방식 함께 조인
         # ----------------------------------------------------------------------
+        # [성능 2.2] 서브쿼리 → 명시적 JOIN 변환으로 인덱스 최적화
         await cur.execute(
             """
             SELECT 
@@ -349,19 +350,21 @@ async def get_certification_status(
                 ei.max_score AS item_max_score
             FROM submissions s
             JOIN evaluation_items ei ON s.item_id = ei.item_id
+            JOIN certification_areas ca ON ei.area_id = ca.area_id AND ca.year_id = %s
             WHERE s.student_id = %s 
               AND s.is_deleted = FALSE
-              AND ei.area_id IN (
-                  SELECT area_id FROM certification_areas WHERE year_id = %s
-              )
             """,
-            (student_id, year_id),
+            (year_id, student_id),
         )
         all_submissions = await cur.fetchall()
 
         # ----------------------------------------------------------------------
         # 7. 해당 학생의 상벌점 중 실제 인증 반영 대상(is_reflected = TRUE) 조회
         # ----------------------------------------------------------------------
+        # [성능 2.1] 학사년도 날짜 범위를 SQL에서 직접 필터링 (Over-fetching 방지)
+        merit_start = date(query_year, 3, 1)
+        merit_end = date(query_year + 1, 3, 1)
+
         await cur.execute(
             """
             SELECT 
@@ -374,8 +377,10 @@ async def get_certification_status(
             WHERE student_id = %s
               AND is_reflected = TRUE
               AND is_deleted = FALSE
+              AND occurred_at >= %s
+              AND occurred_at < %s
             """,
-            (student_id,),
+            (student_id, merit_start, merit_end),
         )
         all_merits = await cur.fetchall()
 
@@ -418,16 +423,10 @@ async def get_certification_status(
             area_item_scores[aid][iid].append(g_score)
 
     # --------------------------------------------------------------------------
-    # 상벌점 필터링: 발생일 기준 학사년도 판정 (3월~다음해 2월)
+    # 상벌점 집계 (SQL에서 학사년도 날짜 범위 필터링 완료)
     # --------------------------------------------------------------------------
     area_merit_points: Dict[str, float] = {}
     for m in all_merits:
-        occ_date = m["occurred_at"]
-        if occ_date:
-            m_year = occ_date.year if occ_date.month >= 3 else occ_date.year - 1
-            if m_year != query_year:
-                continue
-
         m_type = m["type"]  # '+' 또는 '상점' / '-' 또는 '벌점'
         pts = float(m["points"] or 0.0)
         rel_area = (m["related_area"] or "").strip()
