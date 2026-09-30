@@ -6,6 +6,7 @@ core/security.py - JWT 인증, 토큰 수명 주기 관리 및 역할 기반 접
 2. HTTP Bearer 인증 헤더 파싱 및 서명/만료시간 검증
 3. Redis O(1) 블랙리스트 조회를 통한 즉시 로그아웃 세션 무효화
 4. 선언적 RBAC(Role-Based Access Control) 의존성 팩토리 (`require_roles`, `require_student` 등)
+5. 리버스 프록시(Nginx/Docker/Cloudflare) 환경 대응 클라이언트 IP 추출 유틸리티 (`get_client_ip`)
 """
 
 import os
@@ -15,7 +16,7 @@ from enum import StrEnum
 from typing import Any, Callable, Dict, Sequence
 
 import jwt
-from fastapi import Depends, HTTPException
+from fastapi import Depends, HTTPException, Request
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 import redis.asyncio as aioredis
 from dotenv import load_dotenv
@@ -43,6 +44,38 @@ class UserRole(StrEnum):
     STUDENT = "student"
     TEACHER = "teacher"
     ADMIN = "admin"
+
+
+# ==============================================================================
+# 클라이언트 IP 추출 유틸리티 (Reverse Proxy & Cloudflare / Nginx 호환)
+# ==============================================================================
+def get_client_ip(request: Request) -> str:
+    """
+    리버스 프록시(Nginx, Docker, Cloudflare, Traefik 등) 환경을 고려하여
+    클라이언트의 실제 공인/사설 IP를 안전하게 추출합니다.
+
+    우선순위:
+    1. X-Forwarded-For 헤더 (클라이언트 최초 발신 IP)
+    2. X-Real-IP 헤더
+    3. request.client.host (직접 연결 소켓 IP)
+    """
+    forwarded = request.headers.get("X-Forwarded-For")
+    if forwarded:
+        # X-Forwarded-For: <client>, <proxy1>, <proxy2>
+        client = forwarded.split(",")[0].strip()
+        if client:
+            return client
+
+    real_ip = request.headers.get("X-Real-IP")
+    if real_ip:
+        client = real_ip.strip()
+        if client:
+            return client
+
+    if request.client and request.client.host:
+        return request.client.host
+
+    return "unknown"
 
 
 def create_access_token(data: dict, expires_delta: timedelta | None = None) -> str:
