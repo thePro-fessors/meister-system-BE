@@ -9,13 +9,19 @@ routers/auth.py - 인증(Authentication) 및 계정 관리 관련 API 라우터
 
 import re
 import uuid
-from typing import Optional
+from typing import Optional, Any
 import secrets
 from datetime import datetime, timezone, timedelta
 import hashlib
 
-import asyncmy
-from asyncmy.cursors import DictCursor
+try:
+    import asyncmy
+    from asyncmy.cursors import DictCursor
+except (ImportError, ModuleNotFoundError):
+    class _AsyncmyStub:
+        Connection = Any
+    asyncmy = _AsyncmyStub()  # type: ignore
+    DictCursor = Any  # type: ignore
 from fastapi import APIRouter, Query, HTTPException, Depends, BackgroundTasks, Request
 from pydantic import BaseModel
 from fastapi.responses import JSONResponse

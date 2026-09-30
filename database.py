@@ -1,7 +1,17 @@
-import asyncmy
-from asyncmy.cursors import DictCursor
-import dotenv
 import os
+import sys
+
+_venv_site = os.path.join(os.path.dirname(__file__), ".venv", "lib", "python3.12", "site-packages")
+if os.path.exists(_venv_site) and _venv_site not in sys.path:
+    sys.path.append(_venv_site)
+
+try:
+    import asyncmy
+    from asyncmy.cursors import DictCursor
+except (ImportError, ModuleNotFoundError):
+    asyncmy = None  # type: ignore
+    DictCursor = None  # type: ignore
+import dotenv
 import redis.asyncio as aioredis
 from typing import AsyncGenerator
 import logging

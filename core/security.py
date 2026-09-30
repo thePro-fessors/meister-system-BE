@@ -10,6 +10,12 @@ core/security.py - JWT 인증, 토큰 수명 주기 관리 및 역할 기반 접
 """
 
 import os
+import sys
+
+_venv_site = os.path.join(os.path.dirname(os.path.dirname(__file__)), ".venv", "lib", "python3.12", "site-packages")
+if os.path.exists(_venv_site) and _venv_site not in sys.path:
+    sys.path.append(_venv_site)
+
 import uuid
 from datetime import datetime, timedelta, timezone
 from enum import StrEnum
