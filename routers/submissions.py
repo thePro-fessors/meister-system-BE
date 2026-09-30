@@ -11,9 +11,10 @@ from typing import Any, Dict, Optional
 from fastapi import APIRouter, Depends, File, Form, UploadFile
 
 from core.security import get_current_user
-from database import get_db
+from database import get_db, get_redis
 from routers.students import handle_submit_evidence
 from sr_format import SrFormat
+import redis.asyncio as aioredis
 
 router = APIRouter(
     prefix="/api/submissions",
@@ -43,6 +44,7 @@ async def submit_evidence_direct(
     file: Optional[UploadFile] = File(None),
     conn: Any = Depends(get_db),
     current_user: Dict[str, Any] = Depends(get_current_user),
+    redis: aioredis.Redis = Depends(get_redis),
 ):
     """
     증빙자료 신규 제출 엔드포인트 (JWT 토큰 기반 학생 식별)
@@ -67,5 +69,6 @@ async def submit_evidence_direct(
         file_val=file,
         year_val=year,
         area_val=target_area,
+        redis=redis,
     )
 

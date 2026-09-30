@@ -28,8 +28,10 @@ from pydantic import BaseModel, Field
 
 from core.security import get_current_user, require_student
 from core.storage import delete_uploaded_file, save_upload_file
-from database import get_db
+from database import get_db, get_redis
 from sr_format import Error, SrFormat
+import hashlib
+import redis.asyncio as aioredis
 
 router = APIRouter(
     prefix="/api/students",
@@ -565,6 +567,7 @@ async def handle_submit_evidence(
     file_val: Optional[UploadFile],
     year_val: Optional[int] = None,
     area_val: Optional[str] = None,
+    redis: Optional[aioredis.Redis] = None,
 ) -> JSONResponse:
     """
     증빙자료 신규 제출 처리 공통 핵심 서비스 로직
@@ -1009,111 +1012,140 @@ async def handle_submit_evidence(
             )
 
 
+    # [동시성 3.5] TOCTOU 레이스 컨디션 방어: 검증 후 파일 저장 및 DB 삽입 구간 동시 요청 직렬화
+    lock_key = f"lock:submission:{student_id}:{item_id_val}:{parsed_date}:{hashlib.sha256(clean_detail.encode('utf-8')).hexdigest()[:16]}"
+    lock_acquired = False
+    if redis is not None:
+        try:
+            lock_acquired = await redis.set(lock_key, "1", nx=True, ex=10)
+            if not lock_acquired:
+                return JSONResponse(
+                    status_code=status.HTTP_409_CONFLICT,
+                    content=SrFormat(
+                        status_code=status.HTTP_409_CONFLICT,
+                        success=False,
+                        data=None,
+                        error=Error(
+                            code="DUPLICATE_SUBMISSION",
+                            message="동일한 증빙자료 제출 요청이 현재 처리 중입니다. 잠시 후 결과를 확인해주세요.",
+                        ),
+                    ).model_dump(),
+                )
+        except Exception:
+            pass  # Redis 장애 시에도 DB 레벨 트랜잭션 무결성으로 Fallback
+
     # 8. 첨부파일 저장 처리 (core/storage.py 청크 스트리밍 및 50MB 용량/확장자 검증)
     saved_file_info = None
     saved_disk_path = None
     saved_file_path = None
     original_filename = None
 
-    if has_file:
-        saved_file_info = await save_upload_file(file_val, subfolder="submissions")
-        saved_file_path = saved_file_info["file_path"]
-        saved_disk_path = saved_file_info["disk_path"]
-        original_filename = saved_file_info["original_filename"]
-
-    # 9. 데이터베이스 트랜잭션 수행 (submissions 및 submissions_logs 원자적 기록)
-    now = datetime.now()
     try:
-        await conn.autocommit(False)
-        async with conn.cursor(cursor=DictCursor) as cur:
-            await cur.execute(
-                """
-                INSERT INTO submissions (
-                    student_id,
-                    item_id,
-                    detail,
-                    activity_date,
-                    file_path,
-                    original_filename,
-                    link_url,
-                    description,
-                    status_code,
-                    granted_score,
-                    reviewer_id,
-                    reviewed_at,
-                    teacher_comment,
-                    created_at,
-                    is_deleted
-                ) VALUES (
-                    %s, %s, %s, %s, %s,
-                    %s, %s, %s, 1,
-                    NULL, NULL, NULL, NULL, %s,
-                    FALSE
-                )
-                """,
-                (
-                    student_id,
-                    item_id_val,
-                    clean_detail,
-                    parsed_date,
-                    saved_file_path,
-                    original_filename,
-                    clean_link,
-                    clean_description,
-                    now,
-                ),
-            )
-            new_submission_id = cur.lastrowid
-            if not new_submission_id:
-                await cur.execute("SELECT LAST_INSERT_ID() AS last_id")
-                id_row = await cur.fetchone()
-                new_submission_id = id_row["last_id"] if id_row else 0
+        if has_file:
+            saved_file_info = await save_upload_file(file_val, subfolder="submissions")
+            saved_file_path = saved_file_info["file_path"]
+            saved_disk_path = saved_file_info["disk_path"]
+            original_filename = saved_file_info["original_filename"]
 
-            # submissions_logs 초기 제출 이력 기록
-            await cur.execute(
-                """
-                INSERT INTO submissions_logs (
-                    submission_id,
-                    modifier_uuid,
-                    action_type,
-                    old_status_code,
-                    new_status_code,
-                    old_score,
-                    new_score,
-                    comment,
-                    created_at
-                ) VALUES (
-                    %s, %s, 'SUBMIT', NULL,
-                    1, NULL, NULL, '증빙자료 최초 제출', %s
+        # 9. 데이터베이스 트랜잭션 수행 (submissions 및 submissions_logs 원자적 기록)
+        now = datetime.now()
+        try:
+            await conn.autocommit(False)
+            async with conn.cursor(cursor=DictCursor) as cur:
+                await cur.execute(
+                    """
+                    INSERT INTO submissions (
+                        student_id,
+                        item_id,
+                        detail,
+                        activity_date,
+                        file_path,
+                        original_filename,
+                        link_url,
+                        description,
+                        status_code,
+                        granted_score,
+                        reviewer_id,
+                        reviewed_at,
+                        teacher_comment,
+                        created_at,
+                        is_deleted
+                    ) VALUES (
+                        %s, %s, %s, %s, %s,
+                        %s, %s, %s, 1,
+                        NULL, NULL, NULL, NULL, %s,
+                        FALSE
+                    )
+                    """,
+                    (
+                        student_id,
+                        item_id_val,
+                        clean_detail,
+                        parsed_date,
+                        saved_file_path,
+                        original_filename,
+                        clean_link,
+                        clean_description,
+                        now,
+                    ),
                 )
-                """,
-                (
-                    new_submission_id,
-                    user_uuid,
-                    now,
-                ),
-            )
+                new_submission_id = cur.lastrowid
+                if not new_submission_id:
+                    await cur.execute("SELECT LAST_INSERT_ID() AS last_id")
+                    id_row = await cur.fetchone()
+                    new_submission_id = id_row["last_id"] if id_row else 0
 
-        await conn.commit()
-    except Exception as e:
-        await conn.rollback()
-        # 트랜잭션 실패 시 방금 생성된 디스크 파일 롤백 삭제 (고아 파일 방지)
-        if saved_disk_path:
-            delete_uploaded_file(saved_disk_path)
-        return JSONResponse(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            content=SrFormat(
+                # submissions_logs 초기 제출 이력 기록
+                await cur.execute(
+                    """
+                    INSERT INTO submissions_logs (
+                        submission_id,
+                        modifier_uuid,
+                        action_type,
+                        old_status_code,
+                        new_status_code,
+                        old_score,
+                        new_score,
+                        comment,
+                        created_at
+                    ) VALUES (
+                        %s, %s, 'SUBMIT', NULL,
+                        1, NULL, NULL, '증빙자료 최초 제출', %s
+                    )
+                    """,
+                    (
+                        new_submission_id,
+                        user_uuid,
+                        now,
+                    ),
+                )
+
+            await conn.commit()
+        except Exception as e:
+            await conn.rollback()
+            # 트랜잭션 실패 시 방금 생성된 디스크 파일 롤백 삭제 (고아 파일 방지)
+            if saved_disk_path:
+                delete_uploaded_file(saved_disk_path)
+            return JSONResponse(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                success=False,
-                data=None,
-                error=Error(
-                    code="DATABASE_ERROR",
-                    message="증빙자료 제출 처리 중 데이터베이스 오류가 발생했습니다.",
-                ),
-            ).model_dump(),
-        )
+                content=SrFormat(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    success=False,
+                    data=None,
+                    error=Error(
+                        code="DATABASE_ERROR",
+                        message="증빙자료 제출 처리 중 데이터베이스 오류가 발생했습니다.",
+                    ),
+                ).model_dump(),
+            )
+        finally:
+            await conn.autocommit(True)
     finally:
-        await conn.autocommit(True)
+        if lock_acquired and redis is not None:
+            try:
+                await redis.delete(lock_key)
+            except Exception:
+                pass
 
     # 10. 표준 응답 조립 및 반환 (TODO.md 2.2 / Tech_spec 2.2 규격)
     response_data = {
@@ -1169,6 +1201,7 @@ async def submit_evidence_for_student(
     file: Optional[UploadFile] = File(None),
     conn: asyncmy.Connection = Depends(get_db),
     current_user: Dict[str, Any] = Depends(get_current_user),
+    redis: aioredis.Redis = Depends(get_redis),
 ):
     """
     학생 증빙자료 신규 제출 엔드포인트 (경로 학생 식별자 포함)
@@ -1192,6 +1225,7 @@ async def submit_evidence_for_student(
         file_val=file,
         year_val=year,
         area_val=target_area,
+        redis=redis,
     )
 
 
