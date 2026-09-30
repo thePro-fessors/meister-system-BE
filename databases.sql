@@ -303,3 +303,19 @@ CREATE INDEX IX_submissions_status_date
 
 ALTER TABLE student_academic_records ADD CONSTRAINT UQ_student_year UNIQUE (student_id, year_id);
 ALTER TABLE certification_areas ADD CONSTRAINT UQ_year_grade_area_name UNIQUE (year_id, grade, name);
+
+-- ============================================================================
+-- 성능 최적화 복합 인덱스 (SECURITY_AND_AUDIT.md 2.3 권고)
+-- ============================================================================
+
+-- 학생별 증빙 목록 및 상태별 집계 쿼리 최적화
+CREATE INDEX idx_submissions_student_deleted
+  ON submissions (student_id, is_deleted, status_code);
+
+-- 학년도 및 학년별 영역 배점 조회 최적화
+CREATE INDEX idx_cert_areas_year_grade
+  ON certification_areas (year_id, grade);
+
+-- 학생별 반영 상벌점 일자 범위 검색 최적화 (Index-Only Scan 유도)
+CREATE INDEX idx_merits_lookup
+  ON merits (student_id, is_reflected, is_deleted, occurred_at);
