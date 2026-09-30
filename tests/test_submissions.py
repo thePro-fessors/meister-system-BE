@@ -25,8 +25,25 @@ from unittest.mock import AsyncMock
 from fastapi.testclient import TestClient
 
 from core.security import get_current_user
-from database import get_db
+from database import get_db, get_redis
 from main import app
+
+
+class MockRedis:
+    def __init__(self):
+        self.data = {}
+
+    async def get(self, key):
+        return self.data.get(key)
+
+    async def set(self, key, val, nx=False, ex=None):
+        if nx and key in self.data:
+            return False
+        self.data[key] = val
+        return True
+
+    async def delete(self, key):
+        self.data.pop(key, None)
 
 
 class MockCursor:
@@ -129,6 +146,21 @@ class MockCursor:
 
         elif "SELECT LAST_INSERT_ID()" in sql_clean:
             self._current_result = [{"last_id": self.lastrowid}]
+
+        # 7. 파일 소유권 검증 조회 (submissions JOIN students)
+        elif "FROM submissions s" in sql_clean and "JOIN students st" in sql_clean:
+            target_path = params[0]
+            matched = []
+            for sub in self.conn.db_submissions:
+                if sub.get("file_path") == target_path and not sub.get("is_deleted"):
+                    student = next((s for s in self.conn.db_students if s["student_id"] == sub["student_id"]), None)
+                    if student:
+                        matched.append({
+                            "submission_id": sub["submission_id"],
+                            "student_id": sub["student_id"],
+                            "uuid": student["uuid"],
+                        })
+            self._current_result = matched
 
     async def fetchone(self):
         if self._fetch_index < len(self._current_result):
@@ -275,8 +307,10 @@ class TestSubmissionsAPI(unittest.TestCase):
         }
 
         # FastAPI 의존성 오버라이드 등록
+        self.mock_redis = MockRedis()
         app.dependency_overrides[get_db] = lambda: self.mock_conn
         app.dependency_overrides[get_current_user] = lambda: self.mock_user
+        app.dependency_overrides[get_redis] = lambda: self.mock_redis
 
         self.client = TestClient(app)
 
@@ -522,7 +556,7 @@ class TestSubmissionsAPI(unittest.TestCase):
         안정성 1: DB 트랜잭션 에러 발생 시 트랜잭션 롤백 및 업로드된 파일 디스크 자동 삭제 확인
         """
         self.mock_conn.simulate_insert_error = True
-        file_bytes = b"important test certificate"
+        file_bytes = b"%PDF-1.4 important test certificate"
         files = {
             "file": ("자격증.pdf", io.BytesIO(file_bytes), "application/pdf")
         }
@@ -755,7 +789,7 @@ class TestSubmissionsAPI(unittest.TestCase):
         core.storage.MAX_FILE_SIZE_BYTES = 50  # 50 바이트 제한으로 임시 축소
         try:
             files = {
-                "file": ("huge_evidence.zip", io.BytesIO(b"A" * 100), "application/zip")
+                "file": ("huge_evidence.zip", io.BytesIO(b"PK\x03\x04" + b"A" * 100), "application/zip")
             }
             data = {
                 "item_id": 10,
@@ -769,7 +803,100 @@ class TestSubmissionsAPI(unittest.TestCase):
         finally:
             core.storage.MAX_FILE_SIZE_BYTES = orig_max
 
+    def test_uploaded_file_unauthorized_blocked(self):
+        """보안 10: 인증 토큰 없이 /uploads 파일 열람 시도 시 401 UNAUTHORIZED 차단"""
+        res = self.client.get("/uploads/submissions/2026/09/sample.pdf")
+        self.assertEqual(res.status_code, 401)
+        self.assertEqual(res.json()["error"]["code"], "UNAUTHORIZED")
 
+    def test_uploaded_file_path_traversal_blocked(self):
+        """보안 11: 상위 디렉터리 탐색(Path Traversal) 공격 시도 시 404 차단"""
+        from core.security import create_access_token
+        token = create_access_token({"sub": "student-uuid-1", "id": "student1", "role": "student"})
+        res = self.client.get("/uploads/../../etc/passwd", headers={"Authorization": f"Bearer {token}"})
+        self.assertEqual(res.status_code, 404)
+
+    def test_uploaded_file_rbac_and_ownership(self):
+        """보안 12: 학생 증빙자료 RBAC 및 타인 열람 차단(403) / 본인 및 교사 열람 허용(200)"""
+        from core.security import create_access_token
+        import core.storage
+
+        # 1. 실제 파일 디스크 생성
+        upload_base = core.storage.get_upload_base_dir()
+        test_file_dir = os.path.join(upload_base, "submissions", "2026", "09")
+        os.makedirs(test_file_dir, exist_ok=True)
+        test_file_path = os.path.join(test_file_dir, "test_cert.pdf")
+        with open(test_file_path, "wb") as f:
+            f.write(b"%PDF-1.4 test certificate content for rbac")
+
+        try:
+            # DB에 학생 1(student-uuid-1)의 제출물로 등록
+            self.mock_conn.db_submissions.append({
+                "submission_id": 99,
+                "student_id": 1,
+                "file_path": "/uploads/submissions/2026/09/test_cert.pdf",
+                "is_deleted": False,
+            })
+
+            token_student1 = create_access_token({"sub": "student-uuid-1", "id": "student1", "role": "student"})
+            token_student2 = create_access_token({"sub": "student-uuid-2", "id": "student2", "role": "student"})
+            token_teacher = create_access_token({"sub": "teacher-uuid-1", "id": "teacher1", "role": "teacher"})
+
+            # 2. 타인(학생 2) 열람 시도 -> 403 FORBIDDEN
+            res_other = self.client.get(
+                "/uploads/submissions/2026/09/test_cert.pdf",
+                headers={"Authorization": f"Bearer {token_student2}"},
+            )
+            self.assertEqual(res_other.status_code, 403)
+            self.assertEqual(res_other.json()["error"]["code"], "FORBIDDEN")
+
+            # 3. 본인(학생 1) 열람 -> 200 OK (Bearer 헤더)
+            res_owner = self.client.get(
+                "/uploads/submissions/2026/09/test_cert.pdf",
+                headers={"Authorization": f"Bearer {token_student1}"},
+            )
+            self.assertEqual(res_owner.status_code, 200)
+            self.assertEqual(res_owner.content, b"%PDF-1.4 test certificate content for rbac")
+
+            # 4. 본인(학생 1) 열람 -> 200 OK (브라우저 직접 링크 ?token= 쿼리 파라미터)
+            res_query = self.client.get(
+                f"/uploads/submissions/2026/09/test_cert.pdf?token={token_student1}"
+            )
+            self.assertEqual(res_query.status_code, 200)
+
+            # 5. 교사 열람 -> 200 OK
+            res_teacher = self.client.get(
+                "/uploads/submissions/2026/09/test_cert.pdf",
+                headers={"Authorization": f"Bearer {token_teacher}"},
+            )
+            self.assertEqual(res_teacher.status_code, 200)
+        finally:
+            if os.path.exists(test_file_path):
+                os.remove(test_file_path)
+
+    def test_submit_evidence_concurrent_toctou_lock(self):
+        """동시성 13: 동일 건 동시 요청 시 Redis 락 획득 실패에 따른 409 DUPLICATE_SUBMISSION 차단"""
+        original_set = self.mock_redis.set
+        async def mock_set_fail(key, val, nx=False, ex=None):
+            if nx and "lock:submission" in key:
+                return False
+            return True
+        self.mock_redis.set = mock_set_fail
+
+        try:
+            data = {
+                "item_id": 10,
+                "detail": "동시성 테스트",
+                "activity_date": "2026-05-10",
+                "description": "설명",
+                "link_url": "https://example.com/cert",
+            }
+            res = self.client.post("/api/students/1/submissions", data=data)
+            self.assertEqual(res.status_code, 409)
+            self.assertEqual(res.json()["error"]["code"], "DUPLICATE_SUBMISSION")
+            self.assertIn("현재 처리 중", res.json()["error"]["message"])
+        finally:
+            self.mock_redis.set = original_set
 
 
 if __name__ == "__main__":

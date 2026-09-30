@@ -59,7 +59,7 @@ class TestStorage(unittest.IsolatedAsyncioTestCase):
             self.assertIsNotNone(err)
 
     async def test_save_upload_file_success(self):
-        content = b"PDF dummy content for certificate"
+        content = b"%PDF-1.4 dummy content for certificate"
         file = UploadFile(filename="자격증_사본.pdf", file=io.BytesIO(content))
         result = await save_upload_file(
             file=file,
@@ -78,8 +78,8 @@ class TestStorage(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(disk_content, content)
 
     async def test_save_upload_file_oversized_exceeded(self):
-        # 100 바이트 용량 제한 테스트
-        file = UploadFile(filename="huge.zip", file=io.BytesIO(b"A" * 200))
+        # 100 바이트 용량 제한 테스트 (유효한 ZIP 헤더 포함)
+        file = UploadFile(filename="huge.zip", file=io.BytesIO(b"PK\x03\x04" + b"A" * 200))
         with self.assertRaises(HTTPException) as ctx:
             await save_upload_file(
                 file=file,
@@ -131,6 +131,26 @@ class TestStorage(unittest.IsolatedAsyncioTestCase):
         # 이미 없는 파일 삭제 시 False 반환 (예외 발생 안 함)
         res_none = delete_uploaded_file(test_file)
         self.assertFalse(res_none)
+
+    def test_file_signature_validation(self):
+        from core.storage import validate_file_signature
+        self.assertTrue(validate_file_signature(b"%PDF-1.4...", ".pdf"))
+        self.assertTrue(validate_file_signature(b"\xff\xd8\xff...", ".jpg"))
+        self.assertTrue(validate_file_signature(b"\x89PNG\r\n\x1a\n...", ".png"))
+        self.assertTrue(validate_file_signature(b"PK\x03\x04...", ".zip"))
+        # 확장자 위조 방어: PHP 스크립트가 .pdf로 위장한 경우 거부
+        self.assertFalse(validate_file_signature(b"<?php echo 'shell'; ?>", ".pdf"))
+        # 확장자 위조 방어: 실행 파일(EXE)이 .png로 위장한 경우 거부
+        self.assertFalse(validate_file_signature(b"MZ\x90\x00\x03\x00\x00\x00", ".png"))
+
+    def test_sanitize_filename_header_injection(self):
+        # 줄바꿈 및 따옴표를 통한 Content-Disposition 헤더 인젝션 방어
+        malicious = 'malicious\r\nSet-Cookie: pwned=1\r\n"; filename="owned.pdf'
+        cleaned = sanitize_filename(malicious)
+        self.assertNotIn("\r", cleaned)
+        self.assertNotIn("\n", cleaned)
+        self.assertNotIn('"', cleaned)
+        self.assertNotIn(';', cleaned)
 
 
 if __name__ == "__main__":
