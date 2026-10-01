@@ -8,11 +8,11 @@ routers/submissions.py - 마이스터 역량인증제 증빙자료 제출 및 �
 
 from typing import Any, Dict, Optional
 
-from fastapi import APIRouter, Depends, File, Form, UploadFile
+from fastapi import APIRouter, Depends, File, Form, Query, UploadFile
 
 from core.security import get_current_user
 from database import get_db, get_redis
-from routers.students import handle_submit_evidence
+from routers.students import handle_submit_evidence, handle_get_submissions
 from sr_format import SrFormat
 import redis.asyncio as aioredis
 
@@ -20,6 +20,34 @@ router = APIRouter(
     prefix="/api/submissions",
     tags=["submissions"],
 )
+
+
+@router.get(
+    "",
+    summary="내 제출 내역 조회 API (GET /api/submissions)",
+    response_model=SrFormat,
+)
+async def get_my_submissions(
+    student_id: Optional[int] = Query(None, alias="studentId", description="학생 식별자 (선택)"),
+    year: Optional[int] = Query(None, description="학년도 필터 (선택)"),
+    conn: Any = Depends(get_db),
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """
+    학생 본인 증빙 제출 내역 조회 엔드포인트
+    
+    엔드포인트: GET /api/submissions
+    - 학생 본인 제출 건 강제 필터링 (타 학생 ID 조회 시 403 Forbidden 차단)
+    - 교사/관리자는 studentId 지정 시 해당 학생 제출 목록 조회 허용
+    - year: 선택적 학사년도 필터링
+    """
+    return await handle_get_submissions(
+        conn=conn,
+        current_user=current_user,
+        student_id_param=student_id,
+        year_val=year,
+    )
+
 
 
 @router.post(

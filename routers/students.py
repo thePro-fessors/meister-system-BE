@@ -1229,3 +1229,199 @@ async def submit_evidence_for_student(
     )
 
 
+# ==============================================================================
+# 5. 제출 내역 조회 공통 서비스 로직 & 엔드포인트 (TODO 2.3)
+# ==============================================================================
+
+SUBMISSION_STATUS_MAP: dict[int, str] = {
+    1: "제출완료",
+    2: "검토중",
+    3: "인정완료",
+    4: "반려",
+    5: "재제출요청",
+}
+
+
+async def handle_get_submissions(
+    conn: Any,
+    current_user: Dict[str, Any],
+    student_id_param: Optional[int] = None,
+    year_val: Optional[int] = None,
+) -> JSONResponse:
+    """
+    학생 증빙 제출 내역 조회 공통 비즈니스 로직 (TODO.md 2.3)
+    """
+    user_uuid = current_user.get("uuid")
+    user_role = current_user.get("role")
+    is_student = (user_role in ("student", "0", 0))
+
+    target_student_id: Optional[int] = None
+
+    async with conn.cursor(cursor=DictCursor) as cur:
+        # 1. 학생 권한인 경우 본인 소유권 강제 검증 (IDOR 방어)
+        if is_student:
+            await cur.execute(
+                "SELECT student_id FROM students WHERE uuid = %s AND is_deleted = FALSE LIMIT 1",
+                (user_uuid,),
+            )
+            student_row = await cur.fetchone()
+            if not student_row:
+                return JSONResponse(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    content=SrFormat(
+                        status_code=status.HTTP_404_NOT_FOUND,
+                        success=False,
+                        data=None,
+                        error=Error(code="USER_NOT_FOUND", message="학생 정보를 찾을 수 없습니다."),
+                    ).model_dump(),
+                )
+            own_student_id = student_row["student_id"]
+            if student_id_param is not None and student_id_param != own_student_id:
+                return JSONResponse(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    content=SrFormat(
+                        status_code=status.HTTP_403_FORBIDDEN,
+                        success=False,
+                        data=None,
+                        error=Error(code="FORBIDDEN", message="본인의 제출 내역만 조회할 수 있습니다."),
+                    ).model_dump(),
+                )
+            target_student_id = own_student_id
+        else:
+            # 교사 및 관리자는 studentId 파라미터 필수
+            if student_id_param is None:
+                return JSONResponse(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    content=SrFormat(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        success=False,
+                        data=None,
+                        error=Error(code="VALIDATION_ERROR", message="조회 대상 학생 식별자(studentId)가 필요합니다."),
+                    ).model_dump(),
+                )
+            await cur.execute(
+                "SELECT student_id FROM students WHERE student_id = %s AND is_deleted = FALSE LIMIT 1",
+                (student_id_param,),
+            )
+            target_student = await cur.fetchone()
+            if not target_student:
+                return JSONResponse(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    content=SrFormat(
+                        status_code=status.HTTP_404_NOT_FOUND,
+                        success=False,
+                        data=None,
+                        error=Error(code="USER_NOT_FOUND", message="해당 학생을 찾을 수 없습니다."),
+                    ).model_dump(),
+                )
+            target_student_id = student_id_param
+
+        # 2. 동적 쿼리 빌드 및 인덱스 기반 정렬 조회
+        query_parts = [
+            """
+            SELECT 
+                s.submission_id,
+                s.student_id,
+                ay.year,
+                ca.name AS area_name,
+                s.item_id,
+                ei.name AS item_name,
+                s.detail,
+                s.activity_date,
+                s.description,
+                s.file_path,
+                s.original_filename,
+                s.link_url,
+                s.status_code,
+                s.granted_score,
+                s.teacher_comment,
+                s.created_at,
+                s.reviewed_at,
+                s.reviewer_id
+            FROM submissions s
+            JOIN evaluation_items ei ON s.item_id = ei.item_id
+            JOIN certification_areas ca ON ei.area_id = ca.area_id
+            JOIN academic_years ay ON ca.year_id = ay.year_id
+            WHERE s.student_id = %s
+              AND s.is_deleted = FALSE
+            """
+        ]
+        params: list[Any] = [target_student_id]
+
+        if year_val is not None:
+            query_parts.append("AND ay.year = %s")
+            params.append(year_val)
+
+        # 복합 인덱스(idx_submissions_student_deleted) 활용을 위해 최신순 정렬
+        query_parts.append("ORDER BY s.created_at DESC, s.submission_id DESC")
+        full_query = " ".join(query_parts)
+
+        await cur.execute(full_query, tuple(params))
+        rows = await cur.fetchall()
+
+    # 3. FE 스펙(TODO 2.3 / Tech_spec 2.3) 규격 변환
+    results: list[dict[str, Any]] = []
+    for r in rows:
+        st_code = r["status_code"]
+        st_text = SUBMISSION_STATUS_MAP.get(st_code, "제출완료")
+        score_val = float(r["granted_score"]) if r["granted_score"] is not None else None
+        act_date_str = r["activity_date"].strftime("%Y-%m-%d") if r["activity_date"] else None
+        created_str = r["created_at"].isoformat() if r["created_at"] else None
+        reviewed_str = r["reviewed_at"].isoformat() if r["reviewed_at"] else None
+
+        results.append({
+            "id": r["submission_id"],
+            "studentId": r["student_id"],
+            "year": r["year"],
+            "area": r["area_name"],
+            "itemId": r["item_id"],
+            "itemName": r["item_name"],
+            "detail": r["detail"] or "",
+            "activityDate": act_date_str,
+            "description": r["description"] or "",
+            "filePath": r["file_path"],
+            "fileUrl": r["file_path"],  # FE 필드 호환성 보장
+            "originalFilename": r["original_filename"],
+            "linkUrl": r["link_url"],
+            "link": r["link_url"],      # FE 필드 호환성 보장
+            "status": st_text,
+            "score": score_val,
+            "teacherComment": r["teacher_comment"],
+            "submittedAt": created_str,
+            "reviewedAt": reviewed_str,
+            "reviewerId": r["reviewer_id"],
+        })
+
+    return JSONResponse(
+        status_code=status.HTTP_200_OK,
+        content=SrFormat(
+            status_code=status.HTTP_200_OK,
+            success=True,
+            data=results,
+            error=None,
+        ).model_dump(),
+    )
+
+
+@router.get(
+    "/{student_id}/submissions",
+    summary="학생 제출 내역 조회 API (경로 학생 식별자)",
+    response_model=SrFormat,
+)
+async def get_student_submissions(
+    student_id: int,
+    year: Optional[int] = Query(None, description="학년도 필터"),
+    conn: Any = Depends(get_db),
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """
+    학생 제출 내역 조회 엔드포인트 (경로 학생 식별자)
+    
+    엔드포인트: GET /api/students/{studentId}/submissions
+    """
+    return await handle_get_submissions(
+        conn=conn,
+        current_user=current_user,
+        student_id_param=student_id,
+        year_val=year,
+    )
