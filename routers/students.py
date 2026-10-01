@@ -1230,7 +1230,7 @@ async def submit_evidence_for_student(
 
 
 # ==============================================================================
-# 5. 제출 내역 조회 공통 서비스 로직 & 엔드포인트 (TODO 2.3)
+# 5. 제출 내역 및 상벌점 내역 조회 공통 서비스 로직 & 엔드포인트 (TODO 2.3 & 2.5)
 # ==============================================================================
 
 SUBMISSION_STATUS_MAP: dict[int, str] = {
@@ -1239,6 +1239,13 @@ SUBMISSION_STATUS_MAP: dict[int, str] = {
     3: "인정완료",
     4: "반려",
     5: "재제출요청",
+}
+
+MERIT_TYPE_MAP: dict[str, str] = {
+    "+": "상점",
+    "-": "벌점",
+    "상점": "상점",
+    "벌점": "벌점",
 }
 
 
@@ -1403,6 +1410,147 @@ async def handle_get_submissions(
     )
 
 
+async def handle_get_points(
+    conn: Any,
+    current_user: Dict[str, Any],
+    student_id_param: Optional[int] = None,
+    year_val: Optional[int] = None,
+) -> JSONResponse:
+    """
+    학생 상벌점 내역 조회 공통 비즈니스 로직 (TODO.md 2.5)
+    """
+    user_uuid = current_user.get("uuid")
+    user_role = current_user.get("role")
+    is_student = (user_role in ("student", "0", 0))
+
+    target_student_id: Optional[int] = None
+
+    async with conn.cursor(cursor=DictCursor) as cur:
+        # 1. 학생 권한인 경우 본인 소유권 강제 검증 (IDOR 방어)
+        if is_student:
+            await cur.execute(
+                "SELECT student_id FROM students WHERE uuid = %s AND is_deleted = FALSE LIMIT 1",
+                (user_uuid,),
+            )
+            student_row = await cur.fetchone()
+            if not student_row:
+                return JSONResponse(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    content=SrFormat(
+                        status_code=status.HTTP_404_NOT_FOUND,
+                        success=False,
+                        data=None,
+                        error=Error(code="USER_NOT_FOUND", message="학생 정보를 찾을 수 없습니다."),
+                    ).model_dump(),
+                )
+            own_student_id = student_row["student_id"]
+            if student_id_param is not None and student_id_param != own_student_id:
+                return JSONResponse(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    content=SrFormat(
+                        status_code=status.HTTP_403_FORBIDDEN,
+                        success=False,
+                        data=None,
+                        error=Error(code="FORBIDDEN", message="본인의 상벌점 내역만 조회할 수 있습니다."),
+                    ).model_dump(),
+                )
+            target_student_id = own_student_id
+        else:
+            if student_id_param is None:
+                return JSONResponse(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    content=SrFormat(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        success=False,
+                        data=None,
+                        error=Error(code="VALIDATION_ERROR", message="조회 대상 학생 식별자(studentId)가 필요합니다."),
+                    ).model_dump(),
+                )
+            await cur.execute(
+                "SELECT student_id FROM students WHERE student_id = %s AND is_deleted = FALSE LIMIT 1",
+                (student_id_param,),
+            )
+            target_student = await cur.fetchone()
+            if not target_student:
+                return JSONResponse(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    content=SrFormat(
+                        status_code=status.HTTP_404_NOT_FOUND,
+                        success=False,
+                        data=None,
+                        error=Error(code="USER_NOT_FOUND", message="해당 학생을 찾을 수 없습니다."),
+                    ).model_dump(),
+                )
+            target_student_id = student_id_param
+
+        # 2. 동적 쿼리 빌드 (3월 1일 학사력 기준 인덱스 범위 스캔 적용)
+        query_parts = [
+            """
+            SELECT 
+                m.merits_point_id,
+                m.student_id,
+                m.teachers_id,
+                t.name AS teacher_name,
+                m.type,
+                m.points,
+                m.reason,
+                m.related_area,
+                m.occurred_at,
+                m.created_at,
+                m.is_reflected
+            FROM merits m
+            LEFT JOIN teachers t ON m.teachers_id = t.teachers_id
+            WHERE m.student_id = %s
+              AND m.is_deleted = FALSE
+            """
+        ]
+        params: list[Any] = [target_student_id]
+
+        if year_val is not None:
+            # 학사력 기준 범위 [year-03-01, year+1-03-01)
+            merit_start = date(year_val, 3, 1)
+            merit_end = date(year_val + 1, 3, 1)
+            query_parts.append("AND m.occurred_at >= %s AND m.occurred_at < %s")
+            params.extend([merit_start, merit_end])
+
+        query_parts.append("ORDER BY m.occurred_at DESC, m.merits_point_id DESC")
+        full_query = " ".join(query_parts)
+
+        await cur.execute(full_query, tuple(params))
+        rows = await cur.fetchall()
+
+    # 3. FE 스펙(TODO 2.5 / Tech_spec 2.5) 규격 변환
+    results: list[dict[str, Any]] = []
+    for r in rows:
+        raw_type = (r["type"] or "-").strip()
+        type_str = MERIT_TYPE_MAP.get(raw_type, "벌점" if raw_type == "-" else "상점")
+        pts = float(r["points"] or 0.0)
+        occ_str = r["occurred_at"].strftime("%Y-%m-%d") if r["occurred_at"] else None
+
+        results.append({
+            "id": r["merits_point_id"],
+            "pointId": r["merits_point_id"],
+            "type": type_str,
+            "points": pts,
+            "score": pts,  # Tech_spec 필드명 호환성 보장
+            "reason": r["reason"] or "",
+            "date": occ_str,
+            "teacherName": r["teacher_name"],
+            "reflected": bool(r["is_reflected"]),
+            "reflectedArea": r["related_area"],
+        })
+
+    return JSONResponse(
+        status_code=status.HTTP_200_OK,
+        content=SrFormat(
+            status_code=status.HTTP_200_OK,
+            success=True,
+            data=results,
+            error=None,
+        ).model_dump(),
+    )
+
+
 @router.get(
     "/{student_id}/submissions",
     summary="학생 제출 내역 조회 API (경로 학생 식별자)",
@@ -1425,3 +1573,30 @@ async def get_student_submissions(
         student_id_param=student_id,
         year_val=year,
     )
+
+
+@router.get(
+    "/{student_id}/points",
+    summary="학생 상벌점 내역 조회 API (경로 학생 식별자)",
+    response_model=SrFormat,
+)
+async def get_student_points(
+    student_id: int,
+    year: Optional[int] = Query(None, description="학년도 필터"),
+    conn: Any = Depends(get_db),
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """
+    학생 상벌점 내역 조회 엔드포인트 (경로 학생 식별자)
+    
+    엔드포인트: GET /api/students/{studentId}/points
+    """
+    return await handle_get_points(
+        conn=conn,
+        current_user=current_user,
+        student_id_param=student_id,
+        year_val=year,
+    )
+
+
+

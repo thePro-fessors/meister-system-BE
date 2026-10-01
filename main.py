@@ -26,6 +26,7 @@ except (ImportError, ModuleNotFoundError):
 from routers.auth import router as auth_router
 from routers.students import router as students_router
 from routers.submissions import router as submissions_router
+from routers.points import router as points_router
 from sr_format import Error, SrFormat
 
 
@@ -102,6 +103,9 @@ app.include_router(students_router)
 
 # 증빙자료 제출 및 심사 라우터 등록 (/api/submissions)
 app.include_router(submissions_router)
+
+# 상벌점 내역 조회 라우터 등록 (/api/points)
+app.include_router(points_router)
 
 # 📁 [보안 3.1] 증빙자료 파일 안전 조회 및 다운로드 (RBAC 및 학생 소유권 인가 검증)
 # 기존 단순 StaticFiles 마운트의 무인가 개인정보 탈취(IDOR) 취약점을 해소
