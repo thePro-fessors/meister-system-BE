@@ -1,9 +1,9 @@
 # 🗄️ 마이스터 시스템 DB 스키마 변경 내역서 (Schema Changelog)
 
-> **문서 버전**: v1.1  
-> **기준 일자**: 2026-09-29  
+> **문서 버전**: v1.2  
+> **기준 일자**: 2026-10-02  
 > **대상 파일**: [databases.sql](databases.sql)  
-> **변경 목적**: 프론트엔드 연동 요구사항(`BACKEND_REQUIREMENTS.md`) 충족 및 데이터 무결성/추적성 강화
+> **변경 목적**: 프론트엔드 연동 요구사항(`BACKEND_REQUIREMENTS.md`) 충족, 데이터 무결성/추적성 강화 및 성능 인덱스 최적화
 
 ---
 
@@ -16,6 +16,7 @@
 | `submissions` | **컬럼 추가** | `detail` | `VARCHAR(200) NULL` | 학생이 제출한 세부 활동명/자격명 분리 저장 (`description`과 구분) |
 | `submissions` | **컬럼 추가** | `original_filename` | `VARCHAR(255) NULL` | 사용자가 업로드한 원본 파일명 보존 및 다운로드 시 표시 지원 |
 | `submissions` | **컬럼 추가** | `reviewed_at` | `DATETIME NULL` | 교사의 승인/반려 심사 완료 시각 명확한 기록 (`created_at`과 분리) |
+| `submissions` | **컬럼 추가** | `updated_at` | `DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP` | 증빙자료 재제출, 상태 변경, 삭제 시점의 최종 수정일시 추적 지원 |
 
 ---
 
@@ -50,6 +51,8 @@
    - `created_at`(제출 시각)만 존재하여, 교사가 언제 승인/반려했는지 확인하려면 감사 테이블(`submissions_logs`)을 서브쿼리로 조인해야 하는 성능 병목이 발생했습니다.
 3. **세부 활동명(`detail`) 분리 부재**:
    - **FE 요구사항 4장** 데이터 모델에는 `detail`(자격명, 대회 종목 등)과 `description`(상세 활동 설명)이 구분되어 요구되었습니다.
+4. **최종 수정일시(`updated_at`) 부재**:
+   - 재제출(`resubmit`)이나 삭제(`delete`) 시점에 언제 수정되었는지 파악하기 어려웠습니다.
 
 #### ✅ 변경 내용
 ```sql
@@ -70,6 +73,7 @@ CREATE TABLE submissions
   reviewed_at       DATETIME     NULL     COMMENT '교사 검토 일시',           -- [신규]
   teacher_comment   TEXT         NULL     COMMENT '교사 의견',
   created_at        DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at        DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '최종 수정일시', -- [신규]
   is_deleted        BOOL         NULL     DEFAULT FALSE COMMENT 'Soft Delete',
   PRIMARY KEY (submission_id)
 ) COMMENT '증빙자료 관리 테이블';
@@ -92,9 +96,20 @@ ALTER TABLE certification_areas
 ALTER TABLE certification_areas 
   ADD CONSTRAINT UQ_year_grade_area_name UNIQUE (year_id, grade, name);
 
--- 2. submissions 변경
+-- 2. submissions 컬럼 추가
 ALTER TABLE submissions 
   ADD COLUMN detail VARCHAR(200) NULL COMMENT '세부 활동명 또는 자격명' AFTER item_id,
   ADD COLUMN original_filename VARCHAR(255) NULL COMMENT '업로드 원본 파일명' AFTER file_path,
-  ADD COLUMN reviewed_at DATETIME NULL COMMENT '교사 검토 일시' AFTER reviewer_id;
+  ADD COLUMN reviewed_at DATETIME NULL COMMENT '교사 검토 일시' AFTER reviewer_id,
+  ADD COLUMN updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '최종 수정일시' AFTER created_at;
+
+-- 3. 성능 최적화 복합 인덱스 생성 (SECURITY_AND_AUDIT.md 권고)
+CREATE INDEX idx_submissions_history 
+  ON submissions (student_id, is_deleted, created_at DESC, submission_id DESC);
+
+CREATE INDEX idx_merits_history 
+  ON merits (student_id, is_deleted, occurred_at DESC, merits_point_id DESC);
+
+CREATE INDEX idx_submissions_teacher_filter
+  ON submissions (is_deleted, status_code, created_at DESC, submission_id DESC);
 ```

@@ -137,6 +137,7 @@ CREATE TABLE submissions
   reviewed_at       DATETIME     NULL     COMMENT '교사 검토 일시',
   teacher_comment   TEXT         NULL     COMMENT '교사 의견',
   created_at        DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at        DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '최종 수정일시',
   is_deleted        BOOL         NULL     DEFAULT FALSE COMMENT 'Soft Delete',
   PRIMARY KEY (submission_id)
 ) COMMENT '증빙자료 관리 테이블';
@@ -327,3 +328,7 @@ CREATE INDEX idx_submissions_history
 -- 상벌점 내역 정렬 최적화 복합 인덱스 (SECURITY_AND_AUDIT.md 2.1 & TODO.md 6.2 P0)
 CREATE INDEX idx_merits_history 
   ON merits (student_id, is_deleted, occurred_at DESC, merits_point_id DESC);
+
+-- 교사 대시보드 및 심사 대기 목록 조회 최적화 복합 인덱스 (SECURITY_AND_AUDIT.md 2.4)
+CREATE INDEX idx_submissions_teacher_filter
+  ON submissions (is_deleted, status_code, created_at DESC, submission_id DESC);
