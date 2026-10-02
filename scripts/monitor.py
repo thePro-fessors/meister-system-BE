@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Meister 관제 터미널 모니터 (scripts/monitor.py)
 
-서버(FastAPI)가 UDP(127.0.0.1:9999)로 브로드캐스팅하는 JSON 로그를 수신하여
+서버(FastAPI)가 UDP(127.0.0.1:5140)로 브로드캐스팅하는 JSON 로그를 수신하여
 Rich 라이브러리로 시각화합니다.
 향후 UDP -> WebSocket 브릿지로 확장하여 웹 대시보드로도 연결 가능합니다.
 """
