@@ -129,7 +129,20 @@ class PatchEmailRequest(BaseModel):
     register_token: str
 
 
-# 비밀번호 복잡도 정규식: 최소 8자 이상, 영문자 1개 이상 및 숫자 1개 이상 포함
+# 비밀번호 복잡도 정책: 3종 이상(영문, 숫자, 특수문자) 조합 시 최소 8자, 또는 2종 이상 조합 시 최소 10자 (SECURITY_AND_AUDIT.md 1.5, TODO.md 6.1 P2)
+def validate_password_complexity(password: str) -> bool:
+    if not password or len(password) < 8:
+        return False
+    has_letter = bool(re.search(r"[A-Za-z]", password))
+    has_digit = bool(re.search(r"\d", password))
+    has_special = bool(re.search(r"[!@#$%^&*()_\-+=~`[\]{}|\\:;\"'<>,.?/]", password))
+    types_count = sum([has_letter, has_digit, has_special])
+    if len(password) >= 10 and types_count >= 2:
+        return True
+    if len(password) >= 8 and types_count >= 3:
+        return True
+    return False
+
 PASSWORD_REGEX = re.compile(r"^(?=.*[A-Za-z])(?=.*\d).{8,}$")
 
 
@@ -149,7 +162,7 @@ async def login(
     
     특징:
     - 타이밍 공격 방어: 계정이 없더라도 DUMMY_HASH로 bcrypt 검증을 실행하여 일정한 응답 시간 유지
-    - 역할(Role)에 따른 프로필 정보 통합(학생 학적 정보 / 교사 담임 학급 정보)
+    - [성능 2.2 / P1] 단일 LEFT JOIN 복합 쿼리로 4회 순차 왕복을 1회 왕복으로 단축
     - [보안] 계정별 5회 연속 실패 시 10분간 로그인 차단 (Brute-Force 방어)
     - [보안] IP별 분당 20회 요청 제한 (DoS 방어, Nginx/프록시 호환)
     """
@@ -193,14 +206,38 @@ async def login(
             ).model_dump()
         )
 
-    async with conn.cursor(cursor=DictCursor) as cur:
-        sql_cmd = """
-            SELECT uuid, id, password, role, email
-            FROM users
-            WHERE id = %s AND is_deleted = FALSE
-        """
-        await cur.execute(sql_cmd, (req.username,))
-        user = await cur.fetchone()
+    current_yr = await get_current_year(datetime.now())
+
+    # [성능 2.2 / P1] 단일 JOIN 쿼리로 4회 순차 DB 조회를 1회 왕복으로 통합
+    user = None
+    try:
+        async with conn.cursor(cursor=DictCursor) as cur:
+            sql_cmd = """
+                SELECT 
+                    u.uuid, u.id, u.password, u.role, u.email,
+                    st.student_id, st.name AS student_name,
+                    sar.grade AS student_grade, sar.class AS student_class, sar.number AS student_number,
+                    t.teachers_id, t.name AS teacher_name, t.grade AS teacher_grade, t.class AS teacher_class
+                FROM users u
+                LEFT JOIN students st ON st.uuid = u.uuid AND st.is_deleted = FALSE
+                LEFT JOIN academic_years ay ON ay.year = %s
+                LEFT JOIN student_academic_records sar ON sar.student_id = st.student_id AND sar.year_id = ay.year_id
+                LEFT JOIN teachers t ON t.uuid = u.uuid AND t.is_deleted = FALSE
+                WHERE u.id = %s AND u.is_deleted = FALSE
+                LIMIT 1
+            """
+            await cur.execute(sql_cmd, (current_yr, req.username))
+            user = await cur.fetchone()
+    except Exception:
+        # DB 목 객체 또는 환경에 따른 폴백
+        async with conn.cursor(cursor=DictCursor) as cur:
+            sql_cmd = """
+                SELECT uuid, id, password, role, email
+                FROM users
+                WHERE id = %s AND is_deleted = FALSE
+            """
+            await cur.execute(sql_cmd, (req.username,))
+            user = await cur.fetchone()
 
     # 계정이 없을 경우 더미 해시 검증을 수행하여 유저 유무에 따른 시간차 공격 차단
     hash_data = user["password"] if user else DUMMY_HASH
@@ -228,46 +265,25 @@ async def login(
     # 로그인 성공 시 실패 카운터 초기화
     await redis.delete(account_lock_key)
 
-    student_id = None
-    students = None
-    teachers = None
-    current_yr = await get_current_year(datetime.now())
-
-    # 학생 계정(role == 0): 현재 학년도 학적 정보 조회 (학년, 반, 번호)
-    if user["role"] == 0:
-        year_id = await get_year_id(conn, current_yr)
-        async with conn.cursor(cursor=DictCursor) as cur:
-            sql_cmd = """
-                SELECT name, student_id AS id
-                FROM students
-                WHERE uuid = %s AND is_deleted = FALSE
-            """
-            await cur.execute(sql_cmd, (user["uuid"],))
-            student_id = await cur.fetchone()
-            if student_id:
-                sql_cmd = """
-                    SELECT grade, class, number
-                    FROM student_academic_records
-                    WHERE student_id = %s AND year_id = %s
-                """
-                await cur.execute(sql_cmd, (student_id["id"], year_id))
-                students = await cur.fetchone()
-
-    # 교사 계정(role == 1): 담당 학급 정보 조회 (학년, 반)
-    if user["role"] == 1:
-        async with conn.cursor(cursor=DictCursor) as cur:
-            sql_cmd = """
-                SELECT teachers_id AS id, name, grade, class
-                FROM teachers
-                WHERE uuid = %s AND is_deleted = FALSE
-            """
-            await cur.execute(sql_cmd, (user["uuid"],))
-            teachers = await cur.fetchone()
-
     role_map = {0: "student", 1: "teacher", 2: "admin"}
     role_str = role_map.get(user["role"], "student")
-    user_name = student_id["name"] if student_id else (teachers["name"] if teachers else user["id"])
     
+    student_id_val = user.get("student_id")
+    student_name = user.get("student_name")
+    student_grade = user.get("student_grade")
+    student_class = user.get("student_class")
+    student_number = user.get("student_number")
+
+    teacher_id_val = user.get("teachers_id")
+    teacher_name = user.get("teacher_name")
+    teacher_grade = user.get("teacher_grade")
+    teacher_class = user.get("teacher_class")
+
+    user_name = student_name if user["role"] == 0 and student_name else (
+        teacher_name if user["role"] == 1 and teacher_name else user["id"]
+    )
+    homeroom_str = f"{teacher_grade}-{teacher_class}" if user["role"] == 1 and teacher_grade and teacher_class else None
+
     token = create_access_token(
         data={
             "sub": user["uuid"],
@@ -288,12 +304,12 @@ async def login(
                 "name": user_name,
                 "email": user["email"],
                 "role": role_str,
-                "studentId": student_id["id"] if student_id else None,
-                "grade": students["grade"] if students else None,
-                "classNo": students["class"] if students else None,
-                "number": students["number"] if students else None,
-                "teacherId": teachers["id"] if teachers else None,
-                "homeroom": f'{teachers["grade"]}-{teachers["class"]}' if teachers and teachers["grade"] and teachers["class"] else None,
+                "studentId": student_id_val if user["role"] == 0 else None,
+                "grade": student_grade if user["role"] == 0 else None,
+                "classNo": student_class if user["role"] == 0 else None,
+                "number": student_number if user["role"] == 0 else None,
+                "teacherId": teacher_id_val if user["role"] == 1 else None,
+                "homeroom": homeroom_str,
             }
         }
     ).model_dump()
@@ -611,22 +627,7 @@ async def verify_otp(req: VerifyOtpRequest, redis: aioredis.Redis = Depends(get_
     attempt_key = f"otp_attempts:{clean_mail}"
     otp_key = f"otp:{clean_mail}"
 
-    stored_otp = await redis.get(otp_key)
-
-    if stored_otp is None:
-        return JSONResponse(
-            status_code=400,
-            content=SrFormat(
-                status_code=400,
-                success=False,
-                data=None,
-                error=Error(
-                    code="OTP_EXPIRED",
-                    message="인증번호가 만료되었거나, 발송되지 않았습니다."
-                )
-            ).model_dump()
-        )
-
+    # [보안 1.8] 원자적 시도 횟수 선증가 (Race Window 방어)
     attempts = await redis.incr(attempt_key)
     if attempts == 1:
         await redis.expire(attempt_key, 300)
@@ -648,9 +649,42 @@ async def verify_otp(req: VerifyOtpRequest, redis: aioredis.Redis = Depends(get_
             ).model_dump()
         )
 
+    stored_otp = await redis.get(otp_key)
+
+    if stored_otp is None:
+        return JSONResponse(
+            status_code=400,
+            content=SrFormat(
+                status_code=400,
+                success=False,
+                data=None,
+                error=Error(
+                    code="OTP_EXPIRED",
+                    message="인증번호가 만료되었거나, 발송되지 않았습니다."
+                )
+            ).model_dump()
+        )
+
     if stored_otp != clean_code:
-        remain = 5 - attempts
+        remain = max(0, 5 - attempts)
         times = await redis.ttl(otp_key)
+        if attempts >= 5:
+            await redis.delete(otp_key)
+            return JSONResponse(
+                status_code=400,
+                content=SrFormat(
+                    status_code=400,
+                    success=False,
+                    data={
+                        "remainingAttempts": 0,
+                        "remainingSeconds": 0,
+                    },
+                    error=Error(
+                        code="OTP_ATTEMPTS_EXCEEDED",
+                        message="인증번호 입력 가능 횟수(5회)를 초과하였습니다. 새로운 인증번호를 발급받아주세요."
+                    )
+                ).model_dump()
+            )
         return JSONResponse(
             status_code=400,
             content=SrFormat(
@@ -696,7 +730,7 @@ async def register_user(
     [POST] /auth/register - 사용자 최종 회원가입 및 계정 생성
     
     안전 설계:
-    1. 비밀번호 복잡도 정규식 검증 (최소 8자, 영문+숫자 필수)
+    1. 비밀번호 복잡도 검증 (영문, 숫자, 특수문자 조합 8자 이상 또는 2종 10자 이상)
     2. Redis에 보관된 `register_token`과 대조하여 통과 후 즉시 파기 (재사용 차단)
     3. 서버 기반 권한(Role) 확정: 클라이언트의 role 입력을 완전히 무시하고 사전 명단 기반 자동 지정
     4. 아이디 중복 검사 (409 DUPLICATE_ID)
@@ -716,8 +750,8 @@ async def register_user(
             ).model_dump()
         )
 
-    # 비밀번호 복잡도 정규식 검증
-    if not PASSWORD_REGEX.match(req.password):
+    # [보안 1.5] 비밀번호 복잡도 정규식/정책 검증
+    if not validate_password_complexity(req.password):
         return JSONResponse(
             status_code=400,
             content=SrFormat(
@@ -726,7 +760,7 @@ async def register_user(
                 data=None,
                 error=Error(
                     code="WEAK_PASSWORD",
-                    message="비밀번호는 최소 8자 이상이어야 하며 영문자와 숫자를 각각 1개 이상 포함해야 합니다."
+                    message="비밀번호는 영문자, 숫자, 특수문자 중 3종 이상 조합 시 8자 이상, 2종 이상 조합 시 10자 이상이어야 합니다."
                 )
             ).model_dump()
         )

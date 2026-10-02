@@ -319,3 +319,11 @@ CREATE INDEX idx_cert_areas_year_grade
 -- 학생별 반영 상벌점 일자 범위 검색 최적화 (Index-Only Scan 유도)
 CREATE INDEX idx_merits_lookup
   ON merits (student_id, is_reflected, is_deleted, occurred_at);
+
+-- 제출 내역 정렬 최적화 복합 인덱스 (SECURITY_AND_AUDIT.md 2.1 & TODO.md 6.2 P0)
+CREATE INDEX idx_submissions_history 
+  ON submissions (student_id, is_deleted, created_at DESC, submission_id DESC);
+
+-- 상벌점 내역 정렬 최적화 복합 인덱스 (SECURITY_AND_AUDIT.md 2.1 & TODO.md 6.2 P0)
+CREATE INDEX idx_merits_history 
+  ON merits (student_id, is_deleted, occurred_at DESC, merits_point_id DESC);

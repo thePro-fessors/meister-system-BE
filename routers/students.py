@@ -270,8 +270,9 @@ async def get_certification_status(
         # 2. RBAC 및 학생 본인 소유권 검증 (Authorization)
         #    - 학생은 다른 학생의 학적 및 점수를 열람할 수 없습니다.
         #    - 교사와 관리자는 담당 업무 수행을 위해 열람이 허용됩니다.
+        #    - (SECURITY_AND_AUDIT.md 1.3: 정수형 role 0 인입 시 IDOR 방어 강화)
         # ----------------------------------------------------------------------
-        if user_role == "student" and target_student["uuid"] != user_uuid:
+        if user_role in ("student", "0", 0) and target_student["uuid"] != user_uuid:
             return JSONResponse(
                 status_code=status.HTTP_403_FORBIDDEN,
                 content=SrFormat(
