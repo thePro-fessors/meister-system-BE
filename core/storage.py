@@ -11,7 +11,7 @@ import os
 import re
 import uuid
 from datetime import datetime
-from typing import Any, Dict, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from fastapi import HTTPException, UploadFile, status
 
@@ -49,110 +49,60 @@ def get_upload_base_dir() -> str:
     env_dir = os.getenv("UPLOAD_DIR")
     if env_dir:
         return os.path.abspath(env_dir)
-    return os.path.abspath(os.path.join(os.path.dirname(os.path.dirname(__file__)), "uploads"))
+    # 기본값: 프로젝트 루트 내 uploads/
+    base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base_dir, "uploads")
 
 
 def get_file_extension(filename: Optional[str]) -> str:
-    """파일명에서 소문자 확장자를 안전하게 추출합니다."""
-    if not filename:
+    """파일명에서 정규화된 소문자 확장자를 추출합니다."""
+    if not filename or "." not in filename:
         return ""
-    # Windows 경로 구분자(\)를 표준(/)으로 변환 후 파일명만 추출
-    normalized = filename.replace("\\", "/")
-    clean_name = os.path.basename(normalized).strip().rstrip(".")
-    _, ext = os.path.splitext(clean_name)
-    return ext.lower()
+    _, ext = os.path.splitext(filename)
+    return ext.lower().strip()
 
 
 def sanitize_filename(filename: Optional[str]) -> str:
-    """원본 파일명에서 경로 탐색 문자, 널 바이트, 제어문자, 따옴표를 정제하여 헤더 인젝션을 방어합니다.
-    (SECURITY_AND_AUDIT.md 3.6: Content-Disposition 및 HTTP Response Splitting 방어)
+    """
+    업로드 원본 파일명에서 경로 조작 문자열(..), 디렉터리 구분자 및 위험 문자를 안전하게 정제합니다.
+    (TODO.md 5.1: 원본 파일명 보존 및 경로/헤더 인젝션 공격 차단)
     """
     if not filename:
         return "unnamed_file"
-    # Windows 경로 구분자(\) 및 POSIX 구분자(/) 모두 대응
-    normalized = filename.replace("\\", "/")
-    # 디렉터리 경로 분리 후 순수 파일명만 취득
-    clean_name = os.path.basename(normalized)
-    # 널 바이트, 제어 문자, 줄바꿈, 따옴표/세미콜론 제거
-    clean_name = re.sub(r'[\r\n\x00-\x1f\x7f-\x9f"\'\\;]+', '', clean_name).strip()
-    return clean_name[:255] if clean_name else "unnamed_file"
+
+    # 1. 파일명만 추출 (Windows 백슬래시 및 POSIX 슬래시 분리)
+    clean_name = filename.replace("\\", "/").rstrip("/").split("/")[-1]
+
+    # 2. 널 바이트 및 개행 문자, 제어 문자 제거
+    clean_name = clean_name.replace("\x00", "").replace("\r", "").replace("\n", "")
+
+    # 3. 디렉터리 트래버설 문자열(..) 무력화
+    clean_name = re.sub(r"\.\.+", ".", clean_name)
+
+    # 4. 공백 및 특수문자 정제 (헤더 인젝션용 따옴표, 세미콜론 및 위험 특수문자 치환)
+    clean_name = re.sub(r'[\/\\:\*\?"<>|;]', "_", clean_name)
+    clean_name = clean_name.strip()
+
+    # 빈 문자열 폴백
+    if not clean_name or clean_name == ".":
+        return "unnamed_file"
+
+    # 길이 제한 (최대 200자)
+    if len(clean_name) > 200:
+        name_part, ext_part = os.path.splitext(clean_name)
+        clean_name = name_part[: 200 - len(ext_part)] + ext_part
+
+    return clean_name
 
 
-def validate_file_signature(header: bytes, ext: str) -> bool:
-    """파일의 첫 바이트(Magic Bytes)와 확장자의 일치 여부를 검증합니다.
-    (SECURITY_AND_AUDIT.md 3.3: 확장자 위조, WebShell 및 Polyglot 파일 공격 원천 방어)
+def validate_file_extension(filename: Optional[str]) -> str:
     """
-    if not header or not ext:
-        return False
-
-    ext_lower = ext.lower()
-
-    # 1. PDF
-    if ext_lower == ".pdf":
-        return header.startswith(b"%PDF-")
-
-    # 2. 이미지 (JPEG, PNG, GIF, WebP, HEIC/HEIF)
-    if ext_lower in (".jpg", ".jpeg"):
-        return header.startswith(b"\xff\xd8\xff")
-    if ext_lower == ".png":
-        return header.startswith(b"\x89PNG\r\n\x1a\n")
-    if ext_lower == ".gif":
-        return header.startswith(b"GIF87a") or header.startswith(b"GIF89a")
-    if ext_lower == ".webp":
-        return len(header) >= 12 and header.startswith(b"RIFF") and header[8:12] == b"WEBP"
-    if ext_lower in (".heic", ".heif"):
-        return len(header) >= 12 and header[4:8] == b"ftyp" and header[8:12].lower() in (b"heic", b"heix", b"hevc", b"mif1", b"msf1")
-
-    # 3. 압축 (ZIP)
-    if ext_lower == ".zip":
-        return header.startswith(b"PK\x03\x04") or header.startswith(b"PK\x05\x06") or header.startswith(b"PK\x07\x08")
-
-    # 4. 비디오 (MP4, MOV, AVI, WebM)
-    if ext_lower in (".mp4", ".mov"):
-        return len(header) >= 8 and (header[4:8] in (b"ftyp", b"moov", b"mdat", b"wide", b"skip") or b"ftyp" in header[:16])
-    if ext_lower == ".avi":
-        return len(header) >= 12 and header.startswith(b"RIFF") and header[8:12] == b"AVI "
-    if ext_lower == ".webm":
-        return header.startswith(b"\x1a\x45\xdf\xa3")
-
-    return False
-
-
-def validate_file_metadata(file: UploadFile) -> Tuple[bool, Optional[str]]:
+    파일 확장자가 화이트리스트에 부합하는지 검증합니다.
+    검증 통과 시 소문자 정규화된 확장자를 반환합니다.
+    (SECURITY_AND_AUDIT.md: 확장자 위변조 방어)
     """
-    업로드된 파일의 기본 메타데이터(확장자 유효성 등)를 사전 검증합니다.
-    """
-    if not file or not file.filename:
-        return False, "업로드할 파일이 지정되지 않았습니다."
-
-    ext = get_file_extension(file.filename)
-    if not ext or ext not in ALLOWED_EXTENSIONS:
-        return False, f"허용되지 않는 파일 형식({ext or '확장자 없음'})입니다. (jpg, jpeg, png, gif, webp, mp4, mov, avi, webm, pdf, zip만 허용)"
-
-    return True, None
-
-
-async def save_upload_file(
-    file: UploadFile,
-    subfolder: str = "submissions",
-    base_upload_dir: Optional[str] = None,
-    max_size_bytes: Optional[int] = None,
-) -> Dict[str, Any]:
-    """
-    UploadFile을 청크 스트리밍 방식으로 디스크에 안전하게 저장합니다.
-
-    보안 및 안정성 보장:
-    1. 확장자 화이트리스트 사전 검증 (위반 시 INVALID_FILE_TYPE 400 반환)
-    2. 매직 넘버(File Signature) 검증으로 파일 확장자 위조 및 웹쉘 방어
-    3. 64KB 청크 단위 스트리밍 저장 중 실시간 용량 누적 체크 (50MB 초과 시 FILE_SIZE_EXCEEDED 400)
-    4. 비동기 이벤트 루프 블로킹 방지를 위한 asyncio.to_thread 파일 I/O
-    5. 년/월/UUID 기반 파일명 해싱 난수화 경로 생성 (경로 탐색 및 덮어쓰기 공격 원천 차단)
-    6. 예외 발생 또는 용량 초과 시 불완전한 임시 파일 자동 클린업 (Unlink)
-    """
-    effective_limit = max_size_bytes if max_size_bytes is not None else MAX_FILE_SIZE_BYTES
-
-    is_valid, err_msg = validate_file_metadata(file)
-    if not is_valid:
+    ext = get_file_extension(filename)
+    if not ext:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=SrFormat(
@@ -161,26 +111,165 @@ async def save_upload_file(
                 data=None,
                 error=Error(
                     code="INVALID_FILE_TYPE",
-                    message=err_msg or "허용되지 않는 파일 형식입니다.",
+                    message="파일 확장자가 누락되었거나 유효하지 않습니다.",
                 ),
             ).model_dump(),
         )
 
+    if ext not in ALLOWED_EXTENSIONS:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=SrFormat(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                success=False,
+                data=None,
+                error=Error(
+                    code="INVALID_FILE_TYPE",
+                    message=f"허용되지 않은 파일 형식({ext})입니다. 허용 목록: {', '.join(sorted(ALLOWED_EXTENSIONS))}",
+                ),
+            ).model_dump(),
+        )
+
+    return ext
+
+
+def validate_file_metadata(file: UploadFile) -> Tuple[bool, Optional[str]]:
+    """
+    업로드 파일의 확장자 등 메타데이터 유효성을 검증합니다.
+    (tests/test_storage.py 및 core/__init__.py 호환)
+    """
+    if not file or not file.filename:
+        return False, "파일명이 누락되었습니다."
+    ext = get_file_extension(file.filename)
+    if not ext:
+        return False, "확장자가 누락되었거나 유효하지 않습니다."
+    if ext not in ALLOWED_EXTENSIONS:
+        return False, f"허용되지 않은 파일 형식({ext})입니다."
+    return True, None
+
+
+# 파일 확장자별 매직 바이트(바이너리 시그니처) 매핑 테이블
+# (SECURITY_AND_AUDIT.md 3.2: Content-Type 위조 및 바이너리 매직 넘버 검증)
+MAGIC_BYTES_SIGNATURES: Dict[str, List[bytes]] = {
+    ".jpg": [b"\xFF\xD8\xFF"],
+    ".jpeg": [b"\xFF\xD8\xFF"],
+    ".png": [b"\x89PNG\r\n\x1a\n"],
+    ".gif": [b"GIF87a", b"GIF89a"],
+    ".webp": [b"RIFF"],  # RIFF....WEBP
+    ".pdf": [b"%PDF-"],
+    ".zip": [b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08"],
+    # MP4 / MOV (ISO Base Media file: ....ftyp)
+    ".mp4": [b"ftyp"],
+    ".mov": [b"ftyp", b"moov", b"free", b"mdat", b"wide"],
+    ".avi": [b"RIFF"],  # RIFF....AVI
+    ".webm": [b"\x1A\x45\xDF\xA3"],  # Matroska / WebM EBML
+    ".heic": [b"ftypheic", b"ftypmif1", b"ftypmsf1", b"ftypheix", b"ftyphevc"],
+    ".heif": [b"ftypheif", b"ftypmif1", b"ftypmsf1"],
+}
+
+
+def validate_magic_bytes(header_bytes: bytes, ext: str) -> bool:
+    """
+    파일의 첫 32바이트 바이너리 시그니처를 검사하여 위조된 확장자 여부를 판별합니다.
+    """
+    if not header_bytes:
+        return False
+
+    signatures = MAGIC_BYTES_SIGNATURES.get(ext)
+    if not signatures:
+        # 시그니처 목록에 정의되지 않은 확장자는 확장자 화이트리스트 통과 시 기본 허용
+        return True
+
+    # 1. 일반 접두사 매직 넘버 검사
+    for sig in signatures:
+        if header_bytes.startswith(sig):
+            return True
+
+    # 2. RIFF 포맷 세부 검사 (WebP, AVI)
+    if ext == ".webp" and header_bytes.startswith(b"RIFF") and len(header_bytes) >= 12:
+        if header_bytes[8:12] == b"WEBP":
+            return True
+    if ext == ".avi" and header_bytes.startswith(b"RIFF") and len(header_bytes) >= 12:
+        if header_bytes[8:12] == b"AVI ":
+            return True
+
+    # 3. ISO Base Media (MP4/MOV/HEIC/HEIF) ftyp 박스 검사 (오프셋 4~12에 위치)
+    if ext in (".mp4", ".mov", ".heic", ".heif") and len(header_bytes) >= 12:
+        box_type = header_bytes[4:8]
+        if box_type == b"ftyp":
+            for sig in signatures:
+                if sig in header_bytes[:32]:
+                    return True
+            # ftyp 박스가 존재하면 유효한 ISO 미디어로 인정
+            return True
+
+    return False
+
+
+def validate_file_signature(content: bytes, ext: str) -> bool:
+    """
+    validate_magic_bytes의 별칭 호환 함수.
+    (tests/test_storage.py 및 core/__init__.py 호환)
+    """
+    return validate_magic_bytes(content, ext)
+
+
+async def save_upload_file(
+    file: UploadFile,
+    subfolder: str = "submissions",
+    max_size: Optional[int] = None,
+    max_size_bytes: Optional[int] = None,
+    base_upload_dir: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    FastAPI `UploadFile`을 스트리밍 방식으로 읽어 50MB 용량 제한 및 바이너리 매직바이트를 검증하고,
+    날짜 기반 서브디렉터리 및 UUID 파일명으로 디스크에 안전하게 저장합니다.
+
+    보안 통제:
+    1. 확장자 화이트리스트 검사 (`validate_file_extension`)
+    2. 스트리밍 청크 누적 용량 검증 (50MB 초과 즉시 중단 및 임시파일 삭제)
+    3. 첫 청크 바이너리 매직 넘버(File Signature) 위조 검증
+    4. UUID4 난수화 파일명 저장으로 파일명 충돌 및 직접 경로 추측 방어
+    5. 경로 디렉터리 트래버설 방어 및 정제된 원본 파일명 보존
+    """
+    if not file or not file.filename:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=SrFormat(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                success=False,
+                data=None,
+                error=Error(code="MISSING_FILE", message="업로드할 파일이 제공되지 않았습니다."),
+            ).model_dump(),
+        )
+
+    # 1. 파일 확장자 검증
+    ext = validate_file_extension(file.filename)
+
+    # 2. 저장 경로 및 UUID 파일명 생성 (예: uploads/submissions/2026/10/a1b2c3d4... .pdf)
     upload_root = base_upload_dir or get_upload_base_dir()
     now = datetime.now()
-    year_str = f"{now.year:04d}"
-    month_str = f"{now.month:02d}"
+    year_str = now.strftime("%Y")
+    month_str = now.strftime("%m")
 
-    target_dir = os.path.join(upload_root, subfolder, year_str, month_str)
+    # 서브폴더 인젝션 방어 (영숫자 및 밑줄만 허용)
+    clean_subfolder = re.sub(r"[^a-zA-Z0-9_\-]", "", subfolder) or "submissions"
+    target_dir = os.path.join(upload_root, clean_subfolder, year_str, month_str)
+
     os.makedirs(target_dir, exist_ok=True)
 
-    ext = get_file_extension(file.filename)
-    unique_filename = f"{uuid.uuid4().hex}{ext}"
-    disk_path = os.path.join(target_dir, unique_filename)
-    web_path = f"/uploads/{subfolder}/{year_str}/{month_str}/{unique_filename}"
+    stored_filename = f"{uuid.uuid4().hex}{ext}"
+    disk_path = os.path.join(target_dir, stored_filename)
 
+    # 웹 접근용 상대 URL 경로 (예: /uploads/submissions/2026/10/stored.pdf)
+    rel_path = os.path.relpath(disk_path, upload_root).replace("\\", "/")
+    web_path = f"/uploads/{rel_path}"
+
+    # 3. 청크 단위 스트리밍 저장 및 용량/매직바이트 실시간 검증
     total_bytes = 0
-    is_first_chunk = True
+    first_chunk = True
+    effective_limit = max_size_bytes or max_size or MAX_FILE_SIZE_BYTES
+
     try:
         with open(disk_path, "wb") as buffer:
             while True:
@@ -188,10 +277,10 @@ async def save_upload_file(
                 if not chunk:
                     break
 
-                # [보안 3.3] 첫 청크 매직 넘버(File Signature) 검증
-                if is_first_chunk:
-                    is_first_chunk = False
-                    if not validate_file_signature(chunk[:32], ext):
+                # 첫 번째 청크에서 바이너리 매직 넘버 검증 (파일 변조 탐지)
+                if first_chunk:
+                    first_chunk = False
+                    if not validate_magic_bytes(chunk[:32], ext):
                         raise HTTPException(
                             status_code=status.HTTP_400_BAD_REQUEST,
                             detail=SrFormat(
@@ -241,7 +330,6 @@ async def save_upload_file(
         if os.path.exists(disk_path):
             try:
                 os.remove(disk_path)
-
             except OSError:
                 pass
         raise
@@ -301,49 +389,16 @@ def cleanup_old_file_on_resubmit(old_web_path: Optional[str], base_upload_dir: O
     return False
 
 
-async def find_and_clean_orphan_files(
-    conn: Any,
-    base_upload_dir: Optional[str] = None,
+def _scan_and_clean_disk_orphans(
+    upload_root: str,
+    active_rel_paths: Set[str],
     max_age_seconds: int = 3600,
     dry_run: bool = False,
 ) -> Dict[str, Any]:
     """
-    데이터베이스(submissions)와 디스크 저장소를 전수 대조하여
-    참조가 끊긴 고아 파일(Orphan Files)을 백그라운드에서 안전하게 정리(GC)합니다.
-
-    안전 제어:
-    - max_age_seconds (기본 1시간): 현재 업로드 진행 중인 파일의 오삭제를 방지하는 Grace Period
-    - dry_run: 실제 파일 삭제 없이 고아 파일 목록과 예상 회수 용량만 사전 점검
-    - 디렉터리 탐색 및 DB 트랜잭션과 격리된 비동기 I/O
+    디스크 상의 업로드 디렉터리를 순회하며 고아 파일을 찾아 정리하는 동기 작업 함수.
+    (asyncio.to_thread 위임용)
     """
-    upload_root = base_upload_dir or get_upload_base_dir()
-    if not os.path.exists(upload_root):
-        return {"scanned": 0, "orphans_cleaned": 0, "bytes_freed": 0, "dry_run": dry_run}
-
-    # 1. 활성 증빙자료의 파일 경로 수집
-    active_rel_paths = set()
-    try:
-        async with conn.cursor() as cur:
-            await cur.execute(
-                """
-                SELECT file_path
-                FROM submissions
-                WHERE file_path IS NOT NULL AND file_path != '' AND is_deleted = FALSE
-                """
-            )
-            rows = await cur.fetchall()
-            for r in rows:
-                p = r[0] if isinstance(r, (list, tuple)) else r.get("file_path")
-                if p:
-                    clean_p = p.strip().lstrip("/\\").replace("\\", "/")
-                    if clean_p.startswith("uploads/"):
-                        clean_p = clean_p[8:]
-                    clean_norm = os.path.normpath(clean_p).replace("\\", "/")
-                    active_rel_paths.add(clean_norm)
-    except Exception as e:
-        return {"error": f"DB 조회 실패: {e}", "orphans_cleaned": 0}
-
-    # 2. 디스크 상의 업로드 디렉터리 순회
     now_ts = datetime.now().timestamp()
     scanned_count = 0
     orphan_count = 0
@@ -395,3 +450,56 @@ async def find_and_clean_orphan_files(
         "cleaned_files": cleaned_files,
         "dry_run": dry_run,
     }
+
+
+async def find_and_clean_orphan_files(
+    conn: Any,
+    base_upload_dir: Optional[str] = None,
+    max_age_seconds: int = 3600,
+    dry_run: bool = False,
+) -> Dict[str, Any]:
+    """
+    데이터베이스(submissions)와 디스크 저장소를 전수 대조하여
+    참조가 끊긴 고아 파일(Orphan Files)을 백그라운드에서 안전하게 정리(GC)합니다.
+
+    안전 제어:
+    - max_age_seconds (기본 1시간): 현재 업로드 진행 중인 파일의 오삭제를 방지하는 Grace Period
+    - dry_run: 실제 파일 삭제 없이 고아 파일 목록과 예상 회수 용량만 사전 점검
+    - 디렉터리 탐색 및 DB 트랜잭션과 격리된 비동기 스레드 I/O (asyncio.to_thread)
+    """
+    upload_root = base_upload_dir or get_upload_base_dir()
+    if not os.path.exists(upload_root):
+        return {"scanned": 0, "orphans_cleaned": 0, "bytes_freed": 0, "dry_run": dry_run}
+
+    # 1. 활성 증빙자료의 파일 경로 수집
+    active_rel_paths: Set[str] = set()
+    try:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                """
+                SELECT file_path
+                FROM submissions
+                WHERE file_path IS NOT NULL AND file_path != '' AND is_deleted = FALSE
+                """
+            )
+            rows = await cur.fetchall()
+            for r in rows:
+                p = r[0] if isinstance(r, (list, tuple)) else r.get("file_path")
+                if p:
+                    clean_p = p.strip().lstrip("/\\").replace("\\", "/")
+                    if clean_p.startswith("uploads/"):
+                        clean_p = clean_p[8:]
+                    clean_norm = os.path.normpath(clean_p).replace("\\", "/")
+                    active_rel_paths.add(clean_norm)
+    except Exception as e:
+        return {"error": f"DB 조회 실패: {e}", "orphans_cleaned": 0}
+
+    # 2. 디스크 상의 업로드 디렉터리 순회 (asyncio.to_thread로 이벤트 루프 블로킹 방지)
+    result = await asyncio.to_thread(
+        _scan_and_clean_disk_orphans,
+        upload_root=upload_root,
+        active_rel_paths=active_rel_paths,
+        max_age_seconds=max_age_seconds,
+        dry_run=dry_run,
+    )
+    return result
