@@ -271,3 +271,127 @@ def delete_uploaded_file(disk_path: Optional[str]) -> bool:
     except OSError:
         pass
     return False
+
+
+def cleanup_old_file_on_resubmit(old_web_path: Optional[str], base_upload_dir: Optional[str] = None) -> bool:
+    """
+    증빙자료 재제출(Resubmit) 또는 대체 시, 기존 파일이 디스크에 고아 파일(Orphan File)로
+    방치되지 않도록 안전하게 삭제합니다.
+    (SECURITY_AND_AUDIT.md 4.1 권고 및 TODO.md 2.6)
+    """
+    if not old_web_path or not isinstance(old_web_path, str):
+        return False
+
+    upload_root = base_upload_dir or get_upload_base_dir()
+    clean_rel = old_web_path.strip().lstrip("/\\")
+    if clean_rel.startswith("uploads/"):
+        clean_rel = clean_rel[8:]
+
+    abs_path = os.path.abspath(os.path.join(upload_root, clean_rel))
+
+    # 상위 경로 탐색 방어: upload_root 외부 파일 삭제 차단
+    try:
+        if os.path.commonpath([upload_root, abs_path]) != upload_root:
+            return False
+    except ValueError:
+        return False
+
+    if os.path.isfile(abs_path):
+        return delete_uploaded_file(abs_path)
+    return False
+
+
+async def find_and_clean_orphan_files(
+    conn: Any,
+    base_upload_dir: Optional[str] = None,
+    max_age_seconds: int = 3600,
+    dry_run: bool = False,
+) -> Dict[str, Any]:
+    """
+    데이터베이스(submissions)와 디스크 저장소를 전수 대조하여
+    참조가 끊긴 고아 파일(Orphan Files)을 백그라운드에서 안전하게 정리(GC)합니다.
+
+    안전 제어:
+    - max_age_seconds (기본 1시간): 현재 업로드 진행 중인 파일의 오삭제를 방지하는 Grace Period
+    - dry_run: 실제 파일 삭제 없이 고아 파일 목록과 예상 회수 용량만 사전 점검
+    - 디렉터리 탐색 및 DB 트랜잭션과 격리된 비동기 I/O
+    """
+    upload_root = base_upload_dir or get_upload_base_dir()
+    if not os.path.exists(upload_root):
+        return {"scanned": 0, "orphans_cleaned": 0, "bytes_freed": 0, "dry_run": dry_run}
+
+    # 1. 활성 증빙자료의 파일 경로 수집
+    active_rel_paths = set()
+    try:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                """
+                SELECT file_path
+                FROM submissions
+                WHERE file_path IS NOT NULL AND file_path != '' AND is_deleted = FALSE
+                """
+            )
+            rows = await cur.fetchall()
+            for r in rows:
+                p = r[0] if isinstance(r, (list, tuple)) else r.get("file_path")
+                if p:
+                    clean_p = p.strip().lstrip("/\\").replace("\\", "/")
+                    if clean_p.startswith("uploads/"):
+                        clean_p = clean_p[8:]
+                    clean_norm = os.path.normpath(clean_p).replace("\\", "/")
+                    active_rel_paths.add(clean_norm)
+    except Exception as e:
+        return {"error": f"DB 조회 실패: {e}", "orphans_cleaned": 0}
+
+    # 2. 디스크 상의 업로드 디렉터리 순회
+    now_ts = datetime.now().timestamp()
+    scanned_count = 0
+    orphan_count = 0
+    freed_bytes = 0
+    cleaned_files = []
+
+    for root, _, files in os.walk(upload_root):
+        for f in files:
+            abs_disk_path = os.path.join(root, f)
+            scanned_count += 1
+
+            try:
+                stat = os.stat(abs_disk_path)
+            except OSError:
+                continue
+
+            # Grace period 검사: 최근 생성된 파일은 업로드 진행 중일 수 있으므로 보존
+            if now_ts - stat.st_mtime < max_age_seconds:
+                continue
+
+            rel_from_root = os.path.relpath(abs_disk_path, upload_root).replace("\\", "/").strip().lstrip("/\\")
+            if rel_from_root.startswith("uploads/"):
+                rel_from_root = rel_from_root[8:]
+            rel_norm = os.path.normpath(rel_from_root).replace("\\", "/")
+            web_path = f"/uploads/{rel_norm}"
+
+            # DB에 등록되어 있지 않은 파일인 경우 고아 파일로 판정
+            if rel_norm not in active_rel_paths:
+                orphan_count += 1
+                freed_bytes += stat.st_size
+                cleaned_files.append(web_path)
+
+                if not dry_run:
+                    delete_uploaded_file(abs_disk_path)
+
+    # 3. 비어 있는 디렉터리 후속 정리 (역방향 순회)
+    if not dry_run:
+        for root, dirs, files in os.walk(upload_root, topdown=False):
+            if root != upload_root and not os.listdir(root):
+                try:
+                    os.rmdir(root)
+                except OSError:
+                    pass
+
+    return {
+        "scanned": scanned_count,
+        "orphans_cleaned": orphan_count,
+        "bytes_freed": freed_bytes,
+        "cleaned_files": cleaned_files,
+        "dry_run": dry_run,
+    }
