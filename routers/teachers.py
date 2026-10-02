@@ -40,7 +40,7 @@ router = APIRouter(tags=["Teacher"])
     response_model=SrFormat,
 )
 async def get_teacher_dashboard(
-    year: Optional[int] = Query(None, description="조회 학년도 (미지정 시 현재 학사년도)"),
+    year: Optional[int] = Query(None, description="조회 학년도 (미지정 시 현재 학사학년도)"),
     limit: int = Query(10, ge=1, le=50, description="최근 제출건 조회 개수"),
     current_user: Dict[str, Any] = Depends(get_current_user),
     conn: Any = Depends(get_db),
@@ -178,7 +178,7 @@ async def get_teacher_dashboard(
             sar.class AS class_no,
             sar.number,
             ca.area_id,
-            ca.area_name,
+            ca.name AS area_name,
             ei.item_id,
             ei.name AS item_name,
             s.detail,
