@@ -19,8 +19,39 @@ except (ImportError, ModuleNotFoundError):
 from core.security import get_current_user
 from database import get_db, get_redis
 from routers.students import handle_submit_evidence, handle_get_submissions
-from sr_format import SrFormat
+from pydantic import BaseModel
+from sr_format import Error, SrFormat
 import redis.asyncio as aioredis
+
+SUBMISSION_STATUS_MAP = {
+    1: "제출완료",
+    2: "검토중",
+    3: "인정완료",
+    4: "반려",
+    5: "재제출요청",
+}
+
+
+class ApproveSubmissionRequest(BaseModel):
+    granted_score: Optional[float] = None
+    grantedScore: Optional[float] = None
+    teacher_comment: Optional[str] = None
+    teacherComment: Optional[str] = None
+
+
+class RejectSubmissionRequest(BaseModel):
+    teacher_comment: Optional[str] = None
+    teacherComment: Optional[str] = None
+    status_code: Optional[int] = None
+    statusCode: Optional[int] = None
+
+
+class ModifyScoreRequest(BaseModel):
+    granted_score: Optional[float] = None
+    grantedScore: Optional[float] = None
+    teacher_comment: Optional[str] = None
+    teacherComment: Optional[str] = None
+
 
 router = APIRouter(
     prefix="/api/submissions",
@@ -268,10 +299,12 @@ async def resubmit_evidence(
         new_disk_path = None
 
         # 신규 파일 업로드 처리
+        new_orig_filename = None
         if file and file.filename:
             save_res = await save_upload_file(file, subfolder="submissions")
             new_file_path = save_res["file_path"]
             new_disk_path = save_res["disk_path"]
+            new_orig_filename = save_res.get("original_filename") or file.filename
 
         try:
             await conn.autocommit(False)
@@ -281,22 +314,41 @@ async def resubmit_evidence(
                     UPDATE submissions
                     SET description = %s,
                         file_path = %s,
+                        original_filename = COALESCE(%s, original_filename),
                         link_url = %s,
-                        status_code = 1,
+                        status_code = 2,
+                        granted_score = NULL,
+                        reviewer_id = NULL,
+                        reviewed_at = NULL,
+                        teacher_comment = NULL,
                         updated_at = NOW()
-                    WHERE submission_id = %s
+                    WHERE submission_id = %s AND status_code IN (4, 5)
                     """,
-                    (new_desc, new_file_path, target_link, submission_id),
+                    (new_desc, new_file_path, new_orig_filename, target_link, submission_id),
                 )
 
-                # submissions_logs 스키마 준수 이력 기록
+                if cur.rowcount == 0:
+                    await conn.rollback()
+                    if new_disk_path:
+                        delete_uploaded_file(new_disk_path)
+                    return JSONResponse(
+                        status_code=409,
+                        content=SrFormat(
+                            status_code=409,
+                            success=False,
+                            data=None,
+                            error=Error(code="CONFLICT", message="이미 상태가 변경되었거나 재제출 가능한 상태가 아닙니다."),
+                        ).model_dump(),
+                    )
+
+                # submissions_logs 스키마 준수 이력 기록 (DATA-01)
                 await cur.execute(
                     """
                     INSERT INTO submissions_logs (
                         submission_id, modifier_uuid, action_type,
                         old_status_code, new_status_code, old_score, new_score, comment, created_at
                     )
-                    VALUES (%s, %s, '재제출', %s, 1, %s, NULL, %s, NOW())
+                    VALUES (%s, %s, '재제출', %s, 2, %s, NULL, %s, NOW())
                     """,
                     (submission_id, user_uuid, existing["status_code"], existing.get("granted_score"), new_desc),
                 )
@@ -320,7 +372,7 @@ async def resubmit_evidence(
             data={
                 "id": submission_id,
                 "status": "검토중",
-                "statusCode": 1,
+                "statusCode": 2,
                 "filePath": new_file_path,
                 "linkUrl": target_link,
                 "description": new_desc,
@@ -520,5 +572,519 @@ async def delete_submission(
         status_code=200,
         success=True,
         data={"submissionId": submission_id, "deleted": True},
+    ).model_dump()
+
+
+@router.get(
+    "/{submission_id}",
+    summary="증빙자료 단건 상세 조회 API (API-01)",
+    response_model=SrFormat,
+)
+async def get_submission_detail(
+    submission_id: int,
+    conn: Any = Depends(get_db),
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """
+    증빙자료 단건 상세 조회 엔드포인트 (API-01)
+    - 학생 본인, 교사(담임/교과), 관리자 인가 적용 (SEC-01)
+    """
+    from core.authorization import authorize_submission_access
+    auth_err = await authorize_submission_access(current_user, submission_id, conn, action="read")
+    if auth_err:
+        return auth_err
+
+    async with conn.cursor(cursor=DictCursor) as cur:
+        await cur.execute(
+            """
+            SELECT 
+                s.submission_id AS id,
+                s.student_id AS studentId,
+                st.name AS studentName,
+                sar.grade,
+                sar.class AS classNo,
+                sar.number,
+                s.item_id AS itemId,
+                ei.name AS itemName,
+                ca.area_id AS areaId,
+                ca.name AS areaName,
+                s.detail,
+                s.activity_date AS activityDate,
+                s.description,
+                s.link_url AS linkUrl,
+                s.file_path AS filePath,
+                s.original_filename AS originalFilename,
+                s.status_code AS statusCode,
+                s.granted_score AS grantedScore,
+                ei.max_score AS maxScore,
+                s.reviewer_id AS reviewerId,
+                t.name AS reviewerName,
+                s.reviewed_at AS reviewedAt,
+                s.teacher_comment AS teacherComment,
+                s.created_at AS createdAt,
+                s.updated_at AS updatedAt
+            FROM submissions s
+            JOIN students st ON s.student_id = st.student_id
+            JOIN evaluation_items ei ON s.item_id = ei.item_id
+            JOIN certification_areas ca ON ei.area_id = ca.area_id
+            JOIN academic_years ay ON ca.year_id = ay.year_id
+            LEFT JOIN student_academic_records sar ON sar.student_id = st.student_id AND sar.year_id = ay.year_id
+            LEFT JOIN teachers t ON s.reviewer_id = t.teachers_id
+            WHERE s.submission_id = %s AND s.is_deleted = FALSE
+            LIMIT 1
+            """,
+            (submission_id,),
+        )
+        row = await cur.fetchone()
+
+    if not row:
+        return JSONResponse(
+            status_code=404,
+            content=SrFormat(
+                status_code=404,
+                success=False,
+                data=None,
+                error=Error(code="ITEM_NOT_FOUND", message="증빙자료를 찾을 수 없습니다."),
+            ).model_dump(),
+        )
+
+    st_code = row.get("statusCode", 1)
+    row["status"] = SUBMISSION_STATUS_MAP.get(st_code, "제출완료")
+    for date_field in ("activityDate", "reviewedAt", "createdAt", "updatedAt"):
+        if row.get(date_field) and hasattr(row[date_field], "isoformat"):
+            row[date_field] = row[date_field].isoformat()
+        elif row.get(date_field):
+            row[date_field] = str(row[date_field])
+
+    if row.get("grantedScore") is not None:
+        row["grantedScore"] = float(row["grantedScore"])
+    if row.get("maxScore") is not None:
+        row["maxScore"] = float(row["maxScore"])
+
+    return SrFormat(
+        status_code=200,
+        success=True,
+        data=row,
+    ).model_dump()
+
+
+@router.patch(
+    "/{submission_id}/approve",
+    summary="증빙자료 심사 승인 API (API-01)",
+    response_model=SrFormat,
+)
+async def approve_submission(
+    submission_id: int,
+    req: ApproveSubmissionRequest,
+    conn: Any = Depends(get_db),
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """
+    증빙자료 심사 승인 엔드포인트 (API-01)
+    - 교사(담임/교과) 및 관리자 전용
+    - 상태 전이 원자적 검증(status_code IN (1, 2) -> 3)
+    """
+    from core.authorization import authorize_submission_access
+    auth_err = await authorize_submission_access(current_user, submission_id, conn, action="approve")
+    if auth_err:
+        return auth_err
+
+    user_uuid = current_user.get("uuid") or current_user.get("sub")
+
+    async with conn.cursor(cursor=DictCursor) as cur:
+        await cur.execute(
+            """
+            SELECT s.submission_id, s.status_code, s.granted_score, ei.max_score
+            FROM submissions s
+            JOIN evaluation_items ei ON s.item_id = ei.item_id
+            WHERE s.submission_id = %s AND s.is_deleted = FALSE
+            LIMIT 1
+            """,
+            (submission_id,),
+        )
+        row = await cur.fetchone()
+
+    if not row:
+        return JSONResponse(
+            status_code=404,
+            content=SrFormat(
+                status_code=404,
+                success=False,
+                data=None,
+                error=Error(code="ITEM_NOT_FOUND", message="증빙자료를 찾을 수 없습니다."),
+            ).model_dump(),
+        )
+
+    if row["status_code"] not in (1, 2):
+        return JSONResponse(
+            status_code=400,
+            content=SrFormat(
+                status_code=400,
+                success=False,
+                data=None,
+                error=Error(code="INVALID_STATUS", message="제출완료(1) 또는 검토중(2) 상태의 증빙만 승인할 수 있습니다."),
+            ).model_dump(),
+        )
+
+    max_score = float(row["max_score"]) if row.get("max_score") is not None else float(row.get("item_max_score", 100.0))
+    score = req.granted_score if req.granted_score is not None else req.grantedScore
+    if score is None:
+        score = max_score
+
+    if score < 0 or score > max_score:
+        return JSONResponse(
+            status_code=400,
+            content=SrFormat(
+                status_code=400,
+                success=False,
+                data=None,
+                error=Error(code="VALIDATION_ERROR", message=f"인정 점수는 0 이상 {max_score} 이하이어야 합니다."),
+            ).model_dump(),
+        )
+
+    comment = req.teacher_comment if req.teacher_comment is not None else req.teacherComment
+
+    reviewer_id = None
+    async with conn.cursor(cursor=DictCursor) as cur:
+        await cur.execute("SELECT teachers_id FROM teachers WHERE uuid = %s AND is_deleted = FALSE LIMIT 1", (user_uuid,))
+        t_row = await cur.fetchone()
+        if t_row:
+            reviewer_id = t_row["teachers_id"]
+
+    try:
+        await conn.autocommit(False)
+        async with conn.cursor() as cur:
+            await cur.execute(
+                """
+                UPDATE submissions
+                SET status_code = 3,
+                    granted_score = %s,
+                    reviewer_id = %s,
+                    reviewed_at = NOW(),
+                    teacher_comment = %s,
+                    updated_at = NOW()
+                WHERE submission_id = %s AND status_code IN (1, 2)
+                """,
+                (score, reviewer_id, comment, submission_id),
+            )
+            if cur.rowcount == 0:
+                await conn.rollback()
+                return JSONResponse(
+                    status_code=409,
+                    content=SrFormat(
+                        status_code=409,
+                        success=False,
+                        data=None,
+                        error=Error(code="CONFLICT", message="다른 사용자에 의해 이미 심사 처리되었거나 상태가 변경되었습니다."),
+                    ).model_dump(),
+                )
+
+            await cur.execute(
+                """
+                INSERT INTO submissions_logs (
+                    submission_id, modifier_uuid, action_type,
+                    old_status_code, new_status_code, old_score, new_score, comment, created_at
+                )
+                VALUES (%s, %s, 'APPROVE', %s, 3, %s, %s, %s, NOW())
+                """,
+                (submission_id, user_uuid, row["status_code"], row.get("granted_score"), score, comment),
+            )
+        await conn.commit()
+    except Exception:
+        await conn.rollback()
+        raise
+    finally:
+        await conn.autocommit(True)
+
+    return SrFormat(
+        status_code=200,
+        success=True,
+        data={
+            "id": submission_id,
+            "status": "인정완료",
+            "statusCode": 3,
+            "grantedScore": score,
+            "teacherComment": comment,
+        },
+    ).model_dump()
+
+
+@router.patch(
+    "/{submission_id}/reject",
+    summary="증빙자료 심사 반려/재제출요청 API (API-01)",
+    response_model=SrFormat,
+)
+async def reject_submission(
+    submission_id: int,
+    req: RejectSubmissionRequest,
+    conn: Any = Depends(get_db),
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """
+    증빙자료 심사 반려 및 재제출요청 엔드포인트 (API-01)
+    - 교사 및 관리자 전용
+    - 대상 상태: 4(반려) 또는 5(재제출요청)
+    """
+    from core.authorization import authorize_submission_access
+    auth_err = await authorize_submission_access(current_user, submission_id, conn, action="reject")
+    if auth_err:
+        return auth_err
+
+    user_uuid = current_user.get("uuid") or current_user.get("sub")
+    target_status = req.status_code if req.status_code is not None else (req.statusCode or 4)
+    if target_status not in (4, 5):
+        return JSONResponse(
+            status_code=400,
+            content=SrFormat(
+                status_code=400,
+                success=False,
+                data=None,
+                error=Error(code="INVALID_STATUS", message="반려 대상 상태 코드는 4(반려) 또는 5(재제출요청)여야 합니다."),
+            ).model_dump(),
+        )
+
+    async with conn.cursor(cursor=DictCursor) as cur:
+        await cur.execute(
+            "SELECT submission_id, status_code, granted_score FROM submissions WHERE submission_id = %s AND is_deleted = FALSE LIMIT 1",
+            (submission_id,),
+        )
+        row = await cur.fetchone()
+
+    if not row:
+        return JSONResponse(
+            status_code=404,
+            content=SrFormat(
+                status_code=404,
+                success=False,
+                data=None,
+                error=Error(code="ITEM_NOT_FOUND", message="증빙자료를 찾을 수 없습니다."),
+            ).model_dump(),
+        )
+
+    if row["status_code"] not in (1, 2):
+        return JSONResponse(
+            status_code=400,
+            content=SrFormat(
+                status_code=400,
+                success=False,
+                data=None,
+                error=Error(code="INVALID_STATUS", message="제출완료(1) 또는 검토중(2) 상태의 증빙만 반려할 수 있습니다."),
+            ).model_dump(),
+        )
+
+    comment = req.teacher_comment if req.teacher_comment is not None else req.teacherComment
+
+    reviewer_id = None
+    async with conn.cursor(cursor=DictCursor) as cur:
+        await cur.execute("SELECT teachers_id FROM teachers WHERE uuid = %s AND is_deleted = FALSE LIMIT 1", (user_uuid,))
+        t_row = await cur.fetchone()
+        if t_row:
+            reviewer_id = t_row["teachers_id"]
+
+    act_type = "REJECT" if target_status == 4 else "REQUEST_RESUBMIT"
+
+    try:
+        await conn.autocommit(False)
+        async with conn.cursor() as cur:
+            await cur.execute(
+                """
+                UPDATE submissions
+                SET status_code = %s,
+                    granted_score = NULL,
+                    reviewer_id = %s,
+                    reviewed_at = NOW(),
+                    teacher_comment = %s,
+                    updated_at = NOW()
+                WHERE submission_id = %s AND status_code IN (1, 2)
+                """,
+                (target_status, reviewer_id, comment, submission_id),
+            )
+            if cur.rowcount == 0:
+                await conn.rollback()
+                return JSONResponse(
+                    status_code=409,
+                    content=SrFormat(
+                        status_code=409,
+                        success=False,
+                        data=None,
+                        error=Error(code="CONFLICT", message="다른 사용자에 의해 이미 심사 처리되었거나 상태가 변경되었습니다."),
+                    ).model_dump(),
+                )
+
+            await cur.execute(
+                """
+                INSERT INTO submissions_logs (
+                    submission_id, modifier_uuid, action_type,
+                    old_status_code, new_status_code, old_score, new_score, comment, created_at
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, NULL, %s, NOW())
+                """,
+                (submission_id, user_uuid, act_type, row["status_code"], target_status, row.get("granted_score"), comment),
+            )
+        await conn.commit()
+    except Exception:
+        await conn.rollback()
+        raise
+    finally:
+        await conn.autocommit(True)
+
+    status_str = "반려" if target_status == 4 else "재제출요청"
+    return SrFormat(
+        status_code=200,
+        success=True,
+        data={
+            "id": submission_id,
+            "status": status_str,
+            "statusCode": target_status,
+            "teacherComment": comment,
+        },
+    ).model_dump()
+
+
+@router.patch(
+    "/{submission_id}/score",
+    summary="증빙자료 인정 점수 수정 API (API-01)",
+    response_model=SrFormat,
+)
+async def modify_submission_score(
+    submission_id: int,
+    req: ModifyScoreRequest,
+    conn: Any = Depends(get_db),
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """
+    증빙자료 인정 점수 사후 수정 엔드포인트 (API-01)
+    - 교사 및 관리자 전용
+    - 승인 완료(3) 상태 건에 대해서만 허용
+    """
+    from core.authorization import authorize_submission_access
+    auth_err = await authorize_submission_access(current_user, submission_id, conn, action="score_modify")
+    if auth_err:
+        return auth_err
+
+    user_uuid = current_user.get("uuid") or current_user.get("sub")
+
+    async with conn.cursor(cursor=DictCursor) as cur:
+        await cur.execute(
+            """
+            SELECT s.submission_id, s.status_code, s.granted_score, ei.max_score
+            FROM submissions s
+            JOIN evaluation_items ei ON s.item_id = ei.item_id
+            WHERE s.submission_id = %s AND s.is_deleted = FALSE
+            LIMIT 1
+            """,
+            (submission_id,),
+        )
+        row = await cur.fetchone()
+
+    if not row:
+        return JSONResponse(
+            status_code=404,
+            content=SrFormat(
+                status_code=404,
+                success=False,
+                data=None,
+                error=Error(code="ITEM_NOT_FOUND", message="증빙자료를 찾을 수 없습니다."),
+            ).model_dump(),
+        )
+
+    if row["status_code"] != 3:
+        return JSONResponse(
+            status_code=400,
+            content=SrFormat(
+                status_code=400,
+                success=False,
+                data=None,
+                error=Error(code="INVALID_STATUS", message="승인 완료(3) 상태의 증빙에 대해서만 점수를 수정할 수 있습니다."),
+            ).model_dump(),
+        )
+
+    score = req.granted_score if req.granted_score is not None else req.grantedScore
+    if score is None:
+        return JSONResponse(
+            status_code=400,
+            content=SrFormat(
+                status_code=400,
+                success=False,
+                data=None,
+                error=Error(code="VALIDATION_ERROR", message="수정할 인정 점수(grantedScore)가 필요합니다."),
+            ).model_dump(),
+        )
+
+    max_score = float(row["max_score"]) if row.get("max_score") is not None else float(row.get("item_max_score", 100.0))
+    if score < 0 or score > max_score:
+        return JSONResponse(
+            status_code=400,
+            content=SrFormat(
+                status_code=400,
+                success=False,
+                data=None,
+                error=Error(code="VALIDATION_ERROR", message=f"인정 점수는 0 이상 {max_score} 이하이어야 합니다."),
+            ).model_dump(),
+        )
+
+    comment = req.teacher_comment if req.teacher_comment is not None else req.teacherComment
+
+    reviewer_id = None
+    async with conn.cursor(cursor=DictCursor) as cur:
+        await cur.execute("SELECT teachers_id FROM teachers WHERE uuid = %s AND is_deleted = FALSE LIMIT 1", (user_uuid,))
+        t_row = await cur.fetchone()
+        if t_row:
+            reviewer_id = t_row["teachers_id"]
+
+    try:
+        await conn.autocommit(False)
+        async with conn.cursor() as cur:
+            await cur.execute(
+                """
+                UPDATE submissions
+                SET granted_score = %s,
+                    teacher_comment = COALESCE(%s, teacher_comment),
+                    reviewer_id = COALESCE(%s, reviewer_id),
+                    reviewed_at = NOW(),
+                    updated_at = NOW()
+                WHERE submission_id = %s AND status_code = 3
+                """,
+                (score, comment, reviewer_id, submission_id),
+            )
+            if cur.rowcount == 0:
+                await conn.rollback()
+                return JSONResponse(
+                    status_code=409,
+                    content=SrFormat(
+                        status_code=409,
+                        success=False,
+                        data=None,
+                        error=Error(code="CONFLICT", message="점수 수정 중 동시성 충돌이 발생했습니다."),
+                    ).model_dump(),
+                )
+
+            await cur.execute(
+                """
+                INSERT INTO submissions_logs (
+                    submission_id, modifier_uuid, action_type,
+                    old_status_code, new_status_code, old_score, new_score, comment, created_at
+                )
+                VALUES (%s, %s, 'SCORE_MODIFY', 3, 3, %s, %s, %s, NOW())
+                """,
+                (submission_id, user_uuid, row.get("granted_score"), score, comment),
+            )
+        await conn.commit()
+    except Exception:
+        await conn.rollback()
+        raise
+    finally:
+        await conn.autocommit(True)
+
+    return SrFormat(
+        status_code=200,
+        success=True,
+        data={
+            "id": submission_id,
+            "status": "인정완료",
+            "statusCode": 3,
+            "grantedScore": score,
+            "teacherComment": comment,
+        },
     ).model_dump()
 

@@ -36,6 +36,7 @@ from routers.students import router as students_router
 from routers.submissions import router as submissions_router
 from routers.points import router as points_router
 from routers.teachers import router as teachers_router
+from routers.admin import years_router, criteria_router, admin_router
 from sr_format import Error, SrFormat
 
 
@@ -125,6 +126,11 @@ app.include_router(points_router)
 # 교사 업무 라우터 등록 (/api/teacher)
 app.include_router(teachers_router)
 
+# 학년도, 평가 기준, 관리자 라우터 등록 (API-03)
+app.include_router(years_router)
+app.include_router(criteria_router)
+app.include_router(admin_router)
+
 # 📁 [보안 3.1] 증빙자료 파일 안전 조회 및 다운로드 (RBAC 및 학생 소유권 인가 검증)
 # 기존 단순 StaticFiles 마운트의 무인가 개인정보 탈취(IDOR) 취약점을 해소
 @app.get(
@@ -164,64 +170,52 @@ async def get_uploaded_file(
                 ).model_dump(),
             )
 
-    # (B) Authorization Bearer 헤더 검증
-    if not user_uuid:
-        auth_header = request.headers.get("Authorization", "")
-        if auth_header.startswith("Bearer "):
-            jwt_token = auth_header[7:].strip()
-            try:
-                payload = jwt.decode(jwt_token, JWT_SECRET_KEY, algorithms=[JWT_ALGORITHM])
-                jti = payload.get("jti")
-                if jti and redis is not None:
-                    try:
-                        if await redis.get(f"blacklist:{jti}"):
-                            return JSONResponse(
-                                status_code=401,
-                                content=SrFormat(
-                                    status_code=401,
-                                    success=False,
-                                    data=None,
-                                    error=Error(code="UNAUTHORIZED", message="로그아웃되었거나 폐기된 토큰입니다."),
-                                ).model_dump(),
-                            )
-                    except Exception:
-                        pass
-                user_uuid = payload.get("sub")
-                user_role = payload.get("role")
-            except jwt.ExpiredSignatureError:
-                return JSONResponse(
-                    status_code=401,
-                    content=SrFormat(
-                        status_code=401,
-                        success=False,
-                        data=None,
-                        error=Error(code="UNAUTHORIZED", message="인증 토큰이 만료되었습니다."),
-                    ).model_dump(),
-                )
-            except Exception:
-                return JSONResponse(
-                    status_code=401,
-                    content=SrFormat(
-                        status_code=401,
-                        success=False,
-                        data=None,
-                        error=Error(code="UNAUTHORIZED", message="유효하지 않은 인증 토큰입니다."),
-                    ).model_dump(),
-                )
-
-    # (C) token 쿼리 파라미터 (단기 서명 토큰 검증 또는 하위 호환용 JWT)
-    if not user_uuid and token:
-        # 단기 다운로드 서명 토큰 검증 시도
+    # (B) token 쿼리 파라미터 (단기 다운로드 서명 토큰 전용 검증, SEC-02: 레거시 장기 JWT 쿼리 토큰 전면 폐기)
+    elif token:
         signed_user = verify_signed_download_token(token, clean_rel_path)
         if signed_user:
             user_uuid = signed_user.get("uuid")
             user_role = signed_user.get("role")
         else:
-            # 하위 호환용 JWT 디코딩
+            return JSONResponse(
+                status_code=401,
+                content=SrFormat(
+                    status_code=401,
+                    success=False,
+                    data=None,
+                    error=Error(code="UNAUTHORIZED", message="유효하지 않거나 만료된 다운로드 서명 토큰입니다."),
+                ).model_dump(),
+            )
+
+    # (C) Authorization Bearer 헤더 검증 (일반 Access Token만 허용, purpose=download 차단)
+    elif not user_uuid:
+        auth_header = request.headers.get("Authorization", "")
+        if auth_header.startswith("Bearer "):
+            jwt_token = auth_header[7:].strip()
             try:
-                payload = jwt.decode(token, JWT_SECRET_KEY, algorithms=[JWT_ALGORITHM])
+                payload = jwt.decode(jwt_token, JWT_SECRET_KEY, algorithms=[JWT_ALGORITHM])
+                if payload.get("purpose") == "download":
+                    return JSONResponse(
+                        status_code=401,
+                        content=SrFormat(
+                            status_code=401,
+                            success=False,
+                            data=None,
+                            error=Error(code="UNAUTHORIZED", message="다운로드 전용 서명 토큰은 Bearer 인증 헤더에 사용할 수 없습니다."),
+                        ).model_dump(),
+                    )
                 jti = payload.get("jti")
-                if jti and redis is not None:
+                if not jti:
+                    return JSONResponse(
+                        status_code=401,
+                        content=SrFormat(
+                            status_code=401,
+                            success=False,
+                            data=None,
+                            error=Error(code="UNAUTHORIZED", message="유효하지 않은 토큰 형식입니다 (jti 누락)."),
+                        ).model_dump(),
+                    )
+                if redis is not None:
                     try:
                         if await redis.get(f"blacklist:{jti}"):
                             return JSONResponse(
@@ -234,7 +228,15 @@ async def get_uploaded_file(
                                 ).model_dump(),
                             )
                     except Exception:
-                        pass
+                        return JSONResponse(
+                            status_code=503,
+                            content=SrFormat(
+                                status_code=503,
+                                success=False,
+                                data=None,
+                                error=Error(code="SERVICE_UNAVAILABLE", message="인증 세션 상태 확인 중 오류가 발생했습니다."),
+                            ).model_dump(),
+                        )
                 user_uuid = payload.get("sub")
                 user_role = payload.get("role")
             except jwt.ExpiredSignatureError:
@@ -265,7 +267,7 @@ async def get_uploaded_file(
                 status_code=401,
                 success=False,
                 data=None,
-                error=Error(code="UNAUTHORIZED", message="파일 열람 권한이 없습니다. 인증 토큰 또는 일회용 티켓이 필요합니다."),
+                error=Error(code="UNAUTHORIZED", message="파일 열람 권한이 없습니다. 유효한 인증 토큰 또는 일회용 티켓이 필요합니다."),
             ).model_dump(),
         )
 
@@ -292,35 +294,48 @@ async def get_uploaded_file(
             ).model_dump(),
         )
 
-    # 4. 역할별 인가(RBAC) 및 학생 본인 증빙 소유권 검증 (IDOR 방어)
-    if user_role in ("admin", "teacher", 1, 2, "1", "2"):
-        return FileResponse(abs_file_path)
-
-    # 학생은 본인이 제출한 증빙자료만 열람 가능
+    # 4. SEC-01: 모든 학생 리소스에 동일한 교사 권한 범위 적용 (authorize_student_access)
+    from core.authorization import authorize_student_access
     db_web_path = f"/uploads/{clean_rel_path.replace(os.sep, '/')}"
     async with conn.cursor(cursor=DictCursor) as cur:
         await cur.execute(
             """
-            SELECT s.submission_id, s.student_id, st.uuid
+            SELECT s.submission_id, s.student_id, st.uuid AS student_uuid,
+                   COALESCE(ay.year, 2026) AS year
             FROM submissions s
             JOIN students st ON s.student_id = st.student_id
+            LEFT JOIN evaluation_items ei ON s.item_id = ei.item_id
+            LEFT JOIN certification_areas ca ON ei.area_id = ca.area_id
+            LEFT JOIN academic_years ay ON ca.year_id = ay.year_id
             WHERE (s.file_path = %s OR s.file_path = %s) AND s.is_deleted = FALSE
             LIMIT 1
             """,
             (db_web_path, clean_rel_path),
         )
-        row = await cur.fetchone()
+        sub_row = await cur.fetchone()
 
-    if not row or row["uuid"] != user_uuid:
-        return JSONResponse(
-            status_code=403,
-            content=SrFormat(
+    if not sub_row:
+        # 활성 제출에 연결되지 않은 파일: 관리자만 접근 허용 (SEC-01)
+        if user_role not in ("admin", 2, "2"):
+            return JSONResponse(
                 status_code=403,
-                success=False,
-                data=None,
-                error=Error(code="FORBIDDEN", message="본인이 제출한 증빙자료만 열람할 수 있습니다."),
-            ).model_dump(),
+                content=SrFormat(
+                    status_code=403,
+                    success=False,
+                    data=None,
+                    error=Error(code="FORBIDDEN", message="유효한 제출 이력에 연결되지 않은 파일에 접근할 수 없습니다."),
+                ).model_dump(),
+            )
+    else:
+        auth_error = await authorize_student_access(
+            actor={"uuid": user_uuid, "role": user_role},
+            student_id=sub_row["student_id"],
+            conn=conn,
+            year=sub_row.get("year"),
+            action="read",
         )
+        if auth_error:
+            return auth_error
 
     return FileResponse(abs_file_path)
 
@@ -339,6 +354,7 @@ async def issue_download_ticket(
     """
     브라우저 직접 링크 및 <img> 태그 열람 시 JWT 평문 노출을 방지하기 위해
     60초간 유효한 일회용 다운로드 티켓(ticket)을 발급합니다.
+    (SEC-01: 티켓 발급 시에도 학생 본인 및 교사 담당 범위 인가 검증 적용)
     """
     raw_p = file_path.strip().lstrip("/\\")
     if raw_p.startswith("uploads/"):
@@ -359,31 +375,46 @@ async def issue_download_ticket(
     user_role = current_user.get("role")
     user_uuid = current_user.get("uuid")
 
-    # 학생 권한인 경우 본인 증빙 파일인지 DB 소유권 검증
-    if user_role in ("student", "0", 0):
-        db_web_path = f"/uploads/{clean_rel.replace(os.sep, '/')}"
-        async with conn.cursor(cursor=DictCursor) as cur:
-            await cur.execute(
-                """
-                SELECT s.submission_id
-                FROM submissions s
-                JOIN students st ON s.student_id = st.student_id
-                WHERE (s.file_path = %s OR s.file_path = %s) AND st.uuid = %s AND s.is_deleted = FALSE
-                LIMIT 1
-                """,
-                (db_web_path, clean_rel, user_uuid),
-            )
-            row = await cur.fetchone()
-        if not row:
+    from core.authorization import authorize_student_access
+    db_web_path = f"/uploads/{clean_rel.replace(os.sep, '/')}"
+    async with conn.cursor(cursor=DictCursor) as cur:
+        await cur.execute(
+            """
+            SELECT s.submission_id, s.student_id, st.uuid AS student_uuid,
+                   COALESCE(ay.year, 2026) AS year
+            FROM submissions s
+            JOIN students st ON s.student_id = st.student_id
+            LEFT JOIN evaluation_items ei ON s.item_id = ei.item_id
+            LEFT JOIN certification_areas ca ON ei.area_id = ca.area_id
+            LEFT JOIN academic_years ay ON ca.year_id = ay.year_id
+            WHERE (s.file_path = %s OR s.file_path = %s) AND s.is_deleted = FALSE
+            LIMIT 1
+            """,
+            (db_web_path, clean_rel),
+        )
+        sub_row = await cur.fetchone()
+
+    if not sub_row:
+        if user_role not in ("admin", 2, "2"):
             return JSONResponse(
                 status_code=403,
                 content=SrFormat(
                     status_code=403,
                     success=False,
                     data=None,
-                    error=Error(code="FORBIDDEN", message="본인의 증빙 파일에 대해서만 다운로드 티켓을 발급받을 수 있습니다."),
+                    error=Error(code="FORBIDDEN", message="유효한 제출에 연결된 파일에 대해서만 티켓을 발급받을 수 있습니다."),
                 ).model_dump(),
             )
+    else:
+        auth_error = await authorize_student_access(
+            actor=current_user,
+            student_id=sub_row["student_id"],
+            conn=conn,
+            year=sub_row.get("year"),
+            action="read",
+        )
+        if auth_error:
+            return auth_error
 
     ticket_id = await create_download_ticket(
         user_uuid=user_uuid,
