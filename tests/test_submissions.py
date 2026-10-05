@@ -24,7 +24,7 @@ from unittest.mock import AsyncMock
 
 from fastapi.testclient import TestClient
 
-from core.security import get_current_user
+from core.security import create_access_token, create_signed_download_token, get_current_user
 from database import get_db, get_redis
 from main import app
 
@@ -75,7 +75,11 @@ class MockCursor:
                 matched = [s for s in self.conn.db_students if s["uuid"] == target_uuid and not s["is_deleted"]]
                 self._current_result = matched
 
-        # 2. 평가 항목 및 영역/학년도 조회
+        # 2. 교사 조회
+        elif "FROM teachers" in sql_clean:
+            self._current_result = getattr(self.conn, "db_teachers", [])
+
+        # 3. 평가 항목 및 영역/학년도 조회
         elif "FROM evaluation_items ei" in sql_clean:
             item_id = params[0]
             matched = [item for item in self.conn.db_items if item["item_id"] == item_id]
@@ -198,6 +202,10 @@ class MockConnection:
                 "email": "student2@bssm.hs.kr",
                 "is_deleted": False,
             },
+        ]
+
+        self.db_teachers = [
+            {"teachers_id": 1, "uuid": "teacher-uuid-1", "grade": None, "class": None, "is_deleted": False},
         ]
 
         self.db_items = [
@@ -858,9 +866,20 @@ class TestSubmissionsAPI(unittest.TestCase):
             self.assertEqual(res_owner.status_code, 200)
             self.assertEqual(res_owner.content, b"%PDF-1.4 test certificate content for rbac")
 
-            # 4. 본인(학생 1) 열람 -> 200 OK (브라우저 직접 링크 ?token= 쿼리 파라미터)
-            res_query = self.client.get(
+            # 4. [보안 SEC-02] 일반 장기 Access 토큰을 쿼리 스트링으로 전송 시 401 차단
+            res_query_access = self.client.get(
                 f"/uploads/submissions/2026/09/test_cert.pdf?token={token_student1}"
+            )
+            self.assertEqual(res_query_access.status_code, 401)
+
+            # 4-1. [보안 SEC-02] 파일 바인딩 단기 다운로드 서명 토큰으로는 200 OK 정상 열람
+            signed_dl_token = create_signed_download_token(
+                user_uuid="student-uuid-1",
+                file_path="submissions/2026/09/test_cert.pdf",
+                role="student",
+            )
+            res_query = self.client.get(
+                f"/uploads/submissions/2026/09/test_cert.pdf?token={signed_dl_token}"
             )
             self.assertEqual(res_query.status_code, 200)
 

@@ -116,28 +116,37 @@ class MockCursor:
                 ]
                 self._current_result = matched
 
-        elif "FROM students" in sql_clean and "WHERE student_id = %s" in sql_clean:
-            target_id = params[0]
-            matched = [s for s in self.conn.students if s["student_id"] == target_id and not s.get("is_deleted")]
-            self._current_result = matched
+        elif "FROM students" in sql_clean:
+            if "WHERE student_id = %s" in sql_clean:
+                target_id = params[0]
+                matched = [s for s in self.conn.students if s["student_id"] == target_id and not s.get("is_deleted")]
+                self._current_result = matched
+            elif "WHERE uuid = %s" in sql_clean:
+                target_uuid = params[0]
+                matched = [s for s in self.conn.students if s["uuid"] == target_uuid and not s.get("is_deleted")]
+                self._current_result = matched
 
         elif "FROM academic_years" in sql_clean:
             self._current_result = [{"year_id": 1, "year": 2026}]
+
+        elif "FROM teachers" in sql_clean:
+            self._current_result = getattr(self.conn, "teachers", [])
 
         elif "SELECT file_path FROM submissions" in sql_clean:
             active_files = [{"file_path": s["file_path"]} for s in self.conn.submissions if not s.get("is_deleted")]
             self._current_result = active_files
 
         elif "UPDATE submissions" in sql_clean:
-            if "status_code = 1" in sql_clean:
+            self.rowcount = 1
+            if "status_code = 1" in sql_clean or "status_code = 2" in sql_clean:
                 # resubmit
-                sub_id = params[3]
+                sub_id = params[-1]
                 for s in self.conn.submissions:
                     if s["submission_id"] == sub_id:
                         s["description"] = params[0]
                         s["file_path"] = params[1]
-                        s["link_url"] = params[2]
-                        s["status_code"] = 1
+                        s["link_url"] = params[3] if len(params) > 4 else params[2]
+                        s["status_code"] = 2
             elif "is_deleted = TRUE" in sql_clean:
                 sub_id = params[0]
                 for s in self.conn.submissions:
@@ -167,6 +176,9 @@ class MockConnection:
         self.students = [
             {"student_id": 1, "uuid": "student-uuid-1", "name": "학생1", "email": "s1@school.kr", "is_deleted": False},
             {"student_id": 2, "uuid": "student-uuid-2", "name": "학생2", "email": "s2@school.kr", "is_deleted": False},
+        ]
+        self.teachers = [
+            {"teachers_id": 1, "uuid": "teacher-uuid-1", "grade": None, "class": None, "is_deleted": False},
         ]
         self.submissions = [
             {

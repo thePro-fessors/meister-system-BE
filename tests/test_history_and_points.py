@@ -68,6 +68,14 @@ class MockCursor:
                 matched = [s for s in self.conn.db_students if s["uuid"] == target_uuid and not s["is_deleted"]]
                 self._current_result = matched
 
+        # 1-1. 교사 조회 (teachers)
+        elif "FROM teachers" in sql_clean:
+            target_uuid = params[0] if params else None
+            matched = [t for t in self.conn.db_teachers if not t.get("is_deleted")]
+            if target_uuid:
+                matched = [t for t in matched if t.get("uuid") == target_uuid]
+            self._current_result = matched
+
         # 2. 제출 내역 조회 (submissions JOIN evaluation_items JOIN certification_areas JOIN academic_years)
         elif "FROM submissions s" in sql_clean and "JOIN evaluation_items ei" in sql_clean:
             st_id = params[0]
@@ -455,7 +463,7 @@ class TestHistoryAndPointsAPI(unittest.TestCase):
         self.assertEqual(demerit["pointId"], 2)
         self.assertEqual(demerit["type"], "벌점")
         self.assertEqual(demerit["points"], 1.0)
-        self.assertEqual(demerit["score"], 1.0)  # Tech_spec 호환
+        self.assertEqual(demerit["score"], -1.0)  # SCORE-02: 벌점 음수 정규화
         self.assertEqual(demerit["reason"], "지각 3회")
         self.assertEqual(demerit["date"], "2026-06-15")
         self.assertEqual(demerit["teacherName"], "김선생")
