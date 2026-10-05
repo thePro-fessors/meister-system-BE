@@ -26,6 +26,8 @@ from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Upload
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
+from core.authorization import authorize_student_access
+from core.calculator import calculate_student_certification, calculate_area_grade, calculate_area_status
 from core.security import get_current_user, require_student
 from core.storage import delete_uploaded_file, save_upload_file
 from database import get_db, get_redis
@@ -267,27 +269,7 @@ async def get_certification_status(
             )
 
         # ----------------------------------------------------------------------
-        # 2. RBAC 및 학생 본인 소유권 검증 (Authorization)
-        #    - 학생은 다른 학생의 학적 및 점수를 열람할 수 없습니다.
-        #    - 교사와 관리자는 담당 업무 수행을 위해 열람이 허용됩니다.
-        #    - (SECURITY_AND_AUDIT.md 1.3: 정수형 role 0 인입 시 IDOR 방어 강화)
-        # ----------------------------------------------------------------------
-        if user_role in ("student", "0", 0) and target_student["uuid"] != user_uuid:
-            return JSONResponse(
-                status_code=status.HTTP_403_FORBIDDEN,
-                content=SrFormat(
-                    status_code=status.HTTP_403_FORBIDDEN,
-                    success=False,
-                    data=None,
-                    error=Error(
-                        code="FORBIDDEN",
-                        message="본인의 인증 현황만 조회할 수 있습니다.",
-                    ),
-                ).model_dump(),
-            )
-
-        # ----------------------------------------------------------------------
-        # 3. 학년도(Academic Year) 결정 및 year_id 확인
+        # 2. 학년도(Academic Year) 결정 및 year_id 확인
         # ----------------------------------------------------------------------
         query_year = year or await get_current_academic_year()
         year_id = await get_year_id_by_year(conn, query_year)
@@ -305,6 +287,19 @@ async def get_certification_status(
                     ),
                 ).model_dump(),
             )
+
+        # ----------------------------------------------------------------------
+        # 3. RBAC 및 학생 리소스 인가 검증 (SEC-01)
+        # ----------------------------------------------------------------------
+        auth_error = await authorize_student_access(
+            actor=current_user,
+            student_id=student_id,
+            conn=conn,
+            year=query_year,
+            action="read",
+        )
+        if auth_error:
+            return auth_error
 
         # ----------------------------------------------------------------------
         # 4. 해당 학년도 학생의 학적 정보(student_academic_records) 조회
@@ -352,18 +347,20 @@ async def get_certification_status(
         )
         areas = await cur.fetchall()
 
-        # [Fallback 정책] 만약 학년별(grade) 배점이 별도 분리되지 않은 기존 데이터베이스라면 grade 조건 없이 조회
+        # DATA-04: 학년 기준 누락 시 타 학년 데이터로 대체하지 않고 명시적 404 반환
         if not areas:
-            await cur.execute(
-                """
-                SELECT area_id, name, max_score
-                FROM certification_areas
-                WHERE year_id = %s
-                ORDER BY area_id ASC
-                """,
-                (year_id,),
+            return JSONResponse(
+                status_code=status.HTTP_404_NOT_FOUND,
+                content=SrFormat(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    success=False,
+                    data=None,
+                    error=Error(
+                        code="CRITERIA_NOT_CONFIGURED",
+                        message=f"{query_year} 학년도 {st_grade}학년 평가 기준이 설정되지 않았습니다.",
+                    ),
+                ).model_dump(),
             )
-            areas = await cur.fetchall()
 
         # ----------------------------------------------------------------------
         # 6. 학생이 제출한 증빙자료(submissions) 및 평가 항목 메타데이터 조회
@@ -418,130 +415,20 @@ async def get_certification_status(
         all_merits = await cur.fetchall()
 
     # ==========================================================================
-    # 8. 점수 집계 및 등급 산정 연산 (In-Memory Processing)
+    # 8. 점수 집계 및 등급 산정 연산 (SCORE-01: 공통 계산 엔진 단일화)
     # ==========================================================================
-
-    # 영역별 인정 점수 리스트: area_id -> item_id -> [부여된 점수 목록]
-    area_item_scores: Dict[int, Dict[int, List[float]]] = {}
-    # 평가 항목 메타데이터: item_id -> {scoring_type, item_max_score}
-    area_item_meta: Dict[int, Dict[str, Any]] = {}
-    # 영역별 교사 심사 대기(제출완료/검토중) 건수 집계: area_id -> 대기 건수
-    area_pending_counts: Dict[int, int] = {}
-    has_any_pending = False
-
-    for sub in all_submissions:
-        aid = sub["area_id"]
-        iid = sub["item_id"]
-        st_code = sub["status_code"]
-        g_score = float(sub["granted_score"] or 0.0)
-        sc_type = sub["scoring_type"]
-        item_max = float(sub["item_max_score"]) if sub["item_max_score"] is not None else None
-
-        area_item_meta[iid] = {
-            "scoring_type": sc_type,
-            "item_max_score": item_max,
-        }
-
-        # 상태 코드 1(제출완료) 또는 2(검토중) -> 심사 대기 중으로 분류
-        if st_code in (1, 2):
-            has_any_pending = True
-            area_pending_counts[aid] = area_pending_counts.get(aid, 0) + 1
-
-        # 상태 코드 3(인정완료) -> 합산 대상 점수로 분류
-        elif st_code == 3:
-            if aid not in area_item_scores:
-                area_item_scores[aid] = {}
-            if iid not in area_item_scores[aid]:
-                area_item_scores[aid][iid] = []
-            area_item_scores[aid][iid].append(g_score)
-
-    # --------------------------------------------------------------------------
-    # 상벌점 집계 (SQL에서 학사년도 날짜 범위 필터링 완료)
-    # --------------------------------------------------------------------------
-    area_merit_points: Dict[str, float] = {}
-    for m in all_merits:
-        m_type = m["type"]  # '+' 또는 '상점' / '-' 또는 '벌점'
-        pts = float(m["points"] or 0.0)
-        rel_area = (m["related_area"] or "").strip()
-
-        # 벌점인 경우 음수화, 상점인 경우 양수화
-        if m_type in ("-", "벌점"):
-            pts = -abs(pts)
-        else:
-            pts = abs(pts)
-
-        if rel_area:
-            area_merit_points[rel_area] = area_merit_points.get(rel_area, 0.0) + pts
-
-    # --------------------------------------------------------------------------
-    # 9. 영역별 종합 점수 연산 및 결과 조립
-    # --------------------------------------------------------------------------
-    area_results: List[Dict[str, Any]] = []
-    total_score = 0.0
-
-    for area in areas:
-        aid = area["area_id"]
-        aname = area["name"]
-        amax = float(area["max_score"])
-
-        # 각 평가 항목별 점수 집계 (최상위인정형 vs 일반 누적형)
-        area_raw_score = 0.0
-        items_dict = area_item_scores.get(aid, {})
-
-        for iid, scores in items_dict.items():
-            meta = area_item_meta.get(iid, {})
-            scoring_type = meta.get("scoring_type")
-            item_max_limit = meta.get("item_max_score")
-
-            if scoring_type == 8:  # 8: 최상위인정형 (제출 인정 건 중 최고점 1건만 취합)
-                best = max(scores) if scores else 0.0
-                if item_max_limit is not None:
-                    best = min(best, item_max_limit)
-                area_raw_score += best
-            else:  # 일반 누적 합산형
-                sum_item = sum(scores)
-                if item_max_limit is not None:
-                    sum_item = min(sum_item, item_max_limit)
-                area_raw_score += sum_item
-
-        # 상벌점 가감 반영
-        merit_adjustment = area_merit_points.get(aname, 0.0)
-        adjusted_score = area_raw_score + merit_adjustment
-
-        # 0점 이상 ~ 영역 최대점 이하로 클램핑(Clamping)
-        final_score = max(0.0, min(adjusted_score, amax))
-        final_score = round(final_score, 1)
-
-        # 영역 성취 등급 판정 (S, A, B, 미달성)
-        grade_str = calculate_area_grade(final_score, amax)
-
-        # 영역 진행 상태 판정 (달성, 검토중, 보완 필요)
-        pending_cnt = area_pending_counts.get(aid, 0)
-        status_str = calculate_area_status(grade_str, pending_cnt)
-
-        area_results.append({
-            "area": aname,
-            "score": final_score,
-            "maxScore": amax,
-            "grade": grade_str,
-            "status": status_str,
-        })
-        total_score += final_score
-
-    # --------------------------------------------------------------------------
-    # 10. 종합 역량인증 최종 판정
-    # --------------------------------------------------------------------------
-    total_score = round(total_score, 1)
-    overall_cert_status = calculate_cert_status(area_results, has_any_pending)
+    calc_res = calculate_student_certification(areas, all_submissions, all_merits)
 
     response_data = {
         "year": query_year,
         "grade": st_grade,
         "classNo": st_class,
         "number": st_number,
-        "areas": area_results,
-        "totalScore": total_score,
-        "certStatus": overall_cert_status,
+        "areas": calc_res["areas"],
+        "totalScore": calc_res["totalScore"],
+        "certStatus": calc_res["certStatus"],
+        "pendingCount": calc_res["pendingCount"],
+        "totalMeritScore": calc_res["totalMeritScore"],
     }
 
     return SrFormat(
@@ -811,7 +698,8 @@ async def handle_submit_evidence(
                 ca.year_id,
                 ca.grade AS area_grade,
                 ca.name AS area_name,
-                ay.year AS academic_year
+                ay.year AS academic_year,
+                ay.is_activated AS year_is_activated
             FROM evaluation_items ei
             JOIN certification_areas ca ON ei.area_id = ca.area_id
             JOIN academic_years ay ON ca.year_id = ay.year_id
@@ -846,6 +734,21 @@ async def handle_submit_evidence(
                     error=Error(
                         code="VALIDATION_ERROR",
                         message="비활성화된 평가 항목에는 증빙자료를 제출할 수 없습니다.",
+                    ),
+                ).model_dump(),
+            )
+
+        # DATA-04: 신규 제출은 활성화된 학년도에만 허용
+        if eval_item.get("year_is_activated") is False:
+            return JSONResponse(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                content=SrFormat(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    success=False,
+                    data=None,
+                    error=Error(
+                        code="ACADEMIC_YEAR_INACTIVE",
+                        message="현재 활성화된 학년도에만 신규 증빙자료를 제출할 수 있습니다.",
                     ),
                 ).model_dump(),
             )
@@ -1324,6 +1227,17 @@ async def handle_get_submissions(
                 )
             target_student_id = student_id_param
 
+        # SEC-01: 공통 인가 계층을 통한 교사 담당 범위 및 역할 검증
+        auth_error = await authorize_student_access(
+            actor=current_user,
+            student_id=target_student_id,
+            conn=conn,
+            year=year_val,
+            action="read",
+        )
+        if auth_error:
+            return auth_error
+
         # 2. 동적 쿼리 빌드 및 인덱스 기반 정렬 조회
         query_parts = [
             """
@@ -1484,6 +1398,17 @@ async def handle_get_points(
                 )
             target_student_id = student_id_param
 
+        # SEC-01: 공통 인가 계층을 통한 교사 담당 범위 및 역할 검증
+        auth_error = await authorize_student_access(
+            actor=current_user,
+            student_id=target_student_id,
+            conn=conn,
+            year=year_val,
+            action="read",
+        )
+        if auth_error:
+            return auth_error
+
         # 2. 동적 쿼리 빌드 (3월 1일 학사력 기준 인덱스 범위 스캔 적용)
         query_parts = [
             """
@@ -1520,22 +1445,29 @@ async def handle_get_points(
         await cur.execute(full_query, tuple(params))
         rows = await cur.fetchall()
 
-    # 3. FE 스펙(TODO 2.5 / Tech_spec 2.5) 규격 변환
+    # 3. FE 스펙(TODO 2.5 / Tech_spec 2.5 / SCORE-02) 규격 변환
     results: list[dict[str, Any]] = []
     for r in rows:
         raw_type = (r["type"] or "-").strip()
-        type_str = MERIT_TYPE_MAP.get(raw_type, "벌점" if raw_type == "-" else "상점")
-        pts = float(r["points"] or 0.0)
+        type_str = MERIT_TYPE_MAP.get(raw_type, "벌점" if raw_type in ("-", "벌점") else "상점")
+        raw_pts = float(r["points"] or 0.0)
+        signed_pts = -abs(raw_pts) if type_str in ("벌점", "-") else abs(raw_pts)
         occ_str = r["occurred_at"].strftime("%Y-%m-%d") if r["occurred_at"] else None
+        created_str = r["created_at"].strftime("%Y-%m-%d %H:%M:%S") if r.get("created_at") else None
+        rec_year = r["occurred_at"].year if r["occurred_at"] else None
 
         results.append({
             "id": r["merits_point_id"],
             "pointId": r["merits_point_id"],
+            "studentId": r["student_id"],
+            "teacherId": r["teachers_id"],
             "type": type_str,
-            "points": pts,
-            "score": pts,  # Tech_spec 필드명 호환성 보장
+            "points": raw_pts,
+            "score": signed_pts,  # SCORE-02: 상점 양수 / 벌점 음수 정규화
             "reason": r["reason"] or "",
             "date": occ_str,
+            "year": rec_year,
+            "createdAt": created_str,
             "teacherName": r["teacher_name"],
             "reflected": bool(r["is_reflected"]),
             "reflectedArea": r["related_area"],

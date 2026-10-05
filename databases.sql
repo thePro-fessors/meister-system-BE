@@ -332,3 +332,14 @@ CREATE INDEX idx_merits_history
 -- 교사 대시보드 및 심사 대기 목록 조회 최적화 복합 인덱스 (SECURITY_AND_AUDIT.md 2.4)
 CREATE INDEX idx_submissions_teacher_filter
   ON submissions (is_deleted, status_code, created_at DESC, submission_id DESC);
+
+-- ============================================================================
+-- 초기 기초 데이터 시드 (OPS-01)
+-- ============================================================================
+INSERT INTO submissions_status (status_code, description) VALUES
+  (1, '제출완료'),
+  (2, '검토중'),
+  (3, '인정완료'),
+  (4, '반려'),
+  (5, '재제출요청')
+ON DUPLICATE KEY UPDATE description = VALUES(description);

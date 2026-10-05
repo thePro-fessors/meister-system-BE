@@ -26,13 +26,17 @@ try:
 except (ImportError, ModuleNotFoundError):
     DictCursor = Any  # type: ignore
 
+from core.calculator import (
+    calculate_area_grade,
+    calculate_area_status,
+    calculate_student_certification,
+    round_decimal,
+)
 from core.security import get_current_user
 from database import get_db
 from routers.auth import get_current_year
 from routers.students import (
     SUBMISSION_STATUS_MAP,
-    calculate_area_grade,
-    calculate_area_status,
     calculate_cert_status,
     get_year_id_by_year,
 )
@@ -235,18 +239,20 @@ async def get_teacher_dashboard(
             },
         ).model_dump()
 
-    # 4. 검토 대기, 재제출, 미부여 통계 단일 쿼리 집계 (범위 격리 적용)
+    # 4. 검토 대기, 재제출, 미부여 통계 단일 쿼리 집계 (DATA-03: 제출 학년도 격리)
     stats_sql = """
         SELECT
             COUNT(CASE WHEN s.status_code IN (1, 2) THEN 1 END) AS pending_count,
             COUNT(CASE WHEN s.status_code IN (1, 2) AND EXISTS (
                 SELECT 1 FROM submissions_logs sl
-                WHERE sl.submission_id = s.submission_id AND sl.action_type = '재제출'
+                WHERE sl.submission_id = s.submission_id AND sl.action_type IN ('재제출', 'RESUBMIT')
             ) THEN 1 END) AS resubmitted_count,
             COUNT(CASE WHEN s.status_code IN (1, 2) AND s.granted_score IS NULL THEN 1 END) AS unscored_count
         FROM submissions s
+        JOIN evaluation_items ei ON s.item_id = ei.item_id
+        JOIN certification_areas ca ON ei.area_id = ca.area_id AND ca.year_id = %s
         JOIN students st ON s.student_id = st.student_id AND st.is_deleted = FALSE
-        JOIN student_academic_records sar ON sar.student_id = st.student_id AND sar.year_id = %s
+        JOIN student_academic_records sar ON sar.student_id = st.student_id AND sar.year_id = ca.year_id
         WHERE s.is_deleted = FALSE
     """
     stats_params: List[Any] = [year_id]
@@ -262,6 +268,23 @@ async def get_teacher_dashboard(
     pending_count = stats_row.get("pending_count", 0) if stats_row else 0
     resubmitted_count = stats_row.get("resubmitted_count", 0) if stats_row else 0
     unscored_count = stats_row.get("unscored_count", 0) if stats_row else 0
+
+    # 4-1. 담당 학생 수 집계 (DATA-03: 제출이 없는 담당 학생도 포함)
+    student_count_sql = """
+        SELECT COUNT(DISTINCT sar.student_id) AS student_count
+        FROM student_academic_records sar
+        JOIN students st ON sar.student_id = st.student_id AND st.is_deleted = FALSE
+        WHERE sar.year_id = %s
+    """
+    student_count_params: List[Any] = [year_id]
+    if has_homeroom:
+        student_count_sql += " AND sar.grade = %s AND sar.class = %s"
+        student_count_params.extend([teacher_grade, teacher_class])
+
+    async with conn.cursor(cursor=DictCursor) as cur:
+        await cur.execute(student_count_sql, tuple(student_count_params))
+        sc_row = await cur.fetchone()
+    student_count = sc_row.get("student_count", 0) if sc_row else 0
 
     # 5. 권한 범위 내 최근 제출 증빙자료 목록 조회
     recent_sql = """
@@ -286,13 +309,13 @@ async def get_teacher_dashboard(
             s.created_at,
             EXISTS (
                 SELECT 1 FROM submissions_logs sl
-                WHERE sl.submission_id = s.submission_id AND sl.action_type = '재제출'
+                WHERE sl.submission_id = s.submission_id AND sl.action_type IN ('재제출', 'RESUBMIT')
             ) AS is_resubmitted
         FROM submissions s
+        JOIN evaluation_items ei ON s.item_id = ei.item_id
+        JOIN certification_areas ca ON ei.area_id = ca.area_id AND ca.year_id = %s
         JOIN students st ON s.student_id = st.student_id AND st.is_deleted = FALSE
-        JOIN student_academic_records sar ON sar.student_id = st.student_id AND sar.year_id = %s
-        LEFT JOIN evaluation_items ei ON s.item_id = ei.item_id
-        LEFT JOIN certification_areas ca ON ei.area_id = ca.area_id
+        JOIN student_academic_records sar ON sar.student_id = st.student_id AND sar.year_id = ca.year_id
         WHERE s.is_deleted = FALSE
     """
     recent_params: List[Any] = [year_id]
@@ -350,6 +373,7 @@ async def get_teacher_dashboard(
             "pendingCount": pending_count,
             "resubmittedCount": resubmitted_count,
             "unscoredCount": unscored_count,
+            "studentCount": student_count,
             "scopeLabel": scope_label,
             "teacher": {
                 "teachersId": teacher_row.get("teachers_id") if teacher_row else None,
@@ -580,10 +604,10 @@ async def get_teacher_students(
                 type,
                 points,
                 related_area,
-                occurred_at
+                occurred_at,
+                is_reflected
             FROM merits
             WHERE student_id IN ({placeholders})
-              AND is_reflected = TRUE
               AND is_deleted = FALSE
               AND occurred_at >= %s
               AND occurred_at < %s
@@ -615,104 +639,25 @@ async def get_teacher_students(
         st_subs = subs_by_student.get(sid, [])
         st_merits = merits_by_student.get(sid, [])
 
-        # 학년별 영역 배점 필터링 (Fallback: grade 구분이 없는 경우 전체)
+        # 학년별 영역 배점 필터링 (SCORE-01: 공통 계산 엔진 단일화)
         student_areas = [a for a in all_areas if a.get("grade") == st_grade]
         if not student_areas:
-            student_areas = all_areas
+            student_areas = [a for a in all_areas if a.get("grade") is None] or all_areas
 
-        # 증빙 제출 집계
-        area_item_scores: Dict[int, Dict[int, List[float]]] = {}
-        area_item_meta: Dict[int, Dict[str, Any]] = {}
-        area_pending_counts: Dict[int, int] = {}
-        pending_count = 0
-        has_any_pending = False
+        calc_res = calculate_student_certification(student_areas, st_subs, st_merits)
+        area_results = calc_res["areas"]
+        total_score = calc_res["totalScore"]
+        overall_cert_status = calc_res["certStatus"]
+        pending_count = calc_res["pendingCount"]
 
-        for sub in st_subs:
-            aid = sub["area_id"]
-            iid = sub["item_id"]
-            st_code = sub["status_code"]
-            g_score = float(sub["granted_score"] or 0.0)
-            sc_type = sub["scoring_type"]
-            item_max = float(sub["item_max_score"]) if sub["item_max_score"] is not None else None
-
-            area_item_meta[iid] = {
-                "scoring_type": sc_type,
-                "item_max_score": item_max,
-            }
-
-            if st_code in (1, 2):
-                has_any_pending = True
-                pending_count += 1
-                area_pending_counts[aid] = area_pending_counts.get(aid, 0) + 1
-            elif st_code == 3:
-                if aid not in area_item_scores:
-                    area_item_scores[aid] = {}
-                if iid not in area_item_scores[aid]:
-                    area_item_scores[aid][iid] = []
-                area_item_scores[aid][iid].append(g_score)
-
-        # 상벌점 집계
-        area_merit_points: Dict[str, float] = {}
+        # 전체 상벌점 합계 연산 (SCORE-02)
         total_merit_points = 0.0
         for m in st_merits:
             m_type = m.get("type")
             pts = float(m.get("points") or 0.0)
-            rel_area = (m.get("related_area") or "").strip()
-            if m_type in ("-", "벌점"):
-                signed_pts = -abs(pts)
-            else:
-                signed_pts = abs(pts)
+            signed_pts = -abs(pts) if m_type in ("-", "벌점") else abs(pts)
             total_merit_points += signed_pts
-            if rel_area:
-                area_merit_points[rel_area] = area_merit_points.get(rel_area, 0.0) + signed_pts
-        point_total = round(total_merit_points, 1)
-
-        # 5대 핵심 영역별 점수 계산
-        area_results: List[Dict[str, Any]] = []
-        total_score = 0.0
-        for area_info in student_areas:
-            aid = area_info["area_id"]
-            aname = area_info["name"]
-            amax = float(area_info["max_score"])
-
-            area_raw_score = 0.0
-            items_dict = area_item_scores.get(aid, {})
-            for iid, scores in items_dict.items():
-                meta = area_item_meta.get(iid, {})
-                sc_type = meta.get("scoring_type")
-                item_max_limit = meta.get("item_max_score")
-
-                if sc_type == 8:  # 8: 최상위인정형
-                    best = max(scores) if scores else 0.0
-                    if item_max_limit is not None:
-                        best = min(best, item_max_limit)
-                    area_raw_score += best
-                else:  # 일반 누적 합산형
-                    sum_item = sum(scores)
-                    if item_max_limit is not None:
-                        sum_item = min(sum_item, item_max_limit)
-                    area_raw_score += sum_item
-
-            merit_adjustment = area_merit_points.get(aname, 0.0)
-            adjusted_score = area_raw_score + merit_adjustment
-            final_score = max(0.0, min(adjusted_score, amax))
-            final_score = round(final_score, 1)
-
-            grade_str = calculate_area_grade(final_score, amax)
-            pending_cnt = area_pending_counts.get(aid, 0)
-            status_str = calculate_area_status(grade_str, pending_cnt)
-
-            area_results.append({
-                "area": aname,
-                "score": final_score,
-                "maxScore": amax,
-                "grade": grade_str,
-                "status": status_str,
-            })
-            total_score += final_score
-
-        total_score = round(total_score, 1)
-        overall_cert_status = calculate_cert_status(area_results, has_any_pending)
+        point_total = round_decimal(total_merit_points, 1)
 
         # 8. 후속 필터링 (area, status, hasPoints)
         # (1) area 필터
@@ -742,14 +687,15 @@ async def get_teacher_students(
             if not (matches_cert_status or matches_sub_status):
                 continue
 
-        # (3) hasPoints 필터
+        # (3) hasPoints 필터 (SCORE-02: 조회 범위 내 기록 존재 여부 판정)
         if hasPoints is not None:
             clean_hp = str(hasPoints).strip().lower()
+            has_records = len(st_merits) > 0 or point_total != 0.0
             if clean_hp in ("true", "1", "t", "y"):
-                if len(st_merits) == 0 and point_total == 0.0:
+                if not has_records:
                     continue
             elif clean_hp in ("false", "0", "f", "n"):
-                if len(st_merits) > 0 or point_total != 0.0:
+                if has_records:
                     continue
 
         result_students.append({
@@ -960,16 +906,18 @@ async def get_teacher_student_detail(
         areas = await cur.fetchall()
 
         if not areas:
-            await cur.execute(
-                """
-                SELECT area_id, name, max_score
-                FROM certification_areas
-                WHERE year_id = %s
-                ORDER BY area_id ASC
-                """,
-                (year_id,),
+            return JSONResponse(
+                status_code=status.HTTP_404_NOT_FOUND,
+                content=SrFormat(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    success=False,
+                    data=None,
+                    error=Error(
+                        code="CRITERIA_NOT_CONFIGURED",
+                        message=f"{target_year} 학년도 {st_grade}학년 평가 기준이 설정되지 않았습니다.",
+                    ),
+                ).model_dump(),
             )
-            areas = await cur.fetchall()
 
         # (2) 학생 증빙 제출건 전체 조회 (최신 제출순 정렬)
         await cur.execute(
@@ -1019,10 +967,10 @@ async def get_teacher_student_detail(
                 type,
                 points,
                 related_area,
-                occurred_at
+                occurred_at,
+                is_reflected
             FROM merits
             WHERE student_id = %s
-              AND is_reflected = TRUE
               AND is_deleted = FALSE
               AND occurred_at >= %s
               AND occurred_at < %s
@@ -1099,71 +1047,16 @@ async def get_teacher_student_detail(
             "reviewerId": sub["reviewer_id"],
         })
 
-    # 상벌점 집계
-    area_merit_points: Dict[str, float] = {}
+    calc_res = calculate_student_certification(areas, all_submissions, all_merits)
+
+    # 전체 상벌점 집계 (SCORE-02)
     total_merit_points = 0.0
     for m in all_merits:
         m_type = m.get("type")
         pts = float(m.get("points") or 0.0)
-        rel_area = (m.get("related_area") or "").strip()
-        if m_type in ("-", "벌점"):
-            signed_pts = -abs(pts)
-        else:
-            signed_pts = abs(pts)
+        signed_pts = -abs(pts) if m_type in ("-", "벌점") else abs(pts)
         total_merit_points += signed_pts
-        if rel_area:
-            area_merit_points[rel_area] = area_merit_points.get(rel_area, 0.0) + signed_pts
-    point_total = round(total_merit_points, 1)
-
-    # 5대 영역별 최종 점수 및 등급 산정
-    area_results: List[Dict[str, Any]] = []
-    total_score = 0.0
-
-    for area in areas:
-        aid = area["area_id"]
-        aname = area["name"]
-        amax = float(area["max_score"])
-
-        area_raw_score = 0.0
-        items_dict = area_item_scores.get(aid, {})
-
-        for iid, scores in items_dict.items():
-            meta = area_item_meta.get(iid, {})
-            sc_type = meta.get("scoring_type")
-            item_max_limit = meta.get("item_max_score")
-
-            if sc_type == 8:  # 8: 최상위인정형
-                best = max(scores) if scores else 0.0
-                if item_max_limit is not None:
-                    best = min(best, item_max_limit)
-                area_raw_score += best
-            else:  # 일반 누적 합산형
-                sum_item = sum(scores)
-                if item_max_limit is not None:
-                    sum_item = min(sum_item, item_max_limit)
-                area_raw_score += sum_item
-
-        merit_adjustment = area_merit_points.get(aname, 0.0)
-        adjusted_score = area_raw_score + merit_adjustment
-        final_score = max(0.0, min(adjusted_score, amax))
-        final_score = round(final_score, 1)
-
-        grade_str = calculate_area_grade(final_score, amax)
-        pending_cnt = area_pending_counts.get(aid, 0)
-        status_str = calculate_area_status(grade_str, pending_cnt)
-
-        area_results.append({
-            "area": aname,
-            "areaId": aid,
-            "score": final_score,
-            "maxScore": amax,
-            "grade": grade_str,
-            "status": status_str,
-        })
-        total_score += final_score
-
-    total_score = round(total_score, 1)
-    overall_cert_status = calculate_cert_status(area_results, has_any_pending)
+    point_total = round_decimal(total_merit_points, 1)
 
     response_data = {
         "studentId": student_id,
@@ -1175,11 +1068,11 @@ async def get_teacher_student_detail(
         "studentNo": st_number,
         "email": target_student.get("email"),
         "year": target_year,
-        "areas": area_results,
-        "totalScore": total_score,
-        "certStatus": overall_cert_status,
+        "areas": calc_res["areas"],
+        "totalScore": calc_res["totalScore"],
+        "certStatus": calc_res["certStatus"],
         "pointTotal": point_total,
-        "pendingCount": pending_count,
+        "pendingCount": calc_res["pendingCount"],
         "submissions": formatted_submissions,
         "student": {
             "studentId": student_id,
