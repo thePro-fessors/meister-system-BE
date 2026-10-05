@@ -155,13 +155,13 @@ MAGIC_BYTES_SIGNATURES: Dict[str, List[bytes]] = {
     ".jpeg": [b"\xFF\xD8\xFF"],
     ".png": [b"\x89PNG\r\n\x1a\n"],
     ".gif": [b"GIF87a", b"GIF89a"],
-    ".webp": [b"RIFF"],  # RIFF....WEBP
+    ".webp": [],  # RIFF 컨테이너 내 WEBP 청크 12바이트 필수 검증 (OPS-03)
     ".pdf": [b"%PDF-"],
     ".zip": [b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08"],
     # MP4 / MOV (ISO Base Media file: ....ftyp)
     ".mp4": [b"ftyp"],
     ".mov": [b"ftyp", b"moov", b"free", b"mdat", b"wide"],
-    ".avi": [b"RIFF"],  # RIFF....AVI
+    ".avi": [],  # RIFF 컨테이너 내 AVI 청크 12바이트 필수 검증 (OPS-03)
     ".webm": [b"\x1A\x45\xDF\xA3"],  # Matroska / WebM EBML
     ".heic": [b"ftypheic", b"ftypmif1", b"ftypmsf1", b"ftypheix", b"ftyphevc"],
     ".heif": [b"ftypheif", b"ftypmif1", b"ftypmsf1"],
@@ -171,36 +171,34 @@ MAGIC_BYTES_SIGNATURES: Dict[str, List[bytes]] = {
 def validate_magic_bytes(header_bytes: bytes, ext: str) -> bool:
     """
     파일의 첫 32바이트 바이너리 시그니처를 검사하여 위조된 확장자 여부를 판별합니다.
+    (OPS-03: 컨테이너 포맷 세부 청크 우선 검증 적용)
     """
     if not header_bytes:
         return False
 
-    signatures = MAGIC_BYTES_SIGNATURES.get(ext)
-    if not signatures:
-        # 시그니처 목록에 정의되지 않은 확장자는 확장자 화이트리스트 통과 시 기본 허용
-        return True
+    # 1. RIFF 포맷 세부 검사 (WebP, AVI: 단순 RIFF 접두어 우회 원천 차단)
+    if ext == ".webp":
+        return len(header_bytes) >= 12 and header_bytes.startswith(b"RIFF") and header_bytes[8:12] == b"WEBP"
+    if ext == ".avi":
+        return len(header_bytes) >= 12 and header_bytes.startswith(b"RIFF") and header_bytes[8:12] == b"AVI "
 
-    # 1. 일반 접두사 매직 넘버 검사
-    for sig in signatures:
-        if header_bytes.startswith(sig):
-            return True
-
-    # 2. RIFF 포맷 세부 검사 (WebP, AVI)
-    if ext == ".webp" and header_bytes.startswith(b"RIFF") and len(header_bytes) >= 12:
-        if header_bytes[8:12] == b"WEBP":
-            return True
-    if ext == ".avi" and header_bytes.startswith(b"RIFF") and len(header_bytes) >= 12:
-        if header_bytes[8:12] == b"AVI ":
-            return True
-
-    # 3. ISO Base Media (MP4/MOV/HEIC/HEIF) ftyp 박스 검사 (오프셋 4~12에 위치)
+    # 2. ISO Base Media (MP4/MOV/HEIC/HEIF) ftyp 박스 검사 (오프셋 4~12에 위치)
     if ext in (".mp4", ".mov", ".heic", ".heif") and len(header_bytes) >= 12:
         box_type = header_bytes[4:8]
+        signatures = MAGIC_BYTES_SIGNATURES.get(ext, [])
         if box_type == b"ftyp":
             for sig in signatures:
                 if sig in header_bytes[:32]:
                     return True
-            # ftyp 박스가 존재하면 유효한 ISO 미디어로 인정
+            return True
+
+    # 3. 일반 접두사 매직 넘버 검사
+    signatures = MAGIC_BYTES_SIGNATURES.get(ext)
+    if not signatures:
+        return True
+
+    for sig in signatures:
+        if header_bytes.startswith(sig):
             return True
 
     return False

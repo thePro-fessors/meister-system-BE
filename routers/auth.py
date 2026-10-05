@@ -12,6 +12,7 @@ import uuid
 from typing import Optional, Any
 import secrets
 from datetime import datetime, timezone, timedelta
+import asyncio
 import hashlib
 
 try:
@@ -53,21 +54,32 @@ _YEAR_ID_CACHE: dict[int, int] = {}
 
 
 # ==============================================================================
-# 비밀번호 암호화 및 유효성 검증 유틸리티
+# 비밀번호 암호화 및 유효성 검증 유틸리티 (AUTH-03: bcrypt 72바이트 상한 및 to_thread 비동기 처리)
 # ==============================================================================
 
 def hash_password(password: str) -> str:
-    """비밀번호를 bcrypt(rounds=12)로 안전하게 단방향 솔팅 해싱합니다."""
+    """비밀번호를 bcrypt(rounds=12)로 안전하게 단방향 솔팅 해싱합니다. (최대 72바이트 초과 차단)"""
+    pw_bytes = password.encode("utf-8")
+    if len(pw_bytes) > 72:
+        raise ValueError("비밀번호는 최대 72바이트를 초과할 수 없습니다.")
     salt = bcrypt.gensalt(rounds=12)
-    return bcrypt.hashpw(password.encode("utf-8"), salt).decode("utf-8")
+    return bcrypt.hashpw(pw_bytes, salt).decode("utf-8")
 
 
-def verify_password(plain_password: str, hashed_password: str) -> bool:
-    """평문 비밀번호와 해시 비밀번호를 상시 일정한 시간(Constant Time)으로 안전하게 대조합니다."""
+def verify_password_sync(plain_password: str, hashed_password: str) -> bool:
+    """평문 비밀번호와 해시 비밀번호를 상시 일정한 시간(Constant Time)으로 동기 대조합니다."""
     try:
-        return bcrypt.checkpw(plain_password.encode("utf-8"), hashed_password.encode("utf-8"))
+        pw_bytes = plain_password.encode("utf-8")
+        if len(pw_bytes) > 72:
+            return False
+        return bcrypt.checkpw(pw_bytes, hashed_password.encode("utf-8"))
     except Exception:
         return False
+
+
+async def verify_password(plain_password: str, hashed_password: str) -> bool:
+    """CPU-bound bcrypt 검증 작업을 별도 스레드풀로 오프로딩하여 이벤트 루프 블로킹을 방지합니다."""
+    return await asyncio.to_thread(verify_password_sync, plain_password, hashed_password)
 
 
 async def get_current_year(date: datetime | None = None) -> int:
@@ -78,8 +90,8 @@ async def get_current_year(date: datetime | None = None) -> int:
     return target.year
 
 
-async def get_year_id(conn: asyncmy.Connection, year: int) -> int:
-    """학사년도(year)에 대응하는 year_id를 캐싱하여 불필요한 반복 서브쿼리를 방지합니다."""
+async def get_year_id(conn: asyncmy.Connection, year: int) -> Optional[int]:
+    """학사년도(year)에 대응하는 year_id를 캐싱하여 불필요한 반복 서브쿼리를 방지합니다. (DATA-04: 하드코딩 1 폴백 제거)"""
     global _YEAR_ID_CACHE
     if year in _YEAR_ID_CACHE:
         return _YEAR_ID_CACHE[year]
@@ -90,11 +102,11 @@ async def get_year_id(conn: asyncmy.Connection, year: int) -> int:
         if row:
             _YEAR_ID_CACHE[year] = row["year_id"]
             return row["year_id"]
-    return 1  # 기본값 폴백
+    return None
 
 
 # ==============================================================================
-# DTO 스키마 정의
+# DTO 스키마 정의 (AUTH-01: 목적별 OTP 및 이메일 변경 스키마 확장)
 # ==============================================================================
 
 class LoginRequest(BaseModel):
@@ -108,11 +120,13 @@ class SendOtpRequest(BaseModel):
     student_number: Optional[int] = None  # 교사 요청 건의 경우 위 3개는 무시됨
     is_it_student: bool = False
     email: str
+    purpose: str = "register"  # "register" 또는 "change_email"
 
 
 class VerifyOtpRequest(BaseModel):
     email: str
     verify_code: str
+    purpose: str = "register"  # "register" 또는 "change_email"
 
 
 class RegisterRequest(BaseModel):
@@ -126,12 +140,15 @@ class RegisterRequest(BaseModel):
 class PatchEmailRequest(BaseModel):
     email: str
     password: str
-    register_token: str
+    register_token: Optional[str] = None
+    email_change_token: Optional[str] = None
+    registerToken: Optional[str] = None
+    emailChangeToken: Optional[str] = None
 
 
-# 비밀번호 복잡도 정책: 3종 이상(영문, 숫자, 특수문자) 조합 시 최소 8자, 또는 2종 이상 조합 시 최소 10자 (SECURITY_AND_AUDIT.md 1.5, TODO.md 6.1 P2)
+# 비밀번호 복잡도 정책: 3종 이상(영문, 숫자, 특수문자) 조합 시 최소 8자, 또는 2종 이상 조합 시 최소 10자, 최대 72바이트 (SECURITY_AND_AUDIT.md 1.5, TODO.md 6.1 P2)
 def validate_password_complexity(password: str) -> bool:
-    if not password or len(password) < 8:
+    if not password or len(password) < 8 or len(password.encode("utf-8")) > 72:
         return False
     has_letter = bool(re.search(r"[A-Za-z]", password))
     has_digit = bool(re.search(r"\d", password))
@@ -228,20 +245,32 @@ async def login(
             """
             await cur.execute(sql_cmd, (current_yr, req.username))
             user = await cur.fetchone()
-    except Exception:
-        # DB 목 객체 또는 환경에 따른 폴백
-        async with conn.cursor(cursor=DictCursor) as cur:
-            sql_cmd = """
-                SELECT uuid, id, password, role, email
-                FROM users
-                WHERE id = %s AND is_deleted = FALSE
-            """
-            await cur.execute(sql_cmd, (req.username,))
-            user = await cur.fetchone()
+    except Exception as db_err:
+        logger.warning(f"[LOGIN_COMPLEX_QUERY_FAIL] fallback to simple users query: {db_err}")
+        try:
+            async with conn.cursor(cursor=DictCursor) as cur:
+                sql_cmd = """
+                    SELECT uuid, id, password, role, email
+                    FROM users
+                    WHERE id = %s AND is_deleted = FALSE
+                """
+                await cur.execute(sql_cmd, (req.username,))
+                user = await cur.fetchone()
+        except Exception as fatal_err:
+            logger.error(f"[LOGIN_DB_FATAL] DB connection error during login: {fatal_err}")
+            return JSONResponse(
+                status_code=500,
+                content=SrFormat(
+                    status_code=500,
+                    success=False,
+                    data=None,
+                    error=Error(code="INTERNAL_SERVER_ERROR", message="데이터베이스 통신 오류가 발생했습니다."),
+                ).model_dump(),
+            )
 
-    # 계정이 없을 경우 더미 해시 검증을 수행하여 유저 유무에 따른 시간차 공격 차단
+    # 계정이 없을 경우 더미 해시 검증을 수행하여 유저 유무에 따른 시간차 공격 차단 (AUTH-03)
     hash_data = user["password"] if user else DUMMY_HASH
-    hash_valid = verify_password(req.password, hash_data)
+    hash_valid = await verify_password(req.password, hash_data)
 
     if not user or not hash_valid:
         # 실패 카운터 증가 (10분 TTL)
@@ -523,68 +552,95 @@ async def send_otp(
 
     await redis.setex(f"email_cooldown:{clean_mail}", 60, f"{datetime.now()}")
 
-    # 사전 등록 명단 일치 여부 확인
-    if not req.is_it_student:
+    # 목적별 분기 처리 (AUTH-01: 회원가입 vs 이메일 변경 OTP 분리)
+    if req.purpose == "change_email":
         async with conn.cursor(cursor=DictCursor) as cur:
-            sql_cmd = """
-            SELECT * FROM teachers t
-            WHERE email = %s AND is_deleted = FALSE
-            LIMIT 1
-            """
-            await cur.execute(sql_cmd, (req.email,))
-            datas = await cur.fetchone()
-    else:
-        current_yr = await get_current_year()
-        year_id = await get_year_id(conn, current_yr)
-        async with conn.cursor(cursor=DictCursor) as cur:
-            sql_cmd = """
-            SELECT * FROM students s
-            JOIN student_academic_records sa
-                ON s.student_id = sa.student_id
-            WHERE s.email = %s AND s.is_deleted = FALSE
-                AND sa.year_id = %s
-                AND sa.grade = %s AND sa.class = %s AND sa.number = %s
-            LIMIT 1
-            """
-            await cur.execute(sql_cmd, (req.email, year_id, req.student_grade, req.student_class, req.student_number))
-            datas = await cur.fetchone()
+            await cur.execute("SELECT uuid FROM users WHERE email = %s AND is_deleted = FALSE LIMIT 1", (clean_mail,))
+            ex_u = await cur.fetchone()
+            if not ex_u:
+                await cur.execute("SELECT student_id FROM students WHERE email = %s AND is_deleted = FALSE LIMIT 1", (clean_mail,))
+                ex_u = await cur.fetchone()
+            if not ex_u:
+                await cur.execute("SELECT teachers_id FROM teachers WHERE email = %s AND is_deleted = FALSE LIMIT 1", (clean_mail,))
+                ex_u = await cur.fetchone()
 
-    if not datas:
-        return JSONResponse(
-            status_code=404,
-            content=SrFormat(
+        if ex_u:
+            return JSONResponse(
+                status_code=409,
+                content=SrFormat(
+                    status_code=409,
+                    success=False,
+                    data=None,
+                    error=Error(code="DUPLICATE_EMAIL", message="이미 사용 중이거나 등록된 이메일 주소입니다."),
+                ).model_dump(),
+            )
+        user_name = "사용자"
+        otp_key = f"otp:change_email:{clean_mail}"
+    else:
+        # 사전 등록 명단 일치 여부 확인 (신규 가입)
+        if not req.is_it_student:
+            async with conn.cursor(cursor=DictCursor) as cur:
+                sql_cmd = """
+                SELECT * FROM teachers t
+                WHERE email = %s AND is_deleted = FALSE
+                LIMIT 1
+                """
+                await cur.execute(sql_cmd, (req.email,))
+                datas = await cur.fetchone()
+        else:
+            current_yr = await get_current_year()
+            year_id = await get_year_id(conn, current_yr)
+            async with conn.cursor(cursor=DictCursor) as cur:
+                sql_cmd = """
+                SELECT * FROM students s
+                JOIN student_academic_records sa
+                    ON s.student_id = sa.student_id
+                WHERE s.email = %s AND s.is_deleted = FALSE
+                    AND sa.year_id = %s
+                    AND sa.grade = %s AND sa.class = %s AND sa.number = %s
+                LIMIT 1
+                """
+                await cur.execute(sql_cmd, (req.email, year_id, req.student_grade, req.student_class, req.student_number))
+                datas = await cur.fetchone()
+
+        if not datas:
+            return JSONResponse(
                 status_code=404,
-                success=False,
-                data=None,
-                error=Error(
-                    code="NOT_FOUND",
-                    message="유저를 찾을 수 없거나, 요청이 잘못 되었습니다."
-                )
-            ).model_dump()
-        )
-    if datas.get("uuid") is not None:
-        return JSONResponse(
-            status_code=403,
-            content=SrFormat(
+                content=SrFormat(
+                    status_code=404,
+                    success=False,
+                    data=None,
+                    error=Error(
+                        code="NOT_FOUND",
+                        message="유저를 찾을 수 없거나, 요청이 잘못 되었습니다."
+                    )
+                ).model_dump()
+            )
+        if datas.get("uuid") is not None:
+            return JSONResponse(
                 status_code=403,
-                success=False,
-                data=None,
-                error=Error(
-                    code="FORBIDDEN",
-                    message="이미 가입한 사용자입니다."
-                )
-            ).model_dump()
-        )
+                content=SrFormat(
+                    status_code=403,
+                    success=False,
+                    data=None,
+                    error=Error(
+                        code="FORBIDDEN",
+                        message="이미 가입한 사용자입니다."
+                    )
+                ).model_dump()
+            )
+        user_name = datas.get("name", "사용자")
+        otp_key = f"otp:{clean_mail}"
 
     # TRNG(암호학적 난수 생성기)를 이용한 6자리 균등 난수 생성
     otp_codes = f"{secrets.randbelow(1000000):06d}"
-    await redis.setex(f"otp:{clean_mail}", 300, otp_codes)
+    await redis.setex(otp_key, 300, otp_codes)
 
     background_tasks.add_task(
         send_otp_email,
         to_email=clean_mail,
         otp_code=otp_codes,
-        user_name=datas.get("name", "사용자")
+        user_name=user_name,
     )
 
     return SrFormat(
@@ -624,8 +680,12 @@ async def verify_otp(req: VerifyOtpRequest, redis: aioredis.Redis = Depends(get_
     clean_mail = req.email.strip().lower()
     clean_code = req.verify_code.strip()
 
-    attempt_key = f"otp_attempts:{clean_mail}"
-    otp_key = f"otp:{clean_mail}"
+    if req.purpose == "change_email":
+        attempt_key = f"otp_attempts:change_email:{clean_mail}"
+        otp_key = f"otp:change_email:{clean_mail}"
+    else:
+        attempt_key = f"otp_attempts:{clean_mail}"
+        otp_key = f"otp:{clean_mail}"
 
     # [보안 1.8] 원자적 시도 횟수 선증가 (Race Window 방어)
     attempts = await redis.incr(attempt_key)
@@ -705,19 +765,32 @@ async def verify_otp(req: VerifyOtpRequest, redis: aioredis.Redis = Depends(get_
     await redis.delete(otp_key)
     await redis.delete(attempt_key)
 
-    # 안전한 32바이트 Opaque 토큰 생성 (10분 유효)
-    register_token = secrets.token_urlsafe(32)
-    await redis.setex(f"register_token:{clean_mail}", 600, register_token)
-
-    return SrFormat(
-        status_code=200,
-        success=True,
-        data={
-            "message": "Verify OTP codes.",
-            "email": clean_mail,
-            "registerToken": register_token
-        }
-    ).model_dump()
+    # 안전한 32바이트 Opaque 토큰 생성 (10분 유효, AUTH-01)
+    token_val = secrets.token_urlsafe(32)
+    if req.purpose == "change_email":
+        await redis.setex(f"email_change_token:{clean_mail}", 600, token_val)
+        await redis.setex(f"register_token:{clean_mail}", 600, token_val)
+        return SrFormat(
+            status_code=200,
+            success=True,
+            data={
+                "message": "Verify OTP codes.",
+                "email": clean_mail,
+                "emailChangeToken": token_val,
+                "registerToken": token_val
+            }
+        ).model_dump()
+    else:
+        await redis.setex(f"register_token:{clean_mail}", 600, token_val)
+        return SrFormat(
+            status_code=200,
+            success=True,
+            data={
+                "message": "Verify OTP codes.",
+                "email": clean_mail,
+                "registerToken": token_val
+            }
+        ).model_dump()
 
 
 @router.post("/register")
@@ -766,7 +839,7 @@ async def register_user(
         )
 
     clean_mail = req.email.strip().lower()
-    stored_token = await redis.get(f"register_token:{clean_mail}")
+    stored_token = await redis.getdel(f"register_token:{clean_mail}")
     if stored_token is None or stored_token != req.register_token:
         return JSONResponse(
             status_code=401,
@@ -854,9 +927,6 @@ async def register_user(
                     )
                 ).model_dump()
             )
-
-    # 1회용 토큰 즉시 파기
-    await redis.delete(f"register_token:{clean_mail}")
 
     user_uuid = str(uuid.uuid4())
     user_pw = hash_password(req.password)
@@ -947,7 +1017,8 @@ async def patch_email(
     """
     uuid = current_user["uuid"]
 
-    if not req.email or not req.password or not req.register_token:
+    token_val = req.email_change_token or req.emailChangeToken or req.register_token or req.registerToken
+    if not req.email or not req.password or not token_val:
         return JSONResponse(
             status_code=400,
             content=SrFormat(
@@ -963,9 +1034,11 @@ async def patch_email(
 
     clean_mail = req.email.strip().lower()
 
-    # 1. 새 이메일 인증 토큰 검증
-    stored_token = await redis.get(f"register_token:{clean_mail}")
-    if stored_token is None or stored_token != req.register_token:
+    # 1. 새 이메일 인증 토큰 원자적 검증 및 소비 (AUTH-01, AUTH-02)
+    stored_token = await redis.getdel(f"email_change_token:{clean_mail}")
+    if not stored_token:
+        stored_token = await redis.getdel(f"register_token:{clean_mail}")
+    if stored_token is None or stored_token != token_val:
         return JSONResponse(
             status_code=401,
             content=SrFormat(
@@ -982,17 +1055,16 @@ async def patch_email(
     # 2. 이메일 중복 및 사용자/비밀번호 검증
     #    [보안 1.4] users뿐 아니라 students, teachers 테이블도 중복 검사
     async with conn.cursor(cursor=DictCursor) as cur:
-        await cur.execute("SELECT uuid FROM users WHERE email = %s AND is_deleted = FALSE LIMIT 1", (clean_mail,))
+        await cur.execute("SELECT uuid FROM users WHERE email = %s AND uuid != %s AND is_deleted = FALSE LIMIT 1", (clean_mail, uuid))
         existing_user = await cur.fetchone()
 
         if not existing_user:
-            await cur.execute("SELECT student_id FROM students WHERE email = %s AND is_deleted = FALSE LIMIT 1", (clean_mail,))
+            await cur.execute("SELECT student_id FROM students WHERE email = %s AND (uuid IS NULL OR uuid != %s) AND is_deleted = FALSE LIMIT 1", (clean_mail, uuid))
             existing_student = await cur.fetchone()
             if not existing_student:
-                await cur.execute("SELECT teachers_id FROM teachers WHERE email = %s AND is_deleted = FALSE LIMIT 1", (clean_mail,))
+                await cur.execute("SELECT teachers_id FROM teachers WHERE email = %s AND (uuid IS NULL OR uuid != %s) AND is_deleted = FALSE LIMIT 1", (clean_mail, uuid))
                 existing_teacher = await cur.fetchone()
                 existing_user = existing_teacher
-
             else:
                 existing_user = existing_student
 
@@ -1027,7 +1099,7 @@ async def patch_email(
             ).model_dump()
         )
 
-    if not verify_password(req.password, user_data["password"]):
+    if not await verify_password(req.password, user_data["password"]):
         return JSONResponse(
             status_code=401,
             content=SrFormat(
@@ -1040,9 +1112,6 @@ async def patch_email(
                 )
             ).model_dump()
         )
-
-    # 3. 모든 검증 통과 후 1회용 토큰 파기
-    await redis.delete(f"register_token:{clean_mail}")
 
     # 4. 트랜잭션 기반 이메일 업데이트
     #    [보안 1.4] users와 대상 테이블(students/teachers)의 이메일을 원자적으로 동시 UPDATE

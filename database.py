@@ -65,6 +65,10 @@ async def get_db():
             yield conn
         finally:
             try:
+                await conn.rollback()
+            except Exception:
+                pass
+            try:
                 await conn.autocommit(True)
             except Exception:
                 pass

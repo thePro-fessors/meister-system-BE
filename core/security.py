@@ -317,6 +317,7 @@ def create_access_token(data: dict, expires_delta: timedelta | None = None) -> s
     if "jti" not in to_encode:
         to_encode["jti"] = str(uuid.uuid4())
 
+    to_encode["purpose"] = "access"
     to_encode["iat"] = int(now.timestamp())
     to_encode["exp"] = int(expire.timestamp())
 
@@ -329,12 +330,7 @@ async def get_current_user(
 ) -> Dict[str, Any]:
     """
     FastAPI 의존성 주입용: 요청 헤더의 JWT 토큰을 파싱하고 유효성 및 블랙리스트 등록 여부를 검증합니다.
-    
-    검증 절차:
-    1. Authorization Bearer 헤더 존재 여부 확인 (미존재 시 401 UNAUTHORIZED)
-    2. JWT 서명 위조 및 만료 시간(exp) 확인 (만료 시 401 UNAUTHORIZED)
-    3. 페이로드 내 jti 추출 및 Redis 블랙리스트 키(`blacklist:{jti}`) 존재 여부 O(1) 검사
-    4. 검증 완료 시 사용자 식별 정보 딕셔너리 반환
+    (SEC-02: purpose=access 필수 검증, download 토큰 차단, Redis 장애 시 503 반환)
     """
     if not credentials or not credentials.credentials:
         raise HTTPException(
@@ -381,6 +377,21 @@ async def get_current_user(
             ).model_dump(),
         )
 
+    # SEC-02: 다운로드 전용 토큰은 일반 API 인증에 사용 불가
+    if payload.get("purpose") == "download":
+        raise HTTPException(
+            status_code=401,
+            detail=SrFormat(
+                status_code=401,
+                success=False,
+                data=None,
+                error=Error(
+                    code="UNAUTHORIZED",
+                    message="다운로드 전용 토큰은 일반 API 인증에 사용할 수 없습니다.",
+                ),
+            ).model_dump(),
+        )
+
     jti = payload.get("jti")
     if not jti:
         raise HTTPException(
@@ -391,13 +402,28 @@ async def get_current_user(
                 data=None,
                 error=Error(
                     code="UNAUTHORIZED",
-                    message="올바르지 않은 토큰 페이로드 형식입니다.",
+                    message="올바르지 않은 토큰 페이로드 형식입니다 (jti 누락).",
                 ),
             ).model_dump(),
         )
 
-    # Redis 블랙리스트 키 확인: O(1) 초고속 조회
-    is_revoked = await redis.get(f"blacklist:{jti}")
+    # Redis 블랙리스트 키 확인: 장애 시 pass로 우회하지 않고 503 반환 (SEC-02)
+    try:
+        is_revoked = await redis.get(f"blacklist:{jti}")
+    except Exception:
+        raise HTTPException(
+            status_code=503,
+            detail=SrFormat(
+                status_code=503,
+                success=False,
+                data=None,
+                error=Error(
+                    code="SERVICE_UNAVAILABLE",
+                    message="인증 세션 상태 확인 중 오류가 발생했습니다.",
+                ),
+            ).model_dump(),
+        )
+
     if is_revoked:
         raise HTTPException(
             status_code=401,
