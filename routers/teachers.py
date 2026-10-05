@@ -8,6 +8,9 @@ routers/teachers.py - 마이스터 역량인증제 교사용 API 라우터
   - 쿼리 필터: year, grade, classNo, name, studentNo, area, status, hasPoints
   - 교사 담당 학급/권한 범위 강제 필터링 (클라이언트 우회 차단)
   - 학생별 취득 점수, 인증 상태, 대기 증빙 건수, 상벌점 합계 반환
+- 3.3 특정 학생 상세 현황 조회 (GET /api/teacher/students/{studentId} & /api/teachers/students/{studentId})
+  - 담당 권한 범위 내 학생인지 서버 검증 (타 학급 접근 시 403 FORBIDDEN 차단)
+  - 학생의 5대 영역별 세부 인증 현황(취득점수, 배점, 등급, 상태) 및 증빙 제출 전체 목록 반환
 """
 
 import logging
@@ -57,6 +60,64 @@ class TeacherStudentItem(BaseModel):
     certStatus: str = Field(..., description="인증 상태 (인증 가능, 검토중, 보완 필요, 미달성)")
     pendingCount: int = Field(..., description="검토 대기 증빙 건수")
     pointTotal: float = Field(..., description="상벌점 합계")
+
+
+class TeacherStudentDetailAreaItem(BaseModel):
+    """3.3 특정 학생 상세 현황 5대 영역별 세부 인증 결과 DTO (Tech_spec.md 2.1 & 3.3)"""
+    area: str = Field(..., description="인증 영역명")
+    areaId: Optional[int] = Field(None, description="영역 고유 ID")
+    score: float = Field(..., description="학생 취득 점수")
+    maxScore: float = Field(..., description="영역 최대 배점")
+    grade: str = Field(..., description="영역 등급 (S, A, B, 미달성)")
+    status: str = Field(..., description="영역 진행 상태 (달성, 검토중, 보완 필요)")
+
+
+class TeacherStudentDetailSubmissionItem(BaseModel):
+    """3.3 특정 학생 상세 현황 증빙 제출 목록 DTO (Tech_spec.md 2.3 & 3.3)"""
+    id: int = Field(..., description="제출 건 ID")
+    submissionId: Optional[int] = Field(None, description="제출 건 ID alias")
+    studentId: int = Field(..., description="학생 ID")
+    year: int = Field(..., description="학년도")
+    area: str = Field(..., description="영역명")
+    areaId: Optional[int] = Field(None, description="영역 ID")
+    itemId: int = Field(..., description="평가 항목 ID")
+    itemName: str = Field(..., description="평가 항목명")
+    detail: str = Field(..., description="세부 항목명/활동명")
+    activityDate: Optional[str] = Field(None, description="활동 일자 (YYYY-MM-DD)")
+    description: Optional[str] = Field(None, description="자료 설명")
+    filePath: Optional[str] = Field(None, description="파일 경로")
+    fileUrl: Optional[str] = Field(None, description="파일 다운로드/열람 URL")
+    originalFilename: Optional[str] = Field(None, description="업로드 원본 파일명")
+    linkUrl: Optional[str] = Field(None, description="증빙 링크 URL")
+    link: Optional[str] = Field(None, description="증빙 링크 alias")
+    status: str = Field(..., description="제출 상태 문자열 (제출완료, 검토중, 인정완료, 반려, 재제출요청)")
+    statusCode: int = Field(..., description="제출 상태 코드 (1~5)")
+    score: Optional[float] = Field(None, description="인정 점수")
+    grantedScore: Optional[float] = Field(None, description="인정 점수 alias")
+    teacherComment: Optional[str] = Field(None, description="교사 검토 의견")
+    submittedAt: Optional[str] = Field(None, description="제출 일시 (ISO 8601)")
+    reviewedAt: Optional[str] = Field(None, description="검토 일시 (ISO 8601)")
+    reviewerId: Optional[int] = Field(None, description="검토 교사 ID")
+
+
+class TeacherStudentDetailResponse(BaseModel):
+    """3.3 특정 학생 상세 현황 응답 DTO"""
+    studentId: int = Field(..., description="학생 고유 ID")
+    id: Optional[int] = Field(None, description="학생 고유 ID alias")
+    name: str = Field(..., description="학생 이름")
+    grade: int = Field(..., description="학년")
+    classNo: int = Field(..., description="학급 반")
+    number: int = Field(..., description="번호")
+    studentNo: Optional[int] = Field(None, description="번호 alias")
+    email: Optional[str] = Field(None, description="학생 이메일")
+    year: int = Field(..., description="조회 학년도")
+    areas: List[TeacherStudentDetailAreaItem] = Field(..., description="5대 영역별 세부 인증 현황")
+    totalScore: float = Field(..., description="취득 점수 합계")
+    certStatus: str = Field(..., description="종합 역량인증 상태 (인증 가능, 검토중, 보완 필요, 미달성)")
+    pointTotal: float = Field(..., description="상벌점 합계")
+    pendingCount: int = Field(..., description="검토 대기 증빙 건수")
+    submissions: List[TeacherStudentDetailSubmissionItem] = Field(..., description="증빙 제출 전체 목록")
+    student: Optional[Dict[str, Any]] = Field(None, description="학생 정보 객체 (호환용)")
 
 
 # ==============================================================================
@@ -178,7 +239,8 @@ async def get_teacher_dashboard(
     stats_sql = """
         SELECT
             COUNT(CASE WHEN s.status_code IN (1, 2) THEN 1 END) AS pending_count,
-            COUNT(CASE WHEN s.status_code IN (1, 2) AND EXISTS (\n                SELECT 1 FROM submissions_logs sl
+            COUNT(CASE WHEN s.status_code IN (1, 2) AND EXISTS (
+                SELECT 1 FROM submissions_logs sl
                 WHERE sl.submission_id = s.submission_id AND sl.action_type = '재제출'
             ) THEN 1 END) AS resubmitted_count,
             COUNT(CASE WHEN s.status_code IN (1, 2) AND s.granted_score IS NULL THEN 1 END) AS unscored_count
@@ -331,19 +393,21 @@ async def get_teacher_students(
     conn: Any = Depends(get_db),
 ):
     """
-    교사 담당 학급 또는 권한 범위 내 학생 목록 및 제출/인증 현황을 검색 및 조회합니다.
+    [GET] /api/teacher/students
+
+    교사의 담당 학급 또는 권한 범위 내 학생 목록과 각 학생의 인증 현황, 점수, 상벌점 요약을 조회합니다.
 
     보안 및 인가 규칙 (Tech_spec.md 3.2 & TODO.md 3.2):
-    1. 호출 주체: teacher, admin (student 호출 시 403 Forbidden 차단)
-    2. 담임교사의 경우 본인 담당 학급(학년/반) 데이터만 강제 필터링하여 타 학급 열람 우회를 원천 차단합니다.
-    3. 학생별 취득 점수(totalScore), 종합 인증 상태(certStatus), 심사 대기건수(pendingCount), 상벌점 합계(pointTotal)를 계산하여 반환합니다.
+    1. 호출자 역할: 교사(teacher) 또는 관리자(admin)만 허용 (학생 접근 시 403 FORBIDDEN).
+    2. 교사의 담당 학급(grade, class)이 배정된 경우, 클라이언트의 grade/class 쿼리 파라미터와 무관하게
+       담당 학급으로 강제 격리(Scope Isolation)하여 타 학급 정보 조회를 원천 차단합니다.
+    3. 비담임 교과 교사 또는 관리자 계정은 grade, class 쿼리 파라미터를 통해 전체 학급을 필터링 및 조회할 수 있습니다.
     """
-    user_uuid = current_user.get("uuid")
     user_role = current_user.get("role")
+    user_uuid = current_user.get("uuid")
 
     # 1. 교사/관리자 RBAC 인가 검증
-    is_teacher_or_admin = user_role in ("teacher", "admin", "1", "2", 1, 2)
-    if not is_teacher_or_admin:
+    if user_role not in ("teacher", "admin", "1", "2", 1, 2):
         return JSONResponse(
             status_code=status.HTTP_403_FORBIDDEN,
             content=SrFormat(
@@ -354,12 +418,14 @@ async def get_teacher_students(
             ).model_dump(),
         )
 
-    # 2. 교사 정보 및 담당 학급(Scope) 조회
+    is_admin = user_role in ("admin", "2", 2)
+
+    # 2. 교사 정보 및 담당 학급 범위 조회
     teacher_row = None
     async with conn.cursor(cursor=DictCursor) as cur:
         await cur.execute(
             """
-            SELECT teachers_id, name, subject, grade, class, email
+            SELECT teachers_id, name, grade, class AS class_num, subject
             FROM teachers
             WHERE uuid = %s AND is_deleted = FALSE
             LIMIT 1
@@ -368,7 +434,6 @@ async def get_teacher_students(
         )
         teacher_row = await cur.fetchone()
 
-    is_admin = user_role in ("admin", "2", 2)
     if not teacher_row and not is_admin:
         return JSONResponse(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -380,11 +445,26 @@ async def get_teacher_students(
             ).model_dump(),
         )
 
-    # 3. 담임교사 권한 범위 강제 필터링 및 우회 차단 (Scope Isolation)
     teacher_grade = teacher_row.get("grade") if teacher_row else None
-    teacher_class = teacher_row.get("class") if teacher_row else None
+    teacher_class = teacher_row.get("class_num") if teacher_row else None
+    if teacher_class is None and teacher_row:
+        teacher_class = teacher_row.get("class")
+
     has_homeroom = (not is_admin) and (teacher_grade is not None and teacher_class is not None)
 
+    # 3. 학년도 및 year_id 조회
+    target_year = year if year is not None else await get_current_year()
+    year_id = await get_year_id_by_year(conn, target_year)
+
+    if not year_id:
+        return SrFormat(
+            status_code=status.HTTP_200_OK,
+            success=True,
+            data=[],
+            error=None,
+        ).model_dump()
+
+    # 4. 담임 권한 범위 강제 적용 및 필터 해석
     req_class = classNo if classNo is not None else class_no
     req_number = studentNo if studentNo is not None else number
 
@@ -406,24 +486,11 @@ async def get_teacher_students(
         target_grade = grade
         target_class = req_class
 
-    # 4. 대상 학년도 및 year_id 확인
-    target_year = year or await get_current_year(datetime.now())
-    year_id = await get_year_id_by_year(conn, target_year)
-
-    if not year_id:
-        return SrFormat(
-            status_code=status.HTTP_200_OK,
-            success=True,
-            data=[],
-            error=None,
-        ).model_dump()
-
-    # 5. 대상 학생 기본 정보 및 학적 조회 (DB 수준 필터링)
+    # 5. 학생 학적 기본 정보 조회
     student_sql = """
-        SELECT
+        SELECT 
             st.student_id,
             st.name,
-            st.uuid,
             sar.grade,
             sar.class AS class_no,
             sar.number
@@ -703,5 +770,432 @@ async def get_teacher_students(
         status_code=status.HTTP_200_OK,
         success=True,
         data=result_students,
+        error=None,
+    ).model_dump()
+
+
+# ==============================================================================
+# 3.3 교사용 특정 학생 상세 현황 및 제출 목록 조회 API (Tech_spec.md 3.3 & TODO.md 3.3)
+# ==============================================================================
+
+@router.get(
+    "/api/teacher/students/{student_id}",
+    summary="특정 학생 상세 현황 및 제출 목록 조회 (Tech_spec.md 3.3 & TODO.md 3.3)",
+    response_model=SrFormat[TeacherStudentDetailResponse],
+)
+@router.get(
+    "/api/teachers/students/{student_id}",
+    summary="특정 학생 상세 현황 및 제출 목록 조회 (복수형 별칭)",
+    response_model=SrFormat[TeacherStudentDetailResponse],
+    include_in_schema=False,
+)
+async def get_teacher_student_detail(
+    student_id: int,
+    year: Optional[int] = Query(None, description="조회 학년도 (생략 시 현재 학사년도)"),
+    current_user: Dict[str, Any] = Depends(get_current_user),
+    conn: Any = Depends(get_db),
+):
+    """
+    [GET] /api/teacher/students/{student_id}
+
+    특정 학생의 5대 영역별 세부 인증 현황(취득점수, 배점, 성취등급, 상태)과 
+    증빙자료 제출 전체 목록을 교사 권한으로 조회합니다.
+
+    보안 및 권한 규칙 (Tech_spec.md 3.3 & TODO.md 3.3):
+    1. 호출자 역할: 교사(teacher) 또는 관리자(admin)만 허용 (학생 접근 시 403 FORBIDDEN).
+    2. 교사 계정 확인: teachers 테이블에 등록된 교사여야 함 (미등록 교사 시 404 TEACHER_NOT_FOUND).
+    3. 담임 권한 격리 (IDOR 방어):
+       - 담임 교사(grade 및 class 배정)인 경우, 오직 본인 담당 학급 학생만 열람 가능.
+       - 타 학급/타 학년 학생 조회 시 403 FORBIDDEN (FORBIDDEN, "담당 학급 학생만 상세 조회할 수 있습니다.").
+       - 비담임 교과 교사 및 관리자는 전교생 열람 가능.
+    4. 대상 학생 및 학적 존재 검증:
+       - 학생 미존재 시 404 USER_NOT_FOUND
+       - 학년도 미존재 시 404 ITEM_NOT_FOUND
+       - 해당 학년도 학적 미존재 시 404 USER_NOT_FOUND
+    """
+    user_role = current_user.get("role")
+    user_uuid = current_user.get("uuid")
+
+    # 1. RBAC 검증: 교사 또는 관리자 권한 필수
+    if user_role not in ("teacher", "admin", "1", "2", 1, 2):
+        return JSONResponse(
+            status_code=status.HTTP_403_FORBIDDEN,
+            content=SrFormat(
+                status_code=status.HTTP_403_FORBIDDEN,
+                success=False,
+                data=None,
+                error=Error(code="FORBIDDEN", message="교사 또는 관리자 권한이 필요합니다."),
+            ).model_dump(),
+        )
+
+    is_admin = user_role in ("admin", "2", 2)
+
+    # 2. 교사 프로필 및 담임 권한 범위 확인
+    teacher_row = None
+    teacher_grade = None
+    teacher_class = None
+
+    async with conn.cursor(cursor=DictCursor) as cur:
+        await cur.execute(
+            """
+            SELECT teachers_id, name, grade, class AS class_num, subject
+            FROM teachers
+            WHERE uuid = %s AND is_deleted = FALSE
+            LIMIT 1
+            """,
+            (user_uuid,),
+        )
+        teacher_row = await cur.fetchone()
+
+    if not teacher_row and not is_admin:
+        return JSONResponse(
+            status_code=status.HTTP_404_NOT_FOUND,
+            content=SrFormat(
+                status_code=status.HTTP_404_NOT_FOUND,
+                success=False,
+                data=None,
+                error=Error(code="TEACHER_NOT_FOUND", message="교사 정보를 찾을 수 없습니다."),
+            ).model_dump(),
+        )
+
+    if teacher_row:
+        teacher_grade = teacher_row.get("grade")
+        teacher_class = teacher_row.get("class_num")
+        if teacher_class is None:
+            teacher_class = teacher_row.get("class")
+
+    has_homeroom = (not is_admin) and (teacher_grade is not None and teacher_class is not None)
+
+    # 3. 대상 학생 존재 여부 확인
+    async with conn.cursor(cursor=DictCursor) as cur:
+        await cur.execute(
+            """
+            SELECT student_id, uuid, name, email
+            FROM students
+            WHERE student_id = %s AND is_deleted = FALSE
+            LIMIT 1
+            """,
+            (student_id,),
+        )
+        target_student = await cur.fetchone()
+
+    if not target_student:
+        return JSONResponse(
+            status_code=status.HTTP_404_NOT_FOUND,
+            content=SrFormat(
+                status_code=status.HTTP_404_NOT_FOUND,
+                success=False,
+                data=None,
+                error=Error(code="USER_NOT_FOUND", message="해당 학생을 찾을 수 없습니다."),
+            ).model_dump(),
+        )
+
+    # 4. 학년도 및 학적 정보 확인
+    target_year = year if year is not None else await get_current_year()
+    year_id = await get_year_id_by_year(conn, target_year)
+
+    if not year_id:
+        return JSONResponse(
+            status_code=status.HTTP_404_NOT_FOUND,
+            content=SrFormat(
+                status_code=status.HTTP_404_NOT_FOUND,
+                success=False,
+                data=None,
+                error=Error(code="ITEM_NOT_FOUND", message=f"{target_year} 학년도 정보가 시스템에 존재하지 않습니다."),
+            ).model_dump(),
+        )
+
+    async with conn.cursor(cursor=DictCursor) as cur:
+        await cur.execute(
+            """
+            SELECT grade, class AS class_no, number
+            FROM student_academic_records
+            WHERE student_id = %s AND year_id = %s
+            LIMIT 1
+            """,
+            (student_id, year_id),
+        )
+        academic_record = await cur.fetchone()
+
+    if not academic_record:
+        return JSONResponse(
+            status_code=status.HTTP_404_NOT_FOUND,
+            content=SrFormat(
+                status_code=status.HTTP_404_NOT_FOUND,
+                success=False,
+                data=None,
+                error=Error(code="USER_NOT_FOUND", message=f"{target_year} 학년도에 등록된 해당 학생의 학적 정보를 찾을 수 없습니다."),
+            ).model_dump(),
+        )
+
+    st_grade = academic_record["grade"]
+    st_class = academic_record["class_no"]
+    st_number = academic_record["number"]
+
+    # 5. 담임 권한 범위 검증 (Scope Isolation & IDOR 방어)
+    if has_homeroom:
+        if st_grade != teacher_grade or st_class != teacher_class:
+            return JSONResponse(
+                status_code=status.HTTP_403_FORBIDDEN,
+                content=SrFormat(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    success=False,
+                    data=None,
+                    error=Error(code="FORBIDDEN", message="담당 학급 학생만 상세 조회할 수 있습니다."),
+                ).model_dump(),
+            )
+
+    # 6. 대상 학년/학년도 인증 영역, 학생 제출건, 상벌점 조회
+    async with conn.cursor(cursor=DictCursor) as cur:
+        # (1) 인증 영역 조회
+        await cur.execute(
+            """
+            SELECT area_id, name, max_score
+            FROM certification_areas
+            WHERE year_id = %s AND grade = %s
+            ORDER BY area_id ASC
+            """,
+            (year_id, st_grade),
+        )
+        areas = await cur.fetchall()
+
+        if not areas:
+            await cur.execute(
+                """
+                SELECT area_id, name, max_score
+                FROM certification_areas
+                WHERE year_id = %s
+                ORDER BY area_id ASC
+                """,
+                (year_id,),
+            )
+            areas = await cur.fetchall()
+
+        # (2) 학생 증빙 제출건 전체 조회 (최신 제출순 정렬)
+        await cur.execute(
+            """
+            SELECT 
+                s.submission_id,
+                s.student_id,
+                ay.year,
+                ca.area_id,
+                ca.name AS area_name,
+                s.item_id,
+                ei.name AS item_name,
+                ei.scoring_type,
+                ei.max_score AS item_max_score,
+                s.detail,
+                s.activity_date,
+                s.description,
+                s.file_path,
+                s.original_filename,
+                s.link_url,
+                s.status_code,
+                s.granted_score,
+                s.teacher_comment,
+                s.created_at,
+                s.reviewed_at,
+                s.reviewer_id
+            FROM submissions s
+            JOIN evaluation_items ei ON s.item_id = ei.item_id
+            JOIN certification_areas ca ON ei.area_id = ca.area_id AND ca.year_id = %s
+            JOIN academic_years ay ON ca.year_id = ay.year_id
+            WHERE s.student_id = %s
+              AND s.is_deleted = FALSE
+            ORDER BY s.created_at DESC, s.submission_id DESC
+            """,
+            (year_id, student_id),
+        )
+        all_submissions = await cur.fetchall()
+
+        # (3) 상벌점 조회 (3월 1일 ~ 익년 3월 1일 학사력 기준)
+        merit_start = date(target_year, 3, 1)
+        merit_end = date(target_year + 1, 3, 1)
+
+        await cur.execute(
+            """
+            SELECT 
+                merits_point_id,
+                type,
+                points,
+                related_area,
+                occurred_at
+            FROM merits
+            WHERE student_id = %s
+              AND is_reflected = TRUE
+              AND is_deleted = FALSE
+              AND occurred_at >= %s
+              AND occurred_at < %s
+            """,
+            (student_id, merit_start, merit_end),
+        )
+        all_merits = await cur.fetchall()
+
+    # 7. 점수 집계 및 등급 산정 연산 (In-Memory Processing)
+    area_item_scores: Dict[int, Dict[int, List[float]]] = {}
+    area_item_meta: Dict[int, Dict[str, Any]] = {}
+    area_pending_counts: Dict[int, int] = {}
+    pending_count = 0
+    has_any_pending = False
+    formatted_submissions: List[Dict[str, Any]] = []
+
+    for sub in all_submissions:
+        aid = sub["area_id"]
+        iid = sub["item_id"]
+        st_code = sub["status_code"]
+        g_score = float(sub["granted_score"]) if sub["granted_score"] is not None else None
+        sc_type = sub["scoring_type"]
+        item_max = float(sub["item_max_score"]) if sub["item_max_score"] is not None else None
+
+        area_item_meta[iid] = {
+            "scoring_type": sc_type,
+            "item_max_score": item_max,
+        }
+
+        if st_code in (1, 2):
+            has_any_pending = True
+            pending_count += 1
+            area_pending_counts[aid] = area_pending_counts.get(aid, 0) + 1
+        elif st_code == 3:
+            if aid not in area_item_scores:
+                area_item_scores[aid] = {}
+            if iid not in area_item_scores[aid]:
+                area_item_scores[aid][iid] = []
+            area_item_scores[aid][iid].append(g_score or 0.0)
+
+        # 제출 포맷 변환
+        st_text = SUBMISSION_STATUS_MAP.get(st_code, "제출완료")
+        act_date_val = sub["activity_date"]
+        act_date_str = act_date_val.strftime("%Y-%m-%d") if hasattr(act_date_val, "strftime") else (str(act_date_val) if act_date_val else None)
+        created_val = sub["created_at"]
+        created_str = created_val.isoformat() if hasattr(created_val, "isoformat") else (str(created_val) if created_val else None)
+        reviewed_val = sub["reviewed_at"]
+        reviewed_str = reviewed_val.isoformat() if hasattr(reviewed_val, "isoformat") else (str(reviewed_val) if reviewed_val else None)
+
+        formatted_submissions.append({
+            "id": sub["submission_id"],
+            "submissionId": sub["submission_id"],
+            "studentId": sub["student_id"],
+            "year": sub["year"],
+            "area": sub["area_name"],
+            "areaId": aid,
+            "itemId": iid,
+            "itemName": sub["item_name"],
+            "detail": sub["detail"] or "",
+            "activityDate": act_date_str,
+            "description": sub["description"] or "",
+            "filePath": sub["file_path"],
+            "fileUrl": sub["file_path"],
+            "originalFilename": sub["original_filename"],
+            "linkUrl": sub["link_url"],
+            "link": sub["link_url"],
+            "status": st_text,
+            "statusCode": st_code,
+            "score": g_score,
+            "grantedScore": g_score,
+            "teacherComment": sub["teacher_comment"],
+            "submittedAt": created_str,
+            "reviewedAt": reviewed_str,
+            "reviewerId": sub["reviewer_id"],
+        })
+
+    # 상벌점 집계
+    area_merit_points: Dict[str, float] = {}
+    total_merit_points = 0.0
+    for m in all_merits:
+        m_type = m.get("type")
+        pts = float(m.get("points") or 0.0)
+        rel_area = (m.get("related_area") or "").strip()
+        if m_type in ("-", "벌점"):
+            signed_pts = -abs(pts)
+        else:
+            signed_pts = abs(pts)
+        total_merit_points += signed_pts
+        if rel_area:
+            area_merit_points[rel_area] = area_merit_points.get(rel_area, 0.0) + signed_pts
+    point_total = round(total_merit_points, 1)
+
+    # 5대 영역별 최종 점수 및 등급 산정
+    area_results: List[Dict[str, Any]] = []
+    total_score = 0.0
+
+    for area in areas:
+        aid = area["area_id"]
+        aname = area["name"]
+        amax = float(area["max_score"])
+
+        area_raw_score = 0.0
+        items_dict = area_item_scores.get(aid, {})
+
+        for iid, scores in items_dict.items():
+            meta = area_item_meta.get(iid, {})
+            sc_type = meta.get("scoring_type")
+            item_max_limit = meta.get("item_max_score")
+
+            if sc_type == 8:  # 8: 최상위인정형
+                best = max(scores) if scores else 0.0
+                if item_max_limit is not None:
+                    best = min(best, item_max_limit)
+                area_raw_score += best
+            else:  # 일반 누적 합산형
+                sum_item = sum(scores)
+                if item_max_limit is not None:
+                    sum_item = min(sum_item, item_max_limit)
+                area_raw_score += sum_item
+
+        merit_adjustment = area_merit_points.get(aname, 0.0)
+        adjusted_score = area_raw_score + merit_adjustment
+        final_score = max(0.0, min(adjusted_score, amax))
+        final_score = round(final_score, 1)
+
+        grade_str = calculate_area_grade(final_score, amax)
+        pending_cnt = area_pending_counts.get(aid, 0)
+        status_str = calculate_area_status(grade_str, pending_cnt)
+
+        area_results.append({
+            "area": aname,
+            "areaId": aid,
+            "score": final_score,
+            "maxScore": amax,
+            "grade": grade_str,
+            "status": status_str,
+        })
+        total_score += final_score
+
+    total_score = round(total_score, 1)
+    overall_cert_status = calculate_cert_status(area_results, has_any_pending)
+
+    response_data = {
+        "studentId": student_id,
+        "id": student_id,
+        "name": target_student["name"],
+        "grade": st_grade,
+        "classNo": st_class,
+        "number": st_number,
+        "studentNo": st_number,
+        "email": target_student.get("email"),
+        "year": target_year,
+        "areas": area_results,
+        "totalScore": total_score,
+        "certStatus": overall_cert_status,
+        "pointTotal": point_total,
+        "pendingCount": pending_count,
+        "submissions": formatted_submissions,
+        "student": {
+            "studentId": student_id,
+            "id": student_id,
+            "name": target_student["name"],
+            "grade": st_grade,
+            "classNo": st_class,
+            "number": st_number,
+            "studentNo": st_number,
+            "email": target_student.get("email"),
+        },
+    }
+
+    return SrFormat(
+        status_code=status.HTTP_200_OK,
+        success=True,
+        data=response_data,
         error=None,
     ).model_dump()
