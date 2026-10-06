@@ -53,8 +53,11 @@ class RejectSubmissionRequest(BaseModel):
 
 
 class ModifyScoreRequest(BaseModel):
+    score: Optional[float] = None
     granted_score: Optional[float] = None
     grantedScore: Optional[float] = None
+    reason: Optional[str] = None
+    comment: Optional[str] = None
     teacher_comment: Optional[str] = None
     teacherComment: Optional[str] = None
 
@@ -405,11 +408,16 @@ async def get_submission_download_ticket(
 ):
     """
     개별 증빙자료 파일에 대해 안전하게 소비할 수 있는 60초 일회용 티켓을 발급합니다.
-    (SECURITY_AND_AUDIT.md 1.2 & TODO.md 6.1 P1)
+    (SECURITY_AND_AUDIT.md 1.2 & TODO.md 6.1 P1 / SEC-01 권한 격리 적용)
     """
     from fastapi.responses import JSONResponse
     from core.security import create_download_ticket
+    from core.authorization import authorize_submission_access
     from sr_format import Error
+
+    auth_err = await authorize_submission_access(current_user, submission_id, conn, action="read")
+    if auth_err:
+        return auth_err
 
     user_role = current_user.get("role")
     user_uuid = current_user.get("uuid")
@@ -435,18 +443,6 @@ async def get_submission_download_ticket(
                 success=False,
                 data=None,
                 error=Error(code="FILE_NOT_FOUND", message="첨부된 증빙 파일이 없습니다."),
-            ).model_dump(),
-        )
-
-    # 학생인 경우 본인 증빙인지 검증 (IDOR 방어)
-    if user_role in ("student", "0", 0) and row["uuid"] != user_uuid:
-        return JSONResponse(
-            status_code=403,
-            content=SrFormat(
-                status_code=403,
-                success=False,
-                data=None,
-                error=Error(code="FORBIDDEN", message="본인의 증빙 파일에 대해서만 티켓을 발급받을 수 있습니다."),
             ).model_dump(),
         )
 
@@ -498,10 +494,16 @@ async def delete_submission(
 ):
     """
     증빙자료 안전 삭제(Soft-Delete) 및 첨부파일 디스크 정리 엔드포인트
+    - 학생 본인 전용 (교사 직접 삭제 불가 403 차단)
     """
     from fastapi.responses import JSONResponse
     from core.storage import cleanup_old_file_on_resubmit
+    from core.authorization import authorize_submission_access
     from sr_format import Error
+
+    auth_err = await authorize_submission_access(current_user, submission_id, conn, action="student_delete")
+    if auth_err:
+        return auth_err
 
     user_role = current_user.get("role")
     user_uuid = current_user.get("uuid")
@@ -527,17 +529,6 @@ async def delete_submission(
                 success=False,
                 data=None,
                 error=Error(code="NOT_FOUND", message="해당 증빙자료를 찾을 수 없습니다."),
-            ).model_dump(),
-        )
-
-    if user_role in ("student", "0", 0) and row["uuid"] != user_uuid:
-        return JSONResponse(
-            status_code=403,
-            content=SrFormat(
-                status_code=403,
-                success=False,
-                data=None,
-                error=Error(code="FORBIDDEN", message="본인이 제출한 증빙자료만 삭제할 수 있습니다."),
             ).model_dump(),
         )
 
@@ -672,6 +663,96 @@ async def get_submission_detail(
         success=True,
         data=row,
     ).model_dump()
+
+
+async def _calculate_student_totals(
+    student_id: int,
+    year_id: Optional[int],
+    target_year: int,
+    conn: Any,
+) -> Optional[Dict[str, Any]]:
+    """심사 액션(승인/반려/점수수정) 후 학생 인증 현황 총점 및 상태 자동 재계산 (SCORE-01 공통화)"""
+    try:
+        from core.calculator import calculate_student_certification, round_decimal
+        from datetime import date
+        async with conn.cursor(cursor=DictCursor) as cur:
+            await cur.execute(
+                """
+                SELECT sar.grade, sar.class AS class_no, sar.number
+                FROM student_academic_records sar
+                WHERE sar.student_id = %s AND sar.year_id = %s
+                LIMIT 1
+                """,
+                (student_id, year_id),
+            )
+            sar_row = await cur.fetchone()
+            st_grade = sar_row.get("grade", 1) if sar_row else 1
+
+            await cur.execute(
+                """
+                SELECT area_id, name, max_score
+                FROM certification_areas
+                WHERE year_id = %s AND grade = %s
+                ORDER BY area_id ASC
+                """,
+                (year_id, st_grade),
+            )
+            areas = await cur.fetchall()
+
+            await cur.execute(
+                """
+                SELECT 
+                    s.submission_id,
+                    s.item_id,
+                    s.status_code,
+                    s.granted_score,
+                    ei.area_id,
+                    ei.scoring_type,
+                    ei.max_score AS item_max_score
+                FROM submissions s
+                JOIN evaluation_items ei ON s.item_id = ei.item_id
+                JOIN certification_areas ca ON ei.area_id = ca.area_id AND ca.year_id = %s
+                WHERE s.student_id = %s AND s.is_deleted = FALSE
+                """,
+                (year_id, student_id),
+            )
+            all_submissions = await cur.fetchall()
+
+            merit_start = date(target_year, 3, 1)
+            merit_end = date(target_year + 1, 3, 1)
+            await cur.execute(
+                """
+                SELECT merits_point_id, type, points, related_area, occurred_at
+                FROM merits
+                WHERE student_id = %s
+                  AND is_reflected = TRUE
+                  AND is_deleted = FALSE
+                  AND occurred_at >= %s
+                  AND occurred_at < %s
+                """,
+                (student_id, merit_start, merit_end),
+            )
+            all_merits = await cur.fetchall()
+
+        if areas:
+            calc_res = calculate_student_certification(areas, all_submissions, all_merits)
+            total_merit_points = 0.0
+            for m in all_merits:
+                m_type = m.get("type")
+                pts = float(m.get("points") or 0.0)
+                signed_pts = -abs(pts) if m_type in ("-", "벌점") else abs(pts)
+                total_merit_points += signed_pts
+
+            return {
+                "totalScore": calc_res["totalScore"],
+                "certStatus": calc_res["certStatus"],
+                "pointTotal": round_decimal(total_merit_points, 1),
+                "areas": calc_res["areas"],
+                "pendingCount": calc_res["pendingCount"],
+            }
+    except Exception as e:
+        logger.warning(f"Failed to calculate student_totals for student {student_id}: {e}")
+    return None
 
 
 @router.patch(
@@ -811,92 +892,7 @@ async def approve_submission(
     student_id = row["student_id"]
     year_id = row.get("year_id")
     target_year = row.get("year", 2026)
-
-    student_totals = None
-    try:
-        from core.calculator import calculate_student_certification, round_decimal
-        from datetime import date
-        async with conn.cursor(cursor=DictCursor) as cur:
-            # 1. 학생 학년 조회
-            await cur.execute(
-                """
-                SELECT sar.grade, sar.class AS class_no, sar.number
-                FROM student_academic_records sar
-                WHERE sar.student_id = %s AND sar.year_id = %s
-                LIMIT 1
-                """,
-                (student_id, year_id),
-            )
-            sar_row = await cur.fetchone()
-            st_grade = sar_row.get("grade", 1) if sar_row else 1
-
-            # 2. 해당 학년도/학년 영역 조회
-            await cur.execute(
-                """
-                SELECT area_id, name, max_score
-                FROM certification_areas
-                WHERE year_id = %s AND grade = %s
-                ORDER BY area_id ASC
-                """,
-                (year_id, st_grade),
-            )
-            areas = await cur.fetchall()
-
-            # 3. 학생 증빙자료 조회
-            await cur.execute(
-                """
-                SELECT 
-                    s.submission_id,
-                    s.item_id,
-                    s.status_code,
-                    s.granted_score,
-                    ei.area_id,
-                    ei.scoring_type,
-                    ei.max_score AS item_max_score
-                FROM submissions s
-                JOIN evaluation_items ei ON s.item_id = ei.item_id
-                JOIN certification_areas ca ON ei.area_id = ca.area_id AND ca.year_id = %s
-                WHERE s.student_id = %s AND s.is_deleted = FALSE
-                """,
-                (year_id, student_id),
-            )
-            all_submissions = await cur.fetchall()
-
-            # 4. 학생 상벌점 조회 (학사년도 필터)
-            merit_start = date(target_year, 3, 1)
-            merit_end = date(target_year + 1, 3, 1)
-            await cur.execute(
-                """
-                SELECT merits_point_id, type, points, related_area, occurred_at
-                FROM merits
-                WHERE student_id = %s
-                  AND is_reflected = TRUE
-                  AND is_deleted = FALSE
-                  AND occurred_at >= %s
-                  AND occurred_at < %s
-                """,
-                (student_id, merit_start, merit_end),
-            )
-            all_merits = await cur.fetchall()
-
-        if areas:
-            calc_res = calculate_student_certification(areas, all_submissions, all_merits)
-            total_merit_points = 0.0
-            for m in all_merits:
-                m_type = m.get("type")
-                pts = float(m.get("points") or 0.0)
-                signed_pts = -abs(pts) if m_type in ("-", "벌점") else abs(pts)
-                total_merit_points += signed_pts
-
-            student_totals = {
-                "totalScore": calc_res["totalScore"],
-                "certStatus": calc_res["certStatus"],
-                "pointTotal": round_decimal(total_merit_points, 1),
-                "areas": calc_res["areas"],
-                "pendingCount": calc_res["pendingCount"],
-            }
-    except Exception as e:
-        logger.warning(f"Failed to calculate student_totals for student {student_id}: {e}")
+    student_totals = await _calculate_student_totals(student_id, year_id, target_year, conn)
 
     return SrFormat(
         status_code=200,
@@ -1074,88 +1070,7 @@ async def reject_submission(
     student_id = row["student_id"]
     year_id = row.get("year_id")
     target_year = row.get("year", 2026)
-
-    student_totals = None
-    try:
-        from core.calculator import calculate_student_certification, round_decimal
-        from datetime import date
-        async with conn.cursor(cursor=DictCursor) as cur:
-            await cur.execute(
-                """
-                SELECT sar.grade, sar.class AS class_no, sar.number
-                FROM student_academic_records sar
-                WHERE sar.student_id = %s AND sar.year_id = %s
-                LIMIT 1
-                """,
-                (student_id, year_id),
-            )
-            sar_row = await cur.fetchone()
-            st_grade = sar_row.get("grade", 1) if sar_row else 1
-
-            await cur.execute(
-                """
-                SELECT area_id, name, max_score
-                FROM certification_areas
-                WHERE year_id = %s AND grade = %s
-                ORDER BY area_id ASC
-                """,
-                (year_id, st_grade),
-            )
-            areas = await cur.fetchall()
-
-            await cur.execute(
-                """
-                SELECT 
-                    s.submission_id,
-                    s.item_id,
-                    s.status_code,
-                    s.granted_score,
-                    ei.area_id,
-                    ei.scoring_type,
-                    ei.max_score AS item_max_score
-                FROM submissions s
-                JOIN evaluation_items ei ON s.item_id = ei.item_id
-                JOIN certification_areas ca ON ei.area_id = ca.area_id AND ca.year_id = %s
-                WHERE s.student_id = %s AND s.is_deleted = FALSE
-                """,
-                (year_id, student_id),
-            )
-            all_submissions = await cur.fetchall()
-
-            merit_start = date(target_year, 3, 1)
-            merit_end = date(target_year + 1, 3, 1)
-            await cur.execute(
-                """
-                SELECT merits_point_id, type, points, related_area, occurred_at
-                FROM merits
-                WHERE student_id = %s
-                  AND is_reflected = TRUE
-                  AND is_deleted = FALSE
-                  AND occurred_at >= %s
-                  AND occurred_at < %s
-                """,
-                (student_id, merit_start, merit_end),
-            )
-            all_merits = await cur.fetchall()
-
-        if areas:
-            calc_res = calculate_student_certification(areas, all_submissions, all_merits)
-            total_merit_points = 0.0
-            for m in all_merits:
-                m_type = m.get("type")
-                pts = float(m.get("points") or 0.0)
-                signed_pts = -abs(pts) if m_type in ("-", "벌점") else abs(pts)
-                total_merit_points += signed_pts
-
-            student_totals = {
-                "totalScore": calc_res["totalScore"],
-                "certStatus": calc_res["certStatus"],
-                "pointTotal": round_decimal(total_merit_points, 1),
-                "areas": calc_res["areas"],
-                "pendingCount": calc_res["pendingCount"],
-            }
-    except Exception as e:
-        logger.warning(f"Failed to calculate student_totals for student {student_id}: {e}")
+    student_totals = await _calculate_student_totals(student_id, year_id, target_year, conn)
 
     status_str = "반려" if target_status == 4 else "재제출요청"
     return SrFormat(
@@ -1201,9 +1116,12 @@ async def modify_submission_score(
     async with conn.cursor(cursor=DictCursor) as cur:
         await cur.execute(
             """
-            SELECT s.submission_id, s.status_code, s.granted_score, ei.max_score
+            SELECT s.submission_id, s.student_id, s.status_code, s.granted_score, 
+                   ei.max_score, ca.year_id, ay.year
             FROM submissions s
             JOIN evaluation_items ei ON s.item_id = ei.item_id
+            JOIN certification_areas ca ON ei.area_id = ca.area_id
+            JOIN academic_years ay ON ca.year_id = ay.year_id
             WHERE s.submission_id = %s AND s.is_deleted = FALSE
             LIMIT 1
             """,
@@ -1233,7 +1151,12 @@ async def modify_submission_score(
             ).model_dump(),
         )
 
-    score = req.granted_score if req.granted_score is not None else req.grantedScore
+    # 1. 점수 입력값 확인
+    score = (
+        req.score
+        if req.score is not None
+        else (req.granted_score if req.granted_score is not None else req.grantedScore)
+    )
     if score is None:
         return JSONResponse(
             status_code=400,
@@ -1241,7 +1164,7 @@ async def modify_submission_score(
                 status_code=400,
                 success=False,
                 data=None,
-                error=Error(code="VALIDATION_ERROR", message="수정할 인정 점수(grantedScore)가 필요합니다."),
+                error=Error(code="VALIDATION_ERROR", message="수정할 인정 점수(score)가 필요합니다."),
             ).model_dump(),
         )
 
@@ -1257,7 +1180,34 @@ async def modify_submission_score(
             ).model_dump(),
         )
 
-    comment = req.teacher_comment if req.teacher_comment is not None else req.teacherComment
+    # 2. 수정 사유(reason) 필수 입력 검증 (Tech_spec.md 3.4 & TODO.md 3.6)
+    raw_reason = (
+        req.reason
+        if req.reason is not None
+        else (
+            req.comment
+            if req.comment is not None
+            else (
+                req.teacher_comment
+                if req.teacher_comment is not None
+                else req.teacherComment
+            )
+        )
+    )
+    if not raw_reason or not raw_reason.strip():
+        return JSONResponse(
+            status_code=400,
+            content=SrFormat(
+                status_code=400,
+                success=False,
+                data=None,
+                error=Error(code="VALIDATION_ERROR", message="점수 수정 사유(reason)는 필수 입력 항목입니다."),
+            ).model_dump(),
+        )
+
+    # 3. HTML XSS 방어 이스케이프
+    import html
+    comment = html.escape(raw_reason.strip())
 
     reviewer_id = None
     async with conn.cursor(cursor=DictCursor) as cur:
@@ -1273,7 +1223,7 @@ async def modify_submission_score(
                 """
                 UPDATE submissions
                 SET granted_score = %s,
-                    teacher_comment = COALESCE(%s, teacher_comment),
+                    teacher_comment = %s,
                     reviewer_id = COALESCE(%s, reviewer_id),
                     reviewed_at = NOW(),
                     updated_at = NOW()
@@ -1310,15 +1260,27 @@ async def modify_submission_score(
     finally:
         await conn.autocommit(True)
 
+    # 4. 수정 후 학생 인증 현황 총점 자동 재계산 (Tech_spec.md & TODO.md 3.6)
+    student_id = row["student_id"]
+    year_id = row.get("year_id")
+    target_year = row.get("year", 2026)
+    student_totals = await _calculate_student_totals(student_id, year_id, target_year, conn)
+
     return SrFormat(
         status_code=200,
         success=True,
         data={
             "id": submission_id,
+            "submissionId": submission_id,
             "status": "인정완료",
             "statusCode": 3,
+            "score": score,
             "grantedScore": score,
+            "reason": comment,
             "teacherComment": comment,
+            "reviewedAt": datetime.now().isoformat(),
+            "reviewerId": reviewer_id,
+            "studentTotals": student_totals,
         },
     ).model_dump()
 
