@@ -60,15 +60,19 @@ except (ImportError, ModuleNotFoundError):
 class CreatePointRequest(BaseModel):
     student_id: Optional[int] = None
     studentId: Optional[int] = None
-    type: str  # "MERIT" or "DEMERIT" or "+" or "-"
-    points: float
+    type: str  # "MERIT" or "DEMERIT" or "+" or "-" or "상점" or "벌점"
+    points: Optional[float] = None
+    score: Optional[float] = None
     reason: str
     occurred_at: Optional[str] = None
     occurredAt: Optional[str] = None
+    date: Optional[str] = None
     issued_date: Optional[str] = None
     issuedDate: Optional[str] = None
     related_area: Optional[str] = None
     relatedArea: Optional[str] = None
+    reflected_area: Optional[str] = None
+    reflectedArea: Optional[str] = None
 
 
 class UpdatePointRequest(BaseModel):
@@ -118,21 +122,46 @@ async def create_point(
     user_uuid = current_user.get("uuid") or current_user.get("sub")
 
     # 교사 식별자 확인
-    reviewer_id = 0
+    reviewer_id = None
     async with conn.cursor(cursor=DictCursor) as cur:
         await cur.execute("SELECT teachers_id FROM teachers WHERE uuid = %s AND is_deleted = FALSE LIMIT 1", (user_uuid,))
         t_row = await cur.fetchone()
         if t_row:
             reviewer_id = t_row["teachers_id"]
 
+    # 입력 점수 추출 (points 또는 score)
+    raw_points = req.points if req.points is not None else req.score
+    if raw_points is None:
+        return JSONResponse(
+            status_code=400,
+            content=SrFormat(
+                status_code=400,
+                success=False,
+                data=None,
+                error=Error(code="VALIDATION_ERROR", message="상벌점 점수(score/points)는 필수 입력 항목입니다."),
+            ).model_dump(),
+        )
+
+    # 점수 상하한선 방어 검증 (0 초과 100 이하)
+    if raw_points <= 0 or raw_points > 100:
+        return JSONResponse(
+            status_code=400,
+            content=SrFormat(
+                status_code=400,
+                success=False,
+                data=None,
+                error=Error(code="VALIDATION_ERROR", message="상벌점 점수는 0 초과 100 이하의 숫자여야 합니다."),
+            ).model_dump(),
+        )
+
     # 부호 및 구분 정규화 (SCORE-02)
     raw_type = req.type.strip().upper()
     if raw_type in ("MERIT", "+", "상점"):
         norm_type = "+"
-        norm_score = abs(req.points)
+        norm_score = abs(raw_points)
     elif raw_type in ("DEMERIT", "-", "벌점"):
         norm_type = "-"
-        norm_score = -abs(req.points)
+        norm_score = -abs(raw_points)
     else:
         return JSONResponse(
             status_code=400,
@@ -140,7 +169,7 @@ async def create_point(
                 status_code=400,
                 success=False,
                 data=None,
-                error=Error(code="VALIDATION_ERROR", message="상벌점 유형은 MERIT(+) 또는 DEMERIT(-)이어야 합니다."),
+                error=Error(code="VALIDATION_ERROR", message="상벌점 유형은 상점(MERIT/+) 또는 벌점(DEMERIT/-)이어야 합니다."),
             ).model_dump(),
         )
 
@@ -159,20 +188,8 @@ async def create_point(
     import html
     escaped_reason = html.escape(raw_reason)
 
-    # 점수 상하한선 방어 검증 (0 초과 100 이하)
-    if req.points <= 0 or req.points > 100:
-        return JSONResponse(
-            status_code=400,
-            content=SrFormat(
-                status_code=400,
-                success=False,
-                data=None,
-                error=Error(code="VALIDATION_ERROR", message="상벌점 점수는 0 초과 100 이하의 숫자여야 합니다."),
-            ).model_dump(),
-        )
-
-    occ_date = req.occurred_at or req.occurredAt or req.issued_date or req.issuedDate
-    rel_area = req.related_area or req.relatedArea
+    occ_date = req.occurred_at or req.occurredAt or req.date or req.issued_date or req.issuedDate
+    rel_area = req.related_area or req.relatedArea or req.reflected_area or req.reflectedArea
 
     try:
         await conn.autocommit(False)
@@ -206,6 +223,7 @@ async def create_point(
     finally:
         await conn.autocommit(True)
 
+    from datetime import datetime
     return JSONResponse(
         status_code=201,
         content=SrFormat(
@@ -213,12 +231,17 @@ async def create_point(
             success=True,
             data={
                 "id": point_id,
+                "pointId": point_id,
                 "studentId": target_student_id,
+                "teacherId": reviewer_id,
                 "type": norm_type,
                 "points": norm_score,
                 "score": norm_score,
                 "reason": escaped_reason,
                 "occurredAt": occ_date,
+                "date": occ_date,
+                "reflectedArea": rel_area,
+                "createdAt": datetime.now().isoformat(),
             },
         ).model_dump(),
     )
