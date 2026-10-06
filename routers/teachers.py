@@ -535,8 +535,10 @@ async def get_teacher_students(
     if name:
         clean_name = name.strip()
         if clean_name:
+            # SQL LIKE 와일드카드(%, _, \) 이스케이프 (Full Table Scan 및 패턴 주입 방어)
+            escaped_name = clean_name.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
             student_sql += " AND st.name LIKE %s"
-            student_params.append(f"%{clean_name}%")
+            student_params.append(f"%{escaped_name}%")
 
     if req_number is not None:
         student_sql += " AND (sar.number = %s OR st.student_id = %s)"
