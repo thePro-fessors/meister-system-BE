@@ -230,28 +230,68 @@
 
 ## 5. AI 기능 API (실제 모델 연동 시)
 
-현재는 프론트엔드 내 규칙 기반 로직(`src/lib/ai.ts`, `src/lib/chatbot.ts`)으로 동작합니다.
-실제 LLM으로 교체할 경우 아래와 같이 **서버를 경유하는 구조**가 필요합니다(API 키를 브라우저에 노출할 수 없기 때문).
+실제 LLM(Gemini / OpenAI 등) 모델 연동 시 **API 키 은닉 및 권한별 RAG 데이터 통제를 위해 백엔드 프록시 구조**로 동작합니다.
+사용자 역할(학생, 교사, 관리자)에 맞춰 세분화된 AI 어시스턴트 기능을 제공합니다.
 
-### 5.1 증빙자료 자동 분류
-- **기능**: 학생이 입력한 세부항목/설명을 분석해 인증 영역·평가 항목 추천
+---
+
+### 5.1 학생용 AI (Student AI)
+
+#### 5.1.1 증빙자료 자동 분류 및 항목 추천
+- **기능**: 학생이 입력한 세부 활동명(`detail`)과 설명(`description`)을 분석하여 최적의 인증 영역 및 평가 항목 추천
 - **호출 주체**: student
 - **Method / URL**: `POST /api/ai/classify-submission`
-- **요청**: `{ detail, description }`
-- **응답**: `{ suggestions: [{ area, itemName, confidence, reason }] }`
-- **보안/안정성**: 중. 추천값은 참고용이며 최종 저장 값은 학생이 확정 → 서버는 참고용 응답만 반환, 신뢰도 낮은 요청 남용 방지를 위한 rate limit 권장.
+- **요청**: `{ detail: string, description: string }`
+- **응답**: `{ suggestions: [{ area: string, itemId: number, itemName: string, confidence: number, reason: string }] }`
+- **보안/안정성**: 중. 학생 본인 확정 전용 참고 응답, 요청 남용 방지 IP/계정 Rate Limit 적용.
 
-### 5.2 학생 도우미 챗봇
-- **기능**: 학생 질문에 본인 데이터 기반 맞춤 답변
-- **호출 주체**: student (본인)
-- **Method / URL**: `POST /api/ai/chat`
-- **요청**: `{ message, conversationId? }` (studentId는 토큰에서 추출, 클라이언트가 임의 지정 불가)
-- **응답**: `{ reply, suggestions?[] }`
-- **보안/안정성**: **상**.
-  - 서버가 해당 학생의 점수/제출/상벌점 데이터를 조회해 프롬프트에 포함하므로, **본인 데이터만 조회되도록 서버에서 강제** (다른 학생 데이터 유출 방지 — 가장 중요).
-  - LLM 응답에 개인정보·타 학생 정보가 섞이지 않도록 프롬프트/응답 검증.
-  - 과도한 호출로 인한 API 비용 급증 방지를 위한 사용자별 rate limit 필요.
-  - 응답 지연 시 타임아웃 및 폴백 메시지(예: 규칙 기반 답변으로 대체) 권장.
+#### 5.1.2 학생 맞춤형 역량 달성 도우미 챗봇
+- **기능**: 학생 본인의 역량 달성 현황(5대 영역 점수, 미달성 항목, 상벌점 내역) 기반 1:1 상담 및 가이드
+- **호출 주체**: student (본인 한정)
+- **Method / URL**: `POST /api/ai/chat` (또는 `POST /api/ai/student/chat`)
+- **요청**: `{ message: string, conversationId?: string }`
+- **응답**: `{ conversationId: string, reply: string, suggestions?: string[] }`
+- **보안/안정성**: **상**. strict IDOR 격리(본인 데이터 외 타 학생 정보 주입 차단), `chat_conversations` 세션 영속화, 프롬프트 인젝션 방어.
+
+---
+
+### 5.2 교사용 AI (Teacher AI)
+
+#### 5.2.1 증빙자료 심사 보조 및 검토 의견(피드백) 자동 생성
+- **기능**: 학생이 제출한 증빙 내용/파일을 평가 항목 배점 기준(`criteria`)과 비교하여 적합성 사전 검토 및 교사용 피드백 초안 작성
+- **호출 주체**: teacher, admin
+- **Method / URL**: `POST /api/ai/teacher/review-draft`
+- **요청**: `{ submissionId: number }`
+- **응답**: `{ recommendedStatus: string, recommendedScore: number, draftComment: string, checkPoints: string[] }`
+- **보안/안정성**: **상**. 교사 최종 확인 전까지는 자동 승인되지 않으며, 교사 담당 학급 검증 필수.
+
+#### 5.2.2 학급별 역량 분석 및 학생 지도 도우미 챗봇
+- **기능**: 담당 학급 학생들의 역량 취약 영역 분석, 인증 지연 학생 맞춤형 지도 방안 제안
+- **호출 주체**: teacher
+- **Method / URL**: `POST /api/ai/teacher/chat`
+- **요청**: `{ message: string, conversationId?: string }`
+- **응답**: `{ conversationId: string, reply: string, targetStudents?: any[] }`
+- **보안/안정성**: **상**. 담임교사 담당 학급(학년/반) 범위만 프롬프트 주입 (타 학급 격리).
+
+---
+
+### 5.3 관리자용 AI (Admin AI)
+
+#### 5.3.1 전교생 인증 현황 통계 분석 및 총괄 리포트 자동 생성
+- **기능**: 전교생/학년별/학과별 인증 통계, 성취도 추이, 상벌점 분포를 종합 분석하여 학교 운영 보고서 초안 생성
+- **호출 주체**: admin
+- **Method / URL**: `POST /api/ai/admin/summary-report`
+- **요청**: `{ year?: number, grade?: number }`
+- **응답**: `{ summaryText: string, keyInsights: string[], recommendations: string[] }`
+- **보안/안정성**: 상. 관리자(admin) 단독 권한 검증.
+
+#### 5.3.2 부정 의심 제출 탐지 및 감사 리포트 (Anomaly Detection)
+- **기능**: 중복 의심 증빙자료, 비정상적 점수 급변동, 단기간 대량 상벌점 부여 패턴 자동 탐지
+- **호출 주체**: admin
+- **Method / URL**: `POST /api/ai/admin/audit-anomalies`
+- **요청**: `{ year?: number }`
+- **응답**: `{ flaggedItems: [{ type: string, targetId: number, riskLevel: string, reason: string }] }`
+- **보안/안정성**: 상. 관리자 전용 감사 기능.
 
 ---
 
