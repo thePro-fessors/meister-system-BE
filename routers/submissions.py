@@ -7,6 +7,7 @@ routers/submissions.py - 마이스터 역량인증제 증빙자료 제출 및 �
 """
 
 import os
+from datetime import date, datetime
 from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, Depends, File, Form, Query, UploadFile
@@ -43,6 +44,8 @@ class ApproveSubmissionRequest(BaseModel):
 
 
 class RejectSubmissionRequest(BaseModel):
+    comment: Optional[str] = None
+    reason: Optional[str] = None
     teacher_comment: Optional[str] = None
     teacherComment: Optional[str] = None
     status_code: Optional[int] = None
@@ -946,9 +949,47 @@ async def reject_submission(
             ).model_dump(),
         )
 
+    # 1. 반려 사유 필수 입력 검증 (Tech_spec.md 3.5 & TODO.md 3.5)
+    raw_comment = (
+        req.comment
+        if req.comment is not None
+        else (
+            req.reason
+            if req.reason is not None
+            else (
+                req.teacher_comment
+                if req.teacher_comment is not None
+                else req.teacherComment
+            )
+        )
+    )
+    if not raw_comment or not raw_comment.strip():
+        return JSONResponse(
+            status_code=400,
+            content=SrFormat(
+                status_code=400,
+                success=False,
+                data=None,
+                error=Error(code="VALIDATION_ERROR", message="반려 사유(comment)는 필수 입력 항목입니다."),
+            ).model_dump(),
+        )
+
+    # 2. XSS 방어 HTML 이스케이프
+    import html
+    comment = html.escape(raw_comment.strip())
+
     async with conn.cursor(cursor=DictCursor) as cur:
         await cur.execute(
-            "SELECT submission_id, status_code, granted_score FROM submissions WHERE submission_id = %s AND is_deleted = FALSE LIMIT 1",
+            """
+            SELECT s.submission_id, s.student_id, s.status_code, s.granted_score,
+                   ca.year_id, ay.year
+            FROM submissions s
+            JOIN evaluation_items ei ON s.item_id = ei.item_id
+            JOIN certification_areas ca ON ei.area_id = ca.area_id
+            JOIN academic_years ay ON ca.year_id = ay.year_id
+            WHERE s.submission_id = %s AND s.is_deleted = FALSE
+            LIMIT 1
+            """,
             (submission_id,),
         )
         row = await cur.fetchone()
@@ -974,8 +1015,6 @@ async def reject_submission(
                 error=Error(code="INVALID_STATUS", message="제출완료(1) 또는 검토중(2) 상태의 증빙만 반려할 수 있습니다."),
             ).model_dump(),
         )
-
-    comment = req.teacher_comment if req.teacher_comment is not None else req.teacherComment
 
     reviewer_id = None
     async with conn.cursor(cursor=DictCursor) as cur:
@@ -1031,15 +1070,107 @@ async def reject_submission(
     finally:
         await conn.autocommit(True)
 
+    # 3. 반려 후 학생 인증 현황 총점 자동 재계산 (Tech_spec.md & TODO.md 3.5)
+    student_id = row["student_id"]
+    year_id = row.get("year_id")
+    target_year = row.get("year", 2026)
+
+    student_totals = None
+    try:
+        from core.calculator import calculate_student_certification, round_decimal
+        from datetime import date
+        async with conn.cursor(cursor=DictCursor) as cur:
+            await cur.execute(
+                """
+                SELECT sar.grade, sar.class AS class_no, sar.number
+                FROM student_academic_records sar
+                WHERE sar.student_id = %s AND sar.year_id = %s
+                LIMIT 1
+                """,
+                (student_id, year_id),
+            )
+            sar_row = await cur.fetchone()
+            st_grade = sar_row.get("grade", 1) if sar_row else 1
+
+            await cur.execute(
+                """
+                SELECT area_id, name, max_score
+                FROM certification_areas
+                WHERE year_id = %s AND grade = %s
+                ORDER BY area_id ASC
+                """,
+                (year_id, st_grade),
+            )
+            areas = await cur.fetchall()
+
+            await cur.execute(
+                """
+                SELECT 
+                    s.submission_id,
+                    s.item_id,
+                    s.status_code,
+                    s.granted_score,
+                    ei.area_id,
+                    ei.scoring_type,
+                    ei.max_score AS item_max_score
+                FROM submissions s
+                JOIN evaluation_items ei ON s.item_id = ei.item_id
+                JOIN certification_areas ca ON ei.area_id = ca.area_id AND ca.year_id = %s
+                WHERE s.student_id = %s AND s.is_deleted = FALSE
+                """,
+                (year_id, student_id),
+            )
+            all_submissions = await cur.fetchall()
+
+            merit_start = date(target_year, 3, 1)
+            merit_end = date(target_year + 1, 3, 1)
+            await cur.execute(
+                """
+                SELECT merits_point_id, type, points, related_area, occurred_at
+                FROM merits
+                WHERE student_id = %s
+                  AND is_reflected = TRUE
+                  AND is_deleted = FALSE
+                  AND occurred_at >= %s
+                  AND occurred_at < %s
+                """,
+                (student_id, merit_start, merit_end),
+            )
+            all_merits = await cur.fetchall()
+
+        if areas:
+            calc_res = calculate_student_certification(areas, all_submissions, all_merits)
+            total_merit_points = 0.0
+            for m in all_merits:
+                m_type = m.get("type")
+                pts = float(m.get("points") or 0.0)
+                signed_pts = -abs(pts) if m_type in ("-", "벌점") else abs(pts)
+                total_merit_points += signed_pts
+
+            student_totals = {
+                "totalScore": calc_res["totalScore"],
+                "certStatus": calc_res["certStatus"],
+                "pointTotal": round_decimal(total_merit_points, 1),
+                "areas": calc_res["areas"],
+                "pendingCount": calc_res["pendingCount"],
+            }
+    except Exception as e:
+        logger.warning(f"Failed to calculate student_totals for student {student_id}: {e}")
+
     status_str = "반려" if target_status == 4 else "재제출요청"
     return SrFormat(
         status_code=200,
         success=True,
         data={
             "id": submission_id,
+            "submissionId": submission_id,
             "status": status_str,
             "statusCode": target_status,
+            "comment": comment,
             "teacherComment": comment,
+            "reviewedAt": datetime.now().isoformat(),
+            "reviewerId": reviewer_id,
+            "studentTotals": student_totals,
         },
     ).model_dump()
 
