@@ -144,6 +144,33 @@ async def create_point(
             ).model_dump(),
         )
 
+    # 사유(reason) 필수 검증 및 XSS 방어 (SECURITY_AND_AUDIT.md & TODO.md 3.7)
+    raw_reason = (req.reason or "").strip()
+    if not raw_reason:
+        return JSONResponse(
+            status_code=400,
+            content=SrFormat(
+                status_code=400,
+                success=False,
+                data=None,
+                error=Error(code="VALIDATION_ERROR", message="상벌점 부여 사유(reason)는 필수 입력 항목입니다."),
+            ).model_dump(),
+        )
+    import html
+    escaped_reason = html.escape(raw_reason)
+
+    # 점수 상하한선 방어 검증 (0 초과 100 이하)
+    if req.points <= 0 or req.points > 100:
+        return JSONResponse(
+            status_code=400,
+            content=SrFormat(
+                status_code=400,
+                success=False,
+                data=None,
+                error=Error(code="VALIDATION_ERROR", message="상벌점 점수는 0 초과 100 이하의 숫자여야 합니다."),
+            ).model_dump(),
+        )
+
     occ_date = req.occurred_at or req.occurredAt or req.issued_date or req.issuedDate
     rel_area = req.related_area or req.relatedArea
 
@@ -157,7 +184,7 @@ async def create_point(
                 )
                 VALUES (%s, %s, %s, %s, %s, %s, COALESCE(%s, CURDATE()), NOW(), TRUE, FALSE)
                 """,
-                (target_student_id, reviewer_id, norm_type, norm_score, req.reason, rel_area, occ_date),
+                (target_student_id, reviewer_id, norm_type, norm_score, escaped_reason, rel_area, occ_date),
             )
             await cur.execute("SELECT LAST_INSERT_ID() AS last_id")
             last_row = await cur.fetchone()
@@ -170,7 +197,7 @@ async def create_point(
                 )
                 VALUES (%s, %s, 'CREATE', NULL, %s, %s, NOW())
                 """,
-                (point_id, user_uuid, norm_score, req.reason),
+                (point_id, user_uuid, norm_score, escaped_reason),
             )
         await conn.commit()
     except Exception:
@@ -190,7 +217,7 @@ async def create_point(
                 "type": norm_type,
                 "points": norm_score,
                 "score": norm_score,
-                "reason": req.reason,
+                "reason": escaped_reason,
                 "occurredAt": occ_date,
             },
         ).model_dump(),
@@ -209,8 +236,9 @@ async def update_point(
     current_user: Dict[str, Any] = Depends(get_current_user),
 ):
     """
-    학생 상벌점 내역 수정 엔드포인트 (API-02)
+    학생 상벌점 내역 수정 엔드포인트 (API-02 / TODO.md 3.8)
     - 교사 및 관리자 전용
+    - 수정 사유 필수 입력 및 XSS 방어
     - 수정 이력(merits_log) 보존
     """
     async with conn.cursor(cursor=DictCursor) as cur:
@@ -255,6 +283,16 @@ async def update_point(
             new_type = "-"
 
     if req.points is not None:
+        if req.points <= 0 or req.points > 100:
+            return JSONResponse(
+                status_code=400,
+                content=SrFormat(
+                    status_code=400,
+                    success=False,
+                    data=None,
+                    error=Error(code="VALIDATION_ERROR", message="상벌점 점수는 0 초과 100 이하의 숫자여야 합니다."),
+                ).model_dump(),
+            )
         if new_type == "+":
             new_points = abs(req.points)
         else:
@@ -262,7 +300,23 @@ async def update_point(
     else:
         new_points = old_points
 
-    new_reason = req.reason if req.reason is not None else existing["reason"]
+    if req.reason is not None:
+        raw_reason = req.reason.strip()
+        if not raw_reason:
+            return JSONResponse(
+                status_code=400,
+                content=SrFormat(
+                    status_code=400,
+                    success=False,
+                    data=None,
+                    error=Error(code="VALIDATION_ERROR", message="수정 사유는 빈 문자열일 수 없습니다."),
+                ).model_dump(),
+            )
+        import html
+        new_reason = html.escape(raw_reason)
+    else:
+        new_reason = existing["reason"]
+
     new_occ = req.occurred_at or req.occurredAt or existing["occurred_at"]
     new_area = req.related_area or req.relatedArea or existing["related_area"]
 
@@ -308,4 +362,83 @@ async def update_point(
             "reason": new_reason,
             "occurredAt": str(new_occ) if new_occ else None,
         },
+    ).model_dump()
+
+
+@router.delete(
+    "/{point_id}",
+    summary="상벌점 삭제 API (API-02 / TODO.md 3.8)",
+    response_model=SrFormat,
+)
+async def delete_point(
+    point_id: int,
+    reason: Optional[str] = Query(None, description="삭제 사유 (선택)"),
+    conn: Any = Depends(get_db),
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """
+    학생 상벌점 내역 안전 삭제(Soft-Delete) 엔드포인트 (API-02 / TODO.md 3.8)
+    - 교사 및 관리자 전용
+    - merits 테이블 is_deleted = TRUE 갱신
+    - merits_log에 DELETE 감사 로그 원자적 기록
+    """
+    async with conn.cursor(cursor=DictCursor) as cur:
+        await cur.execute(
+            """
+            SELECT merits_point_id, student_id, teachers_id, type, points, reason, is_deleted
+            FROM merits
+            WHERE merits_point_id = %s AND is_deleted = FALSE
+            LIMIT 1
+            """,
+            (point_id,),
+        )
+        existing = await cur.fetchone()
+
+    if not existing:
+        return JSONResponse(
+            status_code=404,
+            content=SrFormat(
+                status_code=404,
+                success=False,
+                data=None,
+                error=Error(code="ITEM_NOT_FOUND", message="해당 상벌점 내역을 찾을 수 없습니다."),
+            ).model_dump(),
+        )
+
+    from core.authorization import authorize_student_access
+    auth_err = await authorize_student_access(current_user, existing["student_id"], conn, action="manage_points")
+    if auth_err:
+        return auth_err
+
+    user_uuid = current_user.get("uuid") or current_user.get("sub")
+    import html
+    del_reason = html.escape((reason or "상벌점 삭제").strip())
+
+    try:
+        await conn.autocommit(False)
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "UPDATE merits SET is_deleted = TRUE WHERE merits_point_id = %s",
+                (point_id,),
+            )
+            await cur.execute(
+                """
+                INSERT INTO merits_log (
+                    merits_point_id, modifier_uuid, action_type, old_points, new_points, modify_reason, created_at
+                )
+                VALUES (%s, %s, 'DELETE', %s, NULL, %s, NOW())
+                """,
+                (point_id, user_uuid, existing["points"], del_reason),
+            )
+        await conn.commit()
+    except Exception:
+        await conn.rollback()
+        raise
+    finally:
+        await conn.autocommit(True)
+
+    return SrFormat(
+        status_code=200,
+        success=True,
+        data={"id": point_id, "deleted": True},
     ).model_dump()
