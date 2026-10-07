@@ -2,6 +2,7 @@
 routers/admin.py - 학년도 관리, 평가 기준 관리, 관리자 통계 개요 API 라우터 (API-03)
 """
 
+import html
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, Depends, Query, status
@@ -14,6 +15,7 @@ try:
 except (ImportError, ModuleNotFoundError):
     DictCursor = Any  # type: ignore
 
+from core.academic import clear_year_cache
 from core.calculator import calculate_student_certification
 from core.security import get_current_user
 from database import get_db, get_redis
@@ -127,34 +129,62 @@ async def create_year(
     if admin_err:
         return admin_err
 
+    if req.year < 1900 or req.year > 2100:
+        return JSONResponse(
+            status_code=400,
+            content=SrFormat(
+                status_code=400,
+                success=False,
+                data=None,
+                error=Error(code="VALIDATION_ERROR", message="유효하지 않은 학년도입니다 (1900~2100)."),
+            ).model_dump(),
+        )
+
     is_act = req.is_activated if req.is_activated is not None else (req.isActivated or False)
 
-    async with conn.cursor(cursor=DictCursor) as cur:
-        await cur.execute("SELECT year_id FROM academic_years WHERE year = %s LIMIT 1", (req.year,))
-        if await cur.fetchone():
-            return JSONResponse(
-                status_code=409,
-                content=SrFormat(
+    try:
+        await conn.autocommit(False)
+        async with conn.cursor(cursor=DictCursor) as cur:
+            await cur.execute("SELECT year_id FROM academic_years WHERE year = %s LIMIT 1", (req.year,))
+            if await cur.fetchone():
+                return JSONResponse(
                     status_code=409,
-                    success=False,
-                    data=None,
-                    error=Error(code="DUPLICATE_YEAR", message=f"{req.year} 학년도가 이미 등록되어 있습니다."),
-                ).model_dump(),
+                    content=SrFormat(
+                        status_code=409,
+                        success=False,
+                        data=None,
+                        error=Error(code="DUPLICATE_YEAR", message=f"{req.year} 학년도가 이미 등록되어 있습니다."),
+                    ).model_dump(),
+                )
+
+            # 단일 활성 학년도 상호 배타성 강제 (SECURITY_AND_AUDIT.md 3.9)
+            if is_act:
+                await cur.execute("UPDATE academic_years SET is_activated = FALSE")
+
+            await cur.execute(
+                "INSERT INTO academic_years (year, is_activated) VALUES (%s, %s)",
+                (req.year, is_act),
             )
+            await cur.execute("SELECT LAST_INSERT_ID() AS last_id")
+            last_row = await cur.fetchone()
+            year_id = last_row[0] if isinstance(last_row, (list, tuple)) else last_row["last_id"]
 
-        await cur.execute(
-            "INSERT INTO academic_years (year, is_activated) VALUES (%s, %s)",
-            (req.year, is_act),
-        )
-        await cur.execute("SELECT LAST_INSERT_ID() AS last_id")
-        last_row = await cur.fetchone()
-        year_id = last_row[0] if isinstance(last_row, (list, tuple)) else last_row["last_id"]
+        await conn.commit()
+        clear_year_cache()
+    except Exception:
+        await conn.rollback()
+        raise
+    finally:
+        await conn.autocommit(True)
 
-    return SrFormat(
+    return JSONResponse(
         status_code=201,
-        success=True,
-        data={"yearId": year_id, "year": req.year, "isActivated": is_act},
-    ).model_dump()
+        content=SrFormat(
+            status_code=201,
+            success=True,
+            data={"yearId": year_id, "year": req.year, "isActivated": is_act},
+        ).model_dump(),
+    )
 
 
 @years_router.patch("/{year}", summary="학년도 활성화 상태 토글 (API-03)", response_model=SrFormat)
@@ -168,23 +198,50 @@ async def toggle_year_active(
     if admin_err:
         return admin_err
 
+    if year < 1900 or year > 2100:
+        return JSONResponse(
+            status_code=400,
+            content=SrFormat(
+                status_code=400,
+                success=False,
+                data=None,
+                error=Error(code="VALIDATION_ERROR", message="유효하지 않은 학년도입니다 (1900~2100)."),
+            ).model_dump(),
+        )
+
     is_act = req.is_activated if req.is_activated is not None else (req.isActivated if req.isActivated is not None else True)
 
-    async with conn.cursor(cursor=DictCursor) as cur:
-        await cur.execute(
-            "UPDATE academic_years SET is_activated = %s WHERE year = %s",
-            (is_act, year),
-        )
-        if cur.rowcount == 0:
-            return JSONResponse(
-                status_code=404,
-                content=SrFormat(
+    try:
+        await conn.autocommit(False)
+        async with conn.cursor(cursor=DictCursor) as cur:
+            await cur.execute("SELECT year_id FROM academic_years WHERE year = %s LIMIT 1", (year,))
+            if not await cur.fetchone():
+                return JSONResponse(
                     status_code=404,
-                    success=False,
-                    data=None,
-                    error=Error(code="ITEM_NOT_FOUND", message=f"{year} 학년도를 찾을 수 없습니다."),
-                ).model_dump(),
+                    content=SrFormat(
+                        status_code=404,
+                        success=False,
+                        data=None,
+                        error=Error(code="ITEM_NOT_FOUND", message=f"{year} 학년도를 찾을 수 없습니다."),
+                    ).model_dump(),
+                )
+
+            # 단일 활성 학년도 상호 배타성 강제 (SECURITY_AND_AUDIT.md 3.9)
+            if is_act:
+                await cur.execute("UPDATE academic_years SET is_activated = FALSE WHERE year != %s", (year,))
+
+            await cur.execute(
+                "UPDATE academic_years SET is_activated = %s WHERE year = %s",
+                (is_act, year),
             )
+
+        await conn.commit()
+        clear_year_cache()
+    except Exception:
+        await conn.rollback()
+        raise
+    finally:
+        await conn.autocommit(True)
 
     return SrFormat(
         status_code=200,
@@ -207,6 +264,17 @@ async def copy_year_criteria(
     admin_err = check_admin_access(current_user)
     if admin_err:
         return admin_err
+
+    if target_year == source_year:
+        return JSONResponse(
+            status_code=400,
+            content=SrFormat(
+                status_code=400,
+                success=False,
+                data=None,
+                error=Error(code="VALIDATION_ERROR", message="동일한 학년도로부터 기준을 복제할 수 없습니다."),
+            ).model_dump(),
+        )
 
     async with conn.cursor(cursor=DictCursor) as cur:
         await cur.execute("SELECT year_id FROM academic_years WHERE year = %s LIMIT 1", (source_year,))
@@ -239,6 +307,24 @@ async def copy_year_criteria(
     t_year_id = t_row["year_id"]
 
     async with conn.cursor(cursor=DictCursor) as cur:
+        # [무결성 3.10] 복제 대상 학년도에 이미 기준이 구성되어 있는 경우 중복 증식 방어 (409 CONFLICT)
+        await cur.execute(
+            "SELECT COUNT(*) AS cnt FROM certification_areas WHERE year_id = %s",
+            (t_year_id,),
+        )
+        t_cnt_row = await cur.fetchone()
+        t_cnt = (t_cnt_row.get("cnt") if t_cnt_row else 0) or 0
+        if t_cnt > 0:
+            return JSONResponse(
+                status_code=409,
+                content=SrFormat(
+                    status_code=409,
+                    success=False,
+                    data=None,
+                    error=Error(code="CONFLICT", message=f"{target_year} 학년도에 이미 평가 기준이 설정되어 있습니다."),
+                ).model_dump(),
+            )
+
         await cur.execute(
             """
             SELECT area_id, grade, name, max_score
@@ -283,7 +369,7 @@ async def copy_year_criteria(
                 t_area_id = t_area_row["area_id"]
                 copied_areas_count += 1
 
-                # 해당 영역의 항목 복제
+                # 해당 영역의 항목 복제 (벌크 배치 최적화: SECURITY_AND_AUDIT.md 2.9)
                 await cur.execute(
                     """
                     SELECT name, max_score, scoring_type, target_grade, requires_evidence
@@ -294,14 +380,8 @@ async def copy_year_criteria(
                 )
                 source_items = await cur.fetchall()
 
-                for s_item in source_items:
-                    await cur.execute(
-                        """
-                        INSERT INTO evaluation_items (
-                            area_id, name, max_score, scoring_type, target_grade, requires_evidence, is_active
-                        )
-                        VALUES (%s, %s, %s, %s, %s, %s, TRUE)
-                        """,
+                if source_items:
+                    items_params = [
                         (
                             t_area_id,
                             s_item["name"],
@@ -309,9 +389,21 @@ async def copy_year_criteria(
                             s_item["scoring_type"],
                             s_item["target_grade"],
                             s_item["requires_evidence"],
-                        ),
-                    )
-                    copied_items_count += 1
+                        )
+                        for s_item in source_items
+                    ]
+                    insert_sql = """
+                        INSERT INTO evaluation_items (
+                            area_id, name, max_score, scoring_type, target_grade, requires_evidence, is_active
+                        )
+                        VALUES (%s, %s, %s, %s, %s, %s, TRUE)
+                    """
+                    if hasattr(cur, "executemany"):
+                        await cur.executemany(insert_sql, items_params)
+                    else:
+                        for p in items_params:
+                            await cur.execute(insert_sql, p)
+                    copied_items_count += len(source_items)
 
         await conn.commit()
     except Exception:
@@ -466,6 +558,17 @@ async def patch_criteria_area(
         return admin_err
 
     new_score = req.max_score if req.max_score is not None else req.maxScore
+    if new_score is not None and (new_score <= 0 or new_score > 1000):
+        return JSONResponse(
+            status_code=400,
+            content=SrFormat(
+                status_code=400,
+                success=False,
+                data=None,
+                error=Error(code="VALIDATION_ERROR", message="영역 배점은 0보다 크고 1000 이하여야 합니다."),
+            ).model_dump(),
+        )
+
     async with conn.cursor(cursor=DictCursor) as cur:
         await cur.execute("SELECT area_id, name, max_score FROM certification_areas WHERE area_id = %s LIMIT 1", (area_id,))
         existing = await cur.fetchone()
@@ -480,7 +583,32 @@ async def patch_criteria_area(
                 ).model_dump(),
             )
 
-        updated_name = req.name if req.name is not None else existing["name"]
+        if req.name is not None:
+            raw_name = req.name.strip()
+            if not raw_name:
+                return JSONResponse(
+                    status_code=400,
+                    content=SrFormat(
+                        status_code=400,
+                        success=False,
+                        data=None,
+                        error=Error(code="VALIDATION_ERROR", message="영역 이름은 비어 있을 수 없습니다."),
+                    ).model_dump(),
+                )
+            updated_name = html.escape(raw_name)
+            if len(updated_name) > 30:
+                return JSONResponse(
+                    status_code=400,
+                    content=SrFormat(
+                        status_code=400,
+                        success=False,
+                        data=None,
+                        error=Error(code="VALIDATION_ERROR", message="영역 이름은 최대 30자까지 가능합니다."),
+                    ).model_dump(),
+                )
+        else:
+            updated_name = existing["name"]
+
         updated_score = new_score if new_score is not None else float(existing["max_score"])
 
         await cur.execute(
@@ -507,9 +635,64 @@ async def create_criteria_item(
         return admin_err
 
     max_score = req.max_score if req.max_score is not None else (req.maxScore if req.maxScore is not None else 10.0)
+    if max_score <= 0 or max_score > 1000:
+        return JSONResponse(
+            status_code=400,
+            content=SrFormat(
+                status_code=400,
+                success=False,
+                data=None,
+                error=Error(code="VALIDATION_ERROR", message="항목 배점은 0보다 크고 1000 이하여야 합니다."),
+            ).model_dump(),
+        )
+
     scoring_type = req.scoring_type if req.scoring_type is not None else (req.scoringType or 1)
-    target_grade = req.target_grade if req.target_grade is not None else (req.targetGrade or 1)
+    # [버그 3.11] targetGrade: 0 (전학년 공통) Falsy 연산 왜곡 방어
+    target_grade = req.target_grade if req.target_grade is not None else (req.targetGrade if req.targetGrade is not None else 0)
     requires_ev = req.requires_evidence if req.requires_evidence is not None else (req.requiresEvidence if req.requiresEvidence is not None else True)
+    raw_name = (req.name or "").strip()
+    if not raw_name:
+        return JSONResponse(
+            status_code=400,
+            content=SrFormat(
+                status_code=400,
+                success=False,
+                data=None,
+                error=Error(code="VALIDATION_ERROR", message="항목 이름은 필수입니다."),
+            ).model_dump(),
+        )
+    if len(raw_name) > 50:
+        return JSONResponse(
+            status_code=400,
+            content=SrFormat(
+                status_code=400,
+                success=False,
+                data=None,
+                error=Error(code="VALIDATION_ERROR", message="항목 이름은 최대 50자까지 가능합니다."),
+            ).model_dump(),
+        )
+    clean_name = html.escape(raw_name)
+    if len(clean_name) > 100:
+        return JSONResponse(
+            status_code=400,
+            content=SrFormat(
+                status_code=400,
+                success=False,
+                data=None,
+                error=Error(code="VALIDATION_ERROR", message="항목 이름이 허용 길이를 초과했습니다."),
+            ).model_dump(),
+        )
+
+    if target_grade not in (0, 1, 2, 3):
+        return JSONResponse(
+            status_code=400,
+            content=SrFormat(
+                status_code=400,
+                success=False,
+                data=None,
+                error=Error(code="VALIDATION_ERROR", message="대상 학년은 0(전학년), 1, 2, 3 중 하나여야 합니다."),
+            ).model_dump(),
+        )
 
     async with conn.cursor(cursor=DictCursor) as cur:
         await cur.execute("SELECT area_id FROM certification_areas WHERE area_id = %s LIMIT 1", (area_id,))
@@ -531,25 +714,28 @@ async def create_criteria_item(
             )
             VALUES (%s, %s, %s, %s, %s, %s, TRUE)
             """,
-            (area_id, req.name, max_score, scoring_type, target_grade, requires_ev),
+            (area_id, clean_name, max_score, scoring_type, target_grade, requires_ev),
         )
         await cur.execute("SELECT LAST_INSERT_ID() AS last_id")
         last_row = await cur.fetchone()
         item_id = last_row[0] if isinstance(last_row, (list, tuple)) else last_row["last_id"]
 
-    return SrFormat(
+    return JSONResponse(
         status_code=201,
-        success=True,
-        data={
-            "itemId": item_id,
-            "areaId": area_id,
-            "name": req.name,
-            "maxScore": max_score,
-            "scoringType": scoring_type,
-            "targetGrade": target_grade,
-            "requiresEvidence": requires_ev,
-        },
-    ).model_dump()
+        content=SrFormat(
+            status_code=201,
+            success=True,
+            data={
+                "itemId": item_id,
+                "areaId": area_id,
+                "name": clean_name,
+                "maxScore": max_score,
+                "scoringType": scoring_type,
+                "targetGrade": target_grade,
+                "requiresEvidence": requires_ev,
+            },
+        ).model_dump(),
+    )
 
 
 @criteria_router.patch("/items/{item_id}", summary="평가 항목 수정 (API-03)", response_model=SrFormat)
@@ -577,10 +763,66 @@ async def update_criteria_item(
                 ).model_dump(),
             )
 
-        new_name = req.name if req.name is not None else existing["name"]
         new_max_score = req.max_score if req.max_score is not None else (req.maxScore if req.maxScore is not None else float(existing["max_score"]))
+        if new_max_score <= 0 or new_max_score > 1000:
+            return JSONResponse(
+                status_code=400,
+                content=SrFormat(
+                    status_code=400,
+                    success=False,
+                    data=None,
+                    error=Error(code="VALIDATION_ERROR", message="항목 배점은 0보다 크고 1000 이하여야 합니다."),
+                ).model_dump(),
+            )
+
+        if req.name is not None:
+            raw_name = req.name.strip()
+            if not raw_name:
+                return JSONResponse(
+                    status_code=400,
+                    content=SrFormat(
+                        status_code=400,
+                        success=False,
+                        data=None,
+                        error=Error(code="VALIDATION_ERROR", message="항목 이름은 비어 있을 수 없습니다."),
+                    ).model_dump(),
+                )
+            if len(raw_name) > 50:
+                return JSONResponse(
+                    status_code=400,
+                    content=SrFormat(
+                        status_code=400,
+                        success=False,
+                        data=None,
+                        error=Error(code="VALIDATION_ERROR", message="항목 이름은 최대 50자까지 가능합니다."),
+                    ).model_dump(),
+                )
+            new_name = html.escape(raw_name)
+            if len(new_name) > 100:
+                return JSONResponse(
+                    status_code=400,
+                    content=SrFormat(
+                        status_code=400,
+                        success=False,
+                        data=None,
+                        error=Error(code="VALIDATION_ERROR", message="항목 이름이 허용 길이를 초과했습니다."),
+                    ).model_dump(),
+                )
+        else:
+            new_name = existing["name"]
+
         new_type = req.scoring_type if req.scoring_type is not None else (req.scoringType if req.scoringType is not None else existing["scoring_type"])
         new_grade = req.target_grade if req.target_grade is not None else (req.targetGrade if req.targetGrade is not None else existing["target_grade"])
+        if new_grade is not None and new_grade not in (0, 1, 2, 3):
+            return JSONResponse(
+                status_code=400,
+                content=SrFormat(
+                    status_code=400,
+                    success=False,
+                    data=None,
+                    error=Error(code="VALIDATION_ERROR", message="대상 학년은 0(전학년), 1, 2, 3 중 하나여야 합니다."),
+                ).model_dump(),
+            )
         new_req_ev = req.requires_evidence if req.requires_evidence is not None else (req.requiresEvidence if req.requiresEvidence is not None else existing["requires_evidence"])
         new_active = req.is_active if req.is_active is not None else (req.isActive if req.isActive is not None else existing["is_active"])
 
@@ -705,7 +947,7 @@ async def get_admin_overview(
         st_count_row = await cur.fetchone()
         total_students = st_count_row.get("total_students", 0) if st_count_row else 0
 
-        # 2. 제출 상태별 카운트
+        # 2. 제출 상태별 카운트 (소프트 삭제 학생 제출물 제외: SECURITY_AND_AUDIT.md 2.14)
         await cur.execute(
             """
             SELECT 
@@ -716,6 +958,7 @@ async def get_admin_overview(
                 COUNT(CASE WHEN s.status_code = 4 THEN 1 END) AS rejected_count,
                 COUNT(CASE WHEN s.status_code = 5 THEN 1 END) AS resubmit_count
             FROM submissions s
+            JOIN students st ON s.student_id = st.student_id AND st.is_deleted = FALSE
             JOIN evaluation_items ei ON s.item_id = ei.item_id
             JOIN certification_areas ca ON ei.area_id = ca.area_id AND ca.year_id = %s
             WHERE s.is_deleted = FALSE
@@ -724,13 +967,14 @@ async def get_admin_overview(
         )
         sub_stats = await cur.fetchone() or {}
 
-        # 3. 인증 영역별 제출 수 통계
+        # 3. 인증 영역별 제출 수 통계 (소프트 삭제 학생 제출물 제외)
         await cur.execute(
             """
-            SELECT ca.area_id AS areaId, ca.name AS areaName, COUNT(s.submission_id) AS submissionCount
+            SELECT ca.area_id AS areaId, ca.name AS areaName, COUNT(st.student_id) AS submissionCount
             FROM certification_areas ca
             LEFT JOIN evaluation_items ei ON ca.area_id = ei.area_id
             LEFT JOIN submissions s ON ei.item_id = s.item_id AND s.is_deleted = FALSE
+            LEFT JOIN students st ON s.student_id = st.student_id AND st.is_deleted = FALSE
             WHERE ca.year_id = %s
             GROUP BY ca.area_id, ca.name
             ORDER BY ca.area_id ASC
