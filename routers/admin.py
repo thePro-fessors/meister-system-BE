@@ -5,7 +5,7 @@ routers/admin.py - 학년도 관리, 평가 기준 관리, 관리자 통계 개�
 import html
 from datetime import datetime
 from typing import Any, Dict, List, Optional
-from fastapi import APIRouter, Depends, Query, status
+from fastapi import APIRouter, Depends, File, Form, Query, Request, UploadFile, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 import redis.asyncio as aioredis
@@ -17,6 +17,17 @@ except (ImportError, ModuleNotFoundError):
 
 from core.academic import clear_year_cache
 from core.calculator import calculate_student_certification
+from core.excel_parser import parse_student_batch_file, sanitize_text
+from core.neis import (
+    explain_neis_student_api_limitation,
+    get_classes_for_year,
+    get_school_info,
+    validate_class_against_neis,
+    NEIS_OFFICE_CODE,
+    NEIS_OFFICE_NAME,
+    NEIS_SCHOOL_CODE,
+    NEIS_SCHOOL_NAME,
+)
 from core.security import get_current_user
 from database import get_db, get_redis
 from sr_format import Error, SrFormat
@@ -91,6 +102,27 @@ class UpdateItemRequest(BaseModel):
     requiresEvidence: Optional[bool] = None
     is_active: Optional[bool] = None
     isActive: Optional[bool] = None
+
+
+class BatchStudentItem(BaseModel):
+    name: str
+    grade: Optional[int] = None
+    class_no: Optional[int] = None
+    classNo: Optional[int] = None
+    student_no: Optional[int] = None
+    studentNo: Optional[int] = None
+    student_number: Optional[str] = None
+    studentNumber: Optional[str] = None
+    email: Optional[str] = None
+
+
+class BatchStudentRequest(BaseModel):
+    year: Optional[int] = None
+    overwrite: Optional[bool] = False
+    validate_with_neis: Optional[bool] = None
+    validateWithNeis: Optional[bool] = True
+    default_email_domain: Optional[str] = "bssm.hs.kr"
+    students: List[BatchStudentItem] = []
 
 
 # ==============================================================================
@@ -998,5 +1030,408 @@ async def get_admin_overview(
                 "resubmitRequested": sub_stats.get("resubmit_count", 0) or 0,
             },
             "areaDistribution": area_distribution,
+        },
+    ).model_dump()
+
+
+# ==============================================================================
+# 4. 학생 명단 엑셀/CSV 일괄 등록 & NEIS 연동 API (4.6)
+# ==============================================================================
+
+@admin_router.get("/neis/info", summary="NEIS 연동 정책 및 학생 명단 API 미제공 법적 근거 안내 (4.6)", response_model=SrFormat)
+async def get_neis_integration_info(
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """
+    NEIS Open API 연동 정보 및 학생 명단 직접 조회 API 미제공에 대한 구체적 법적/기술적 근거를 반환합니다.
+    """
+    admin_err = check_admin_access(current_user)
+    if admin_err:
+        return admin_err
+
+    return SrFormat(
+        status_code=200,
+        success=True,
+        data=explain_neis_student_api_limitation(),
+    ).model_dump()
+
+
+@admin_router.get("/neis/school-info", summary="부산소프트웨어마이스터고 NEIS 학교 기본정보 조회 (4.6)", response_model=SrFormat)
+async def get_bssm_neis_school_info(
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """
+    NEIS Open API에서 부산소프트웨어마이스터고등학교 공식 학교 기본정보를 조회합니다.
+    """
+    admin_err = check_admin_access(current_user)
+    if admin_err:
+        return admin_err
+
+    info = await get_school_info()
+    if not info:
+        return JSONResponse(
+            status_code=502,
+            content=SrFormat(
+                status_code=502,
+                success=False,
+                data=None,
+                error=Error(code="NEIS_API_ERROR", message="NEIS Open API로부터 학교 정보를 조회할 수 없습니다."),
+            ).model_dump(),
+        )
+
+    return SrFormat(status_code=200, success=True, data=info).model_dump()
+
+
+@admin_router.get("/neis/classes", summary="부산소프트웨어마이스터고 NEIS 학년도별 개설 학급 목록 조회 (4.6)", response_model=SrFormat)
+async def get_bssm_neis_classes(
+    year: Optional[int] = Query(None, description="조회 학년도 (미지정 시 활성 학년도)"),
+    conn: Any = Depends(get_db),
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """
+    NEIS Open API에서 부산소프트웨어마이스터고등학교의 해당 학년도 인가 학급 목록을 동적 조회합니다.
+    """
+    admin_err = check_admin_access(current_user)
+    if admin_err:
+        return admin_err
+
+    target_year = year
+    if target_year is None:
+        async with conn.cursor(cursor=DictCursor) as cur:
+            await cur.execute("SELECT year FROM academic_years ORDER BY is_activated DESC, year DESC LIMIT 1")
+            row = await cur.fetchone()
+            target_year = row["year"] if row else 2026
+
+    classes = await get_classes_for_year(target_year)
+    return SrFormat(
+        status_code=200,
+        success=True,
+        data={
+            "schoolName": NEIS_SCHOOL_NAME,
+            "schoolCode": NEIS_SCHOOL_CODE,
+            "officeCode": NEIS_OFFICE_CODE,
+            "year": target_year,
+            "classCount": len(classes),
+            "classes": classes,
+        },
+    ).model_dump()
+
+
+@admin_router.post("/students/batch", summary="학생 명단 엑셀/CSV 일괄 등록 (4.6)", response_model=SrFormat)
+@admin_router.post("/students/batch/neis", summary="NEIS 표준 양식 학생 명단 일괄 등록 (4.6)", response_model=SrFormat)
+async def batch_register_students(
+    request: Request,
+    file: Optional[UploadFile] = File(None),
+    year: Optional[int] = Form(None),
+    overwrite: Optional[bool] = Form(False),
+    validate_with_neis: Optional[bool] = Form(None),
+    default_email_domain: Optional[str] = Form("bssm.hs.kr"),
+    conn: Any = Depends(get_db),
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """
+    학생 명단 엑셀(XLSX) 또는 CSV 파일 일괄 등록 엔드포인트 (TODO.md 4.6)
+    - 관리자 전용
+    - XLSX / CSV 파일 자동 감지 및 멀티 인코딩(UTF-8, CP949, EUC-KR) 파싱
+    - 수식 인젝션(Formula Injection) 방어 및 XSS 방어
+    - 부산소프트웨어마이스터고 NEIS 학급 정보 실시간 교차 검증 (validate_with_neis)
+    - 학생 계정(students) 및 학년도별 학적(student_academic_records) 단일 트랜잭션 원자적 등록
+    """
+    admin_err = check_admin_access(current_user)
+    if admin_err:
+        return admin_err
+
+    content_type = request.headers.get("content-type", "").lower()
+    query_params = request.query_params
+
+    # 1. 쿼리/폼/JSON 파라미터 우선순위 정규화
+    target_year = year if year is not None else (int(query_params.get("year")) if query_params.get("year") else None)
+    is_overwrite = bool(overwrite if overwrite is not None else query_params.get("overwrite", False))
+    should_validate_neis = validate_with_neis if validate_with_neis is not None else True
+    email_domain = default_email_domain or query_params.get("default_email_domain", "bssm.hs.kr")
+
+    valid_records: List[Dict[str, Any]] = []
+    parsing_errors: List[Dict[str, Any]] = []
+
+    # 2. 파일 업로드 또는 JSON 바디 분기 처리
+    if file is not None:
+        file_bytes = await file.read()
+        if len(file_bytes) > 10 * 1024 * 1024:
+            return JSONResponse(
+                status_code=400,
+                content=SrFormat(
+                    status_code=400,
+                    success=False,
+                    data=None,
+                    error=Error(code="FILE_TOO_LARGE", message="파일 크기는 최대 10MB까지 허용됩니다."),
+                ).model_dump(),
+            )
+        try:
+            valid_records, parsing_errors = parse_student_batch_file(
+                file_bytes=file_bytes,
+                filename=file.filename or "students.xlsx",
+                default_email_domain=email_domain,
+            )
+        except Exception as e:
+            return JSONResponse(
+                status_code=400,
+                content=SrFormat(
+                    status_code=400,
+                    success=False,
+                    data=None,
+                    error=Error(code="FILE_PARSE_ERROR", message=f"파일 파싱 실패: {str(e)}"),
+                ).model_dump(),
+            )
+    elif "application/json" in content_type:
+        try:
+            body = await request.json()
+            if "year" in body and target_year is None:
+                target_year = int(body["year"])
+            if "overwrite" in body:
+                is_overwrite = bool(body["overwrite"])
+            if "validateWithNeis" in body:
+                should_validate_neis = bool(body["validateWithNeis"])
+            elif "validate_with_neis" in body:
+                should_validate_neis = bool(body["validate_with_neis"])
+            if "default_email_domain" in body:
+                email_domain = body["default_email_domain"]
+
+            raw_students = body.get("students", [])
+            from core.excel_parser import parse_student_number_field, sanitize_text, EMAIL_REGEX
+
+            seen_students = set()
+            seen_emails = set()
+
+            for idx, item in enumerate(raw_students, start=1):
+                clean_name = sanitize_text(item.get("name"))
+                if not clean_name:
+                    parsing_errors.append({"row": idx, "name": "", "reason": "학생 성명이 누락되었습니다."})
+                    continue
+                if len(clean_name) > 20:
+                    parsing_errors.append({"row": idx, "name": clean_name, "reason": "학생 성명은 20자를 초과할 수 없습니다."})
+                    continue
+                name = html.escape(clean_name)
+
+                grade = item.get("grade")
+                class_no = item.get("class_no") if item.get("class_no") is not None else item.get("classNo")
+                student_no = item.get("student_no") if item.get("student_no") is not None else item.get("studentNo")
+
+                snum = item.get("student_number") or item.get("studentNumber")
+                if snum:
+                    g, c, n = parse_student_number_field(snum)
+                    if g and c and n:
+                        grade, class_no, student_no = g, c, n
+
+                if grade is None or not (1 <= grade <= 3):
+                    parsing_errors.append({"row": idx, "name": name, "reason": f"유효하지 않은 학년입니다 ({grade})."})
+                    continue
+                if class_no is None or not (1 <= class_no <= 20):
+                    parsing_errors.append({"row": idx, "name": name, "reason": f"유효하지 않은 반입니다 ({class_no})."})
+                    continue
+                if student_no is None or not (1 <= student_no <= 50):
+                    parsing_errors.append({"row": idx, "name": name, "reason": f"유효하지 않은 번호입니다 ({student_no})."})
+                    continue
+
+                email = (item.get("email") or "").strip().lower()
+                if email:
+                    if not EMAIL_REGEX.match(email):
+                        parsing_errors.append({"row": idx, "name": name, "reason": f"올바르지 않은 이메일 형식입니다: {email}"})
+                        continue
+                else:
+                    email = f"s{grade}{class_no:02d}{student_no:02d}@{email_domain}"
+
+                st_key = (grade, class_no, student_no)
+                if st_key in seen_students:
+                    parsing_errors.append({"row": idx, "name": name, "reason": f"중복된 학년/반/번호 ({grade}-{class_no}-{student_no})"})
+                    continue
+                seen_students.add(st_key)
+
+                if email in seen_emails:
+                    parsing_errors.append({"row": idx, "name": name, "reason": f"중복된 이메일 ({email})"})
+                    continue
+                seen_emails.add(email)
+
+                valid_records.append({
+                    "row_number": idx,
+                    "name": name,
+                    "grade": grade,
+                    "class_no": class_no,
+                    "student_no": student_no,
+                    "email": email,
+                })
+        except Exception as e:
+            return JSONResponse(
+                status_code=400,
+                content=SrFormat(
+                    status_code=400,
+                    success=False,
+                    data=None,
+                    error=Error(code="VALIDATION_ERROR", message=f"JSON 바디 파싱 실패: {str(e)}"),
+                ).model_dump(),
+            )
+    else:
+        return JSONResponse(
+            status_code=400,
+            content=SrFormat(
+                status_code=400,
+                success=False,
+                data=None,
+                error=Error(
+                    code="VALIDATION_ERROR",
+                    message="업로드할 엑셀/CSV 파일(file) 또는 학생 명단 JSON(students)이 필요합니다.",
+                ),
+            ).model_dump(),
+        )
+
+    # 3. 대상 학년도(year_id) 확인
+    async with conn.cursor(cursor=DictCursor) as cur:
+        if target_year is None:
+            await cur.execute("SELECT year_id, year FROM academic_years ORDER BY is_activated DESC, year DESC LIMIT 1")
+            y_row = await cur.fetchone()
+            if not y_row:
+                return JSONResponse(
+                    status_code=404,
+                    content=SrFormat(
+                        status_code=404,
+                        success=False,
+                        data=None,
+                        error=Error(code="ITEM_NOT_FOUND", message="등록된 학년도가 없습니다. 먼저 학년도를 등록해주세요."),
+                    ).model_dump(),
+                )
+            target_year_id = y_row["year_id"]
+            target_year = y_row["year"]
+        else:
+            await cur.execute("SELECT year_id FROM academic_years WHERE year = %s LIMIT 1", (target_year,))
+            y_row = await cur.fetchone()
+            if not y_row:
+                return JSONResponse(
+                    status_code=404,
+                    content=SrFormat(
+                        status_code=404,
+                        success=False,
+                        data=None,
+                        error=Error(code="ITEM_NOT_FOUND", message=f"{target_year} 학년도가 시스템에 존재하지 않습니다."),
+                    ).model_dump(),
+                )
+            target_year_id = y_row["year_id"]
+
+    # 4. NEIS 학급 실시간 교차 검증 (validate_with_neis = True인 경우)
+    neis_validated_classes: Dict[Tuple[int, int], bool] = {}
+    final_to_insert: List[Dict[str, Any]] = []
+
+    if should_validate_neis and valid_records:
+        distinct_classes = set((st["grade"], st["class_no"]) for st in valid_records)
+        for g, c in distinct_classes:
+            is_valid, err_msg = await validate_class_against_neis(target_year, g, c)
+            neis_validated_classes[(g, c)] = is_valid
+            if not is_valid:
+                for st in valid_records:
+                    if st["grade"] == g and st["class_no"] == c:
+                        parsing_errors.append({
+                            "row": st.get("row_number", 0),
+                            "name": st["name"],
+                            "reason": err_msg or f"NEIS 미인가 학급 ({g}학년 {c}반)",
+                        })
+
+        for st in valid_records:
+            if neis_validated_classes.get((st["grade"], st["class_no"]), True):
+                final_to_insert.append(st)
+    else:
+        final_to_insert = valid_records
+
+    # 5. DB 트랜잭션 원자적 일괄 등록
+    created_count = 0
+    updated_count = 0
+    skipped_count = 0
+
+    try:
+        await conn.autocommit(False)
+        async with conn.cursor(cursor=DictCursor) as cur:
+            for st in final_to_insert:
+                # 1) students 테이블 조회/생성
+                await cur.execute(
+                    "SELECT student_id, name, is_deleted FROM students WHERE email = %s LIMIT 1",
+                    (st["email"],),
+                )
+                ex_student = await cur.fetchone()
+
+                if ex_student:
+                    student_id = ex_student["student_id"]
+                    if is_overwrite and ex_student["name"] != st["name"]:
+                        await cur.execute(
+                            "UPDATE students SET name = %s, is_deleted = FALSE WHERE student_id = %s",
+                            (st["name"], student_id),
+                        )
+                else:
+                    await cur.execute(
+                        "INSERT INTO students (name, email, status, is_deleted) VALUES (%s, %s, 0, FALSE)",
+                        (st["name"], st["email"]),
+                    )
+                    await cur.execute("SELECT LAST_INSERT_ID() AS last_id")
+                    last_id_row = await cur.fetchone()
+                    student_id = last_id_row["last_id"] if isinstance(last_id_row, dict) else last_id_row[0]
+                    created_count += 1
+
+                # 2) student_academic_records 테이블 조회/생성/갱신
+                await cur.execute(
+                    """
+                    SELECT record_id, grade, class, number
+                    FROM student_academic_records
+                    WHERE student_id = %s AND year_id = %s
+                    LIMIT 1
+                    """,
+                    (student_id, target_year_id),
+                )
+                ex_record = await cur.fetchone()
+
+                if ex_record:
+                    if is_overwrite:
+                        await cur.execute(
+                            """
+                            UPDATE student_academic_records
+                            SET grade = %s, class = %s, number = %s
+                            WHERE record_id = %s
+                            """,
+                            (st["grade"], st["class_no"], st["student_no"], ex_record["record_id"]),
+                        )
+                        updated_count += 1
+                    else:
+                        skipped_count += 1
+                else:
+                    await cur.execute(
+                        """
+                        INSERT INTO student_academic_records (student_id, year_id, grade, class, number)
+                        VALUES (%s, %s, %s, %s, %s)
+                        """,
+                        (student_id, target_year_id, st["grade"], st["class_no"], st["student_no"]),
+                    )
+
+        await conn.commit()
+    except Exception:
+        await conn.rollback()
+        raise
+    finally:
+        await conn.autocommit(True)
+
+    return SrFormat(
+        status_code=200,
+        success=True,
+        data={
+            "year": target_year,
+            "yearId": target_year_id,
+            "totalProcessed": len(final_to_insert) + len(parsing_errors),
+            "successCount": len(final_to_insert),
+            "failedCount": len(parsing_errors),
+            "createdStudentsCount": created_count,
+            "updatedRecordsCount": updated_count,
+            "skippedRecordsCount": skipped_count,
+            "errors": parsing_errors,
+            "neisValidation": {
+                "performed": should_validate_neis,
+                "schoolName": NEIS_SCHOOL_NAME,
+                "officeName": NEIS_OFFICE_NAME,
+                "schoolCode": NEIS_SCHOOL_CODE,
+                "officeCode": NEIS_OFFICE_CODE,
+            },
         },
     ).model_dump()
