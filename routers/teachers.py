@@ -27,19 +27,13 @@ except (ImportError, ModuleNotFoundError):
     DictCursor = Any  # type: ignore
 
 from core.calculator import (
-    calculate_area_grade,
-    calculate_area_status,
     calculate_student_certification,
     round_decimal,
 )
+from core.academic import get_current_year, get_year_id_by_year
 from core.security import get_current_user
 from database import get_db
-from routers.auth import get_current_year
-from routers.students import (
-    SUBMISSION_STATUS_MAP,
-    calculate_cert_status,
-    get_year_id_by_year,
-)
+from routers.students import SUBMISSION_STATUS_MAP
 from sr_format import Error, SrFormat
 
 logger = logging.getLogger("meister.teachers")
@@ -981,12 +975,7 @@ async def get_teacher_student_detail(
         )
         all_merits = await cur.fetchall()
 
-    # 7. 점수 집계 및 등급 산정 연산 (In-Memory Processing)
-    area_item_scores: Dict[int, Dict[int, List[float]]] = {}
-    area_item_meta: Dict[int, Dict[str, Any]] = {}
-    area_pending_counts: Dict[int, int] = {}
-    pending_count = 0
-    has_any_pending = False
+    # 7. 응답용 제출 포맷 변환 (점수 산출은 calculate_student_certification에 위임)
     formatted_submissions: List[Dict[str, Any]] = []
 
     for sub in all_submissions:
@@ -994,24 +983,6 @@ async def get_teacher_student_detail(
         iid = sub["item_id"]
         st_code = sub["status_code"]
         g_score = float(sub["granted_score"]) if sub["granted_score"] is not None else None
-        sc_type = sub["scoring_type"]
-        item_max = float(sub["item_max_score"]) if sub["item_max_score"] is not None else None
-
-        area_item_meta[iid] = {
-            "scoring_type": sc_type,
-            "item_max_score": item_max,
-        }
-
-        if st_code in (1, 2):
-            has_any_pending = True
-            pending_count += 1
-            area_pending_counts[aid] = area_pending_counts.get(aid, 0) + 1
-        elif st_code == 3:
-            if aid not in area_item_scores:
-                area_item_scores[aid] = {}
-            if iid not in area_item_scores[aid]:
-                area_item_scores[aid][iid] = []
-            area_item_scores[aid][iid].append(g_score or 0.0)
 
         # 제출 포맷 변환
         st_text = SUBMISSION_STATUS_MAP.get(st_code, "제출완료")

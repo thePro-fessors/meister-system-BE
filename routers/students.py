@@ -26,8 +26,19 @@ from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Upload
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
+import html
+from core.academic import (
+    _YEAR_ID_CACHE,
+    clear_year_cache,
+    get_current_academic_year,
+    get_year_id_by_year,
+)
 from core.authorization import authorize_student_access
-from core.calculator import calculate_student_certification, calculate_area_grade, calculate_area_status
+from core.calculator import (
+    calculate_student_certification,
+    calculate_area_grade,
+    calculate_area_status,
+)
 from core.security import get_current_user, require_student
 from core.storage import delete_uploaded_file, save_upload_file
 from database import get_db, get_redis
@@ -40,119 +51,16 @@ router = APIRouter(
     tags=["students"],
 )
 
-# ==============================================================================
-# 0. 인메모리 캐시 (In-Memory Cache)
-# ==============================================================================
-# 학사년도(year, 예: 2026) -> DB 고유 식별자(year_id) 매핑 캐시
-# 매 요청마다 academic_years 테이블에 불필요한 반복 쿼리가 발생하는 병목을 제거합니다.
-_YEAR_ID_CACHE: dict[int, int] = {}
 
-
-# ==============================================================================
-# 1. 헬퍼 유틸리티 (Domain Logic & Calculation Rule Helpers)
-# ==============================================================================
-
-async def get_current_academic_year(target_date: Optional[datetime] = None) -> int:
-    """
-    3월 1일 학사력 기준 현재 학년도 계산 함수
-    
-    규칙:
-    - 초·중·고 학사 일정상 1월과 2월은 직전 학년도의 학기(겨울방학/학기말)에 속합니다.
-    - 예: 2026년 1월/2월 -> 2025 학년도
-    - 예: 2026년 3월~12월 -> 2026 학년도
-    """
-    now = target_date or datetime.now()
-    if now.month < 3:
-        return now.year - 1
-    return now.year
-
-
-async def get_year_id_by_year(conn: asyncmy.Connection, year: int) -> Optional[int]:
-    """
-    학년도 정수(예: 2026)를 기반으로 academic_years 테이블의 year_id를 조회합니다.
-    
-    성능 최적화:
-    - 프로세스 인메모리 딕셔너리(_YEAR_ID_CACHE)를 먼저 확인하고,
-      캐시 미스 시에만 DB 쿼리를 수행한 뒤 캐시에 적재합니다.
-    """
-    global _YEAR_ID_CACHE
-    if year in _YEAR_ID_CACHE:
-        return _YEAR_ID_CACHE[year]
-
-    async with conn.cursor(cursor=DictCursor) as cur:
-        await cur.execute(
-            "SELECT year_id FROM academic_years WHERE year = %s LIMIT 1",
-            (year,)
-        )
-        row = await cur.fetchone()
-        if row:
-            _YEAR_ID_CACHE[year] = row["year_id"]
-            return row["year_id"]
-    return None
-
-
-def calculate_area_grade(score: float, max_score: float) -> str:
-    """
-    FE 요구사항 7장 기준 영역별 성취 등급(Grade) 산정 로직
-    
-    등급 판정 기준:
-    - S: 영역 최대 배점의 90% 이상 (score >= max_score * 0.9)
-    - A: 영역 최대 배점의 80% 이상 90% 미만 (score >= max_score * 0.8)
-    - B: 영역 최대 배점의 70% 이상 80% 미만 (score >= max_score * 0.7)
-    - 미달성: 영역 최대 배점의 70% 미만 또는 최대 배점이 0 이하인 경우
-    """
-    if max_score <= 0:
-        return "미달성"
-
-    ratio = (score / max_score) * 100.0
-    if ratio >= 90.0:
-        return "S"
-    elif ratio >= 80.0:
-        return "A"
-    elif ratio >= 70.0:
-        return "B"
-    else:
-        return "미달성"
-
-
-def calculate_area_status(grade: str, pending_count: int) -> str:
-    """
-    영역별 현재 진행/심사 상태 문자열 판정
-    
-    상태 기준:
-    - 등급이 'S' 또는 'A'인 경우: 이미 목표를 달성하였으므로 "달성"
-    - 등급이 'B' 또는 '미달성'이지만, 아직 교사 심사 대기 중인 증빙이 있는 경우: "검토중"
-    - 검토 중인 건도 없고 기준 점수에 미달한 경우: 추가 활동이 필요하므로 "보완 필요"
-    """
-    if grade in ("S", "A"):
-        return "달성"
-    if pending_count > 0:
-        return "검토중"
-    return "보완 필요"
-
-
+# 하위 호환성을 위한 별칭 제공 (기존 참조 호환)
 def calculate_cert_status(area_results: List[Dict[str, Any]], has_pending: bool) -> str:
-    """
-    마이스터 역량인증제 종합 최종 인증 판정 (FE 7장 명세)
-    
-    판정 우선순위:
-    1. '인증 가능': 평가 대상인 5개 모든 영역이 각각 'S' 또는 'A' 등급을 충족한 경우
-    2. '검토중': 한 영역이라도 B/미달성이지만 교사 심사 대기(제출완료/검토중) 중인 증빙자료가 존재하는 경우
-    3. '보완 필요': 미달 영역이 존재하며 더 이상 대기 중인 증빙자료가 없는 경우 (학생의 추가 제출 필요)
-    """
+    """마이스터 역량인증제 종합 최종 인증 판정 (FE 7장 명세)"""
     if not area_results:
         return "미달성"
-
-    # 모든 영역이 S 또는 A인지 전수 검사
-    all_passed = all(area["grade"] in ("S", "A") for area in area_results)
-    if all_passed:
+    if all(area.get("grade") in ("S", "A") for area in area_results):
         return "인증 가능"
-
-    # 미달성 영역이 있으나 교사 검토 대기 건이 남아있는 경우
     if has_pending:
         return "검토중"
-
-    # 추가 증빙 제출이 필요한 상태
     return "보완 필요"
 
 
@@ -566,8 +474,8 @@ async def handle_submit_evidence(
                 ).model_dump(),
             )
 
-        clean_detail = (detail_val or "").strip()
-        if not clean_detail:
+        raw_detail = (detail_val or "").strip()
+        if not raw_detail:
             return JSONResponse(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 content=SrFormat(
@@ -580,6 +488,7 @@ async def handle_submit_evidence(
                     ),
                 ).model_dump(),
             )
+        clean_detail = html.escape(raw_detail)
         if len(clean_detail) > 200:
             return JSONResponse(
                 status_code=status.HTTP_400_BAD_REQUEST,
@@ -594,8 +503,8 @@ async def handle_submit_evidence(
                 ).model_dump(),
             )
 
-        clean_description = (description_val or "").strip()
-        if not clean_description:
+        raw_description = (description_val or "").strip()
+        if not raw_description:
             return JSONResponse(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 content=SrFormat(
@@ -608,6 +517,7 @@ async def handle_submit_evidence(
                     ),
                 ).model_dump(),
             )
+        clean_description = html.escape(raw_description)
 
         if not activity_date_val:
             return JSONResponse(
