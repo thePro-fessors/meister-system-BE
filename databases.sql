@@ -16,7 +16,7 @@ CREATE TABLE certification_areas
   area_id   INT         NOT NULL AUTO_INCREMENT COMMENT '인증 영역 고유 ID',
   year_id   INT         NOT NULL COMMENT '대상 학년도 ID',
   grade     TINYINT     NOT NULL DEFAULT 1 COMMENT '대상 학년 (1, 2, 3)',
-  name      VARCHAR(30) NOT NULL COMMENT '인증 영역',
+  name      VARCHAR(60) NOT NULL COMMENT '인증 영역',
   max_score INT         NOT NULL,
   PRIMARY KEY (area_id)
 ) COMMENT '인증 영역 관리 테이블';
@@ -45,7 +45,7 @@ CREATE TABLE evaluation_items
 (
   item_id           INT          NOT NULL AUTO_INCREMENT COMMENT '고유 ID',
   area_id           INT          NOT NULL COMMENT '인증 영역 고유 ID',
-  name              VARCHAR(50)  NULL     COMMENT '평가 항목 이름',
+  name              VARCHAR(100) NULL     COMMENT '평가 항목 이름',
   target_grade      TINYINT      NULL     DEFAULT 0 COMMENT '대상 학년',
   max_score         DECIMAL(5,2) NULL     COMMENT '최대 제한 점수',
   scoring_type      TINYINT      NOT NULL COMMENT '점수 산정 방식',
@@ -58,9 +58,9 @@ CREATE TABLE merits
 (
   merits_point_id INT          NOT NULL AUTO_INCREMENT COMMENT '사안 ID',
   student_id      INT          NOT NULL COMMENT '학생 고유 ID',
-  teachers_id     INT          NOT NULL COMMENT '교사 고유 ID',
+  teachers_id     INT          NULL     COMMENT '교사 고유 ID (관리자 부여 시 NULL 허용)',
   type            VARCHAR(1)   NULL     DEFAULT '-' COMMENT '상/벌점 구분',
-  points          DECIMAL(3,1) NULL     DEFAULT 1 COMMENT '상벌점 점수',
+  points          DECIMAL(5,2) NULL     DEFAULT 1 COMMENT '상벌점 점수',
   reason          TEXT         NOT NULL COMMENT '부여 사유',
   related_area    VARCHAR(20)  NULL     COMMENT '반영 영역',
   occurred_at     DATE         NULL     COMMENT '발생일',
@@ -76,8 +76,8 @@ CREATE TABLE merits_log
   merits_point_id INT          NOT NULL COMMENT '수정할 사안 ID',
   modifier_uuid   VARCHAR(36)  NOT NULL COMMENT '변경자의 UUID',
   action_type     VARCHAR(20)  NOT NULL COMMENT '수정 / 삭제 구분자',
-  old_points      DECIMAL(3,1) NULL     COMMENT '변경 전 점수',
-  new_points      DECIMAL(3,1) NULL     COMMENT '변경 후 점수',
+  old_points      DECIMAL(5,2) NULL     COMMENT '변경 전 점수',
+  new_points      DECIMAL(5,2) NULL     COMMENT '변경 후 점수',
   modify_reason   TEXT         NULL     COMMENT '수정 사유',
   created_at      DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '변경 시각',
   PRIMARY KEY (log_id)
@@ -108,7 +108,7 @@ CREATE TABLE students
   uuid       VARCHAR(36)  NULL     COMMENT '유저 고유 ID',
   student_id INT          NOT NULL AUTO_INCREMENT COMMENT '학생 고유 ID',
   name       VARCHAR(20)  NOT NULL COMMENT '학생 이름',
-  email      VARCHAR(100) NOT NULL COMMENT '학생 이메일',
+  email      VARCHAR(255) NOT NULL COMMENT '학생 이메일',
   status     TINYINT      NULL     DEFAULT 0 COMMENT '상태',
   is_deleted BOOL         NULL     DEFAULT FALSE COMMENT 'Soft Delete',
   PRIMARY KEY (student_id)
@@ -172,7 +172,7 @@ CREATE TABLE teachers
   subject     VARCHAR(20)  NULL     COMMENT '담당교과',
   grade       TINYINT      NULL     COMMENT '담당 학년',
   class       TINYINT      NULL     COMMENT '담당 반',
-  email       VARCHAR(100) NOT NULL COMMENT '교사 이메일',
+  email       VARCHAR(255) NOT NULL COMMENT '교사 이메일',
   is_deleted  BOOL         NULL     DEFAULT FALSE COMMENT 'Soft Delete',
   PRIMARY KEY (teachers_id)
 ) COMMENT '교사 정보 관리 테이블';
@@ -304,6 +304,7 @@ CREATE INDEX IX_submissions_status_date
 
 ALTER TABLE student_academic_records ADD CONSTRAINT UQ_student_year UNIQUE (student_id, year_id);
 ALTER TABLE certification_areas ADD CONSTRAINT UQ_year_grade_area_name UNIQUE (year_id, grade, name);
+ALTER TABLE evaluation_items ADD CONSTRAINT UQ_area_item_name UNIQUE (area_id, name);
 
 -- ============================================================================
 -- 성능 최적화 복합 인덱스 (SECURITY_AND_AUDIT.md 2.3 권고)

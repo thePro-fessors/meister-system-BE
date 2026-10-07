@@ -1,15 +1,15 @@
 # 🗄️ 마이스터 시스템 DB 스키마 변경 내역서 (Schema Changelog)
 
-> **문서 버전**: v1.2  
-> **기준 일자**: 2026-10-02  
+> **문서 버전**: v1.3  
+> **기준 일자**: 2026-10-06  
 > **대상 파일**: [databases.sql](databases.sql)  
-> **변경 목적**: 프론트엔드 연동 요구사항(`BACKEND_REQUIREMENTS.md`) 충족, 데이터 무결성/추적성 강화 및 성능 인덱스 최적화
+> **변경 목적**: 관리자 상벌점 부여 시 NULL 제약 완화, DECIMAL(5,2) 100점 확장, 이메일 컬럼 일치 확장, 기준 복제 중복 방지 제약
 
 ---
 
 ## 📌 변경 요약표
 
-| 테이블명 | 구분 | 컬럼 / 제약조건명 | 타입 / 속성 | 변경 사유 및 FE 요구사항 대응 |
+| 테이블명 | 구분 | 컬럼 / 제약조건명 | 타입 / 속성 | 변경 사유 및 요구사항 대응 |
 | :--- | :---: | :--- | :--- | :--- |
 | `certification_areas` | **컬럼 추가** | `grade` | `TINYINT NOT NULL DEFAULT 1` | 학년별(1, 2, 3학년) 영역 최대 배점 차등 설정 지원 |
 | `certification_areas` | **제약 변경** | `UQ_year_grade_area_name` | `UNIQUE (year_id, grade, name)` | 동일 학년도 내 학년별 영역명 고유성 보장 (기존 `UQ_year_area_name` 대체) |
@@ -17,6 +17,14 @@
 | `submissions` | **컬럼 추가** | `original_filename` | `VARCHAR(255) NULL` | 사용자가 업로드한 원본 파일명 보존 및 다운로드 시 표시 지원 |
 | `submissions` | **컬럼 추가** | `reviewed_at` | `DATETIME NULL` | 교사의 승인/반려 심사 완료 시각 명확한 기록 (`created_at`과 분리) |
 | `submissions` | **컬럼 추가** | `updated_at` | `DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP` | 증빙자료 재제출, 상태 변경, 삭제 시점의 최종 수정일시 추적 지원 |
+| `merits` | **제약 완화** | `teachers_id` | `INT NULL` | 관리자(Admin) 상벌점 직접 부여 시 NULL 허용 (MySQL Error 1048 방어) |
+| `merits` | **타입 확장** | `points` | `DECIMAL(5,2) NULL DEFAULT 1.0` | 100점 상벌점 부여 허용 (MySQL Error 1264 Data out of range 방어) |
+| `merits_log` | **타입 확장** | `old_points`, `new_points` | `DECIMAL(5,2) NULL` | 100점 상벌점 변경 이력 보존 |
+| `students` | **타입 확장** | `email` | `VARCHAR(255) NOT NULL` | users 테이블(320자)과의 길이 불일치로 인한 회원가입/수정 오류 방지 |
+| `teachers` | **타입 확장** | `email` | `VARCHAR(255) NOT NULL` | users 테이블(320자)과의 길이 불일치로 인한 회원가입/수정 오류 방지 |
+| `evaluation_items` | **제약 추가** | `UQ_area_item_name` | `UNIQUE (area_id, name)` | 동일 영역 내 평가 항목명 중복 및 기준 복제 시 중복 증식 원천 방지 |
+| `certification_areas` | **타입 확장** | `name` | `VARCHAR(60) NOT NULL` | XSS 이스케이프 문자열 확장 보존을 위한 영역명 컬럼 확장 |
+| `evaluation_items` | **타입 확장** | `name` | `VARCHAR(100) NULL` | XSS 이스케이프 문자열 확장 보존을 위한 항목명 컬럼 확장 |
 
 ---
 
@@ -112,4 +120,26 @@ CREATE INDEX idx_merits_history
 
 CREATE INDEX idx_submissions_teacher_filter
   ON submissions (is_deleted, status_code, created_at DESC, submission_id DESC);
+
+-- 4. [v1.3 신규] 관리자 상벌점 부여 허용 및 DECIMAL(5,2) 100점 확장, 이메일 확장, 항목 유니크 제약
+ALTER TABLE merits
+  MODIFY COLUMN teachers_id INT NULL COMMENT '교사 고유 ID (관리자 부여 시 NULL 허용)',
+  MODIFY COLUMN points DECIMAL(5,2) NULL DEFAULT 1.00 COMMENT '상벌점 점수';
+
+ALTER TABLE merits_log
+  MODIFY COLUMN old_points DECIMAL(5,2) NULL COMMENT '변경 전 점수',
+  MODIFY COLUMN new_points DECIMAL(5,2) NULL COMMENT '변경 후 점수';
+
+ALTER TABLE students
+  MODIFY COLUMN email VARCHAR(255) NOT NULL COMMENT '학생 이메일';
+
+ALTER TABLE teachers
+  MODIFY COLUMN email VARCHAR(255) NOT NULL COMMENT '교사 이메일';
+
+ALTER TABLE evaluation_items
+  ADD CONSTRAINT UQ_area_item_name UNIQUE (area_id, name),
+  MODIFY COLUMN name VARCHAR(100) NULL COMMENT '평가 항목 이름 (XSS 이스케이프 보존)';
+
+ALTER TABLE certification_areas
+  MODIFY COLUMN name VARCHAR(60) NOT NULL COMMENT '인증 영역 (XSS 이스케이프 보존)';
 ```
