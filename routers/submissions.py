@@ -6,6 +6,7 @@ routers/submissions.py - 마이스터 역량인증제 증빙자료 제출 및 �
 - TODO.md 2.2 (증빙자료 신규 제출 API: POST /api/submissions)
 """
 
+import html
 import os
 from datetime import date, datetime
 from typing import Any, Dict, Optional
@@ -18,6 +19,7 @@ try:
 except (ImportError, ModuleNotFoundError):
     DictCursor = Any  # type: ignore
 
+from core.logger import logger
 from core.security import get_current_user
 from database import get_db, get_redis
 from routers.students import handle_submit_evidence, handle_get_submissions
@@ -300,7 +302,8 @@ async def resubmit_evidence(
                         ).model_dump(),
                     )
 
-        new_desc = (description or "").strip() or existing["description"]
+        raw_desc = (description or "").strip()
+        new_desc = html.escape(raw_desc) if raw_desc else existing["description"]
         target_link = (link_url or link or "").strip() or existing["link_url"]
         old_file_path = existing["file_path"]
 
@@ -545,21 +548,29 @@ async def delete_submission(
 
     file_to_clean = row.get("file_path")
 
-    async with conn.cursor() as cur:
-        await cur.execute(
-            "UPDATE submissions SET is_deleted = TRUE, updated_at = NOW() WHERE submission_id = %s",
-            (submission_id,),
-        )
-        await cur.execute(
-            """
-            INSERT INTO submissions_logs (
-                submission_id, modifier_uuid, action_type,
-                old_status_code, new_status_code, old_score, new_score, comment, created_at
+    try:
+        await conn.autocommit(False)
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "UPDATE submissions SET is_deleted = TRUE, updated_at = NOW() WHERE submission_id = %s",
+                (submission_id,),
             )
-            VALUES (%s, %s, '삭제', %s, %s, %s, NULL, '사용자 요청에 의한 증빙자료 삭제', NOW())
-            """,
-            (submission_id, user_uuid, row["status_code"], row["status_code"], row.get("granted_score")),
-        )
+            await cur.execute(
+                """
+                INSERT INTO submissions_logs (
+                    submission_id, modifier_uuid, action_type,
+                    old_status_code, new_status_code, old_score, new_score, comment, created_at
+                )
+                VALUES (%s, %s, '삭제', %s, %s, %s, NULL, '사용자 요청에 의한 증빙자료 삭제', NOW())
+                """,
+                (submission_id, user_uuid, row["status_code"], row["status_code"], row.get("granted_score")),
+            )
+        await conn.commit()
+    except Exception:
+        await conn.rollback()
+        raise
+    finally:
+        await conn.autocommit(True)
 
     # 증빙 삭제 시 디스크 고아 파일 즉시 정리 (SECURITY_AND_AUDIT.md 4.1 권고)
     if file_to_clean:
