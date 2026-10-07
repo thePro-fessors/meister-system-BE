@@ -337,3 +337,5 @@ class TestAuthAPI(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(res.headers.get("X-XSS-Protection"), "1; mode=block")
         self.assertEqual(res.headers.get("Referrer-Policy"), "strict-origin-when-cross-origin")
         self.assertEqual(res.headers.get("Cache-Control"), "no-store")
+        self.assertEqual(res.headers.get("Strict-Transport-Security"), "max-age=31536000; includeSubDomains")
+        self.assertEqual(res.headers.get("Content-Security-Policy"), "default-src 'self'; frame-ancestors 'none'; object-src 'none';")

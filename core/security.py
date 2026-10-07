@@ -457,14 +457,34 @@ class RoleChecker:
     
     허용된 역할 목록(allowed_roles)을 받아 현재 사용자의 role과 대조하며,
     권한이 없을 경우 403 FORBIDDEN 표준 에러를 발생시킵니다.
+    문자열 역할("student", "teacher", "admin")과 정수형 역할(0, 1, 2)을 모두 정상 정규화하여 호환합니다.
     """
 
-    def __init__(self, allowed_roles: Sequence[str | UserRole]):
-        self.allowed_roles = {str(r) for r in allowed_roles}
+    ROLE_NORMALIZATION: Dict[Any, str] = {
+        0: "student",
+        "0": "student",
+        "student": "student",
+        1: "teacher",
+        "1": "teacher",
+        "teacher": "teacher",
+        2: "admin",
+        "2": "admin",
+        "admin": "admin",
+    }
+
+    def __init__(self, allowed_roles: Sequence[str | int | UserRole]):
+        self.allowed_roles = set()
+        for r in allowed_roles:
+            norm = self.ROLE_NORMALIZATION.get(r, str(r))
+            self.allowed_roles.add(norm)
+            self.allowed_roles.add(str(r))
+            if isinstance(r, int):
+                self.allowed_roles.add(r)
 
     def __call__(self, current_user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
         user_role = current_user.get("role")
-        if user_role not in self.allowed_roles:
+        norm_user_role = self.ROLE_NORMALIZATION.get(user_role, str(user_role))
+        if norm_user_role not in self.allowed_roles and user_role not in self.allowed_roles and str(user_role) not in self.allowed_roles:
             raise HTTPException(
                 status_code=403,
                 detail=SrFormat(
@@ -480,7 +500,7 @@ class RoleChecker:
         return current_user
 
 
-def require_roles(*roles: str | UserRole) -> Callable[..., Dict[str, Any]]:
+def require_roles(*roles: str | int | UserRole) -> Callable[..., Dict[str, Any]]:
     """
     지정된 역할 목록 중 하나 이상을 가진 사용자만 접근을 허용하는 의존성 팩토리 함수
 

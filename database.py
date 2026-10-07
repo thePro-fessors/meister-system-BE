@@ -26,17 +26,17 @@ logger = logging.getLogger("meister.database")
 
 dotenv.load_dotenv()
 
-# DB 커넥션 풀 크기 환경 변수화 (SECURITY_AND_AUDIT.md 2.3 & TODO.md 6.2 P2)
-DB_POOL_MIN = int(os.getenv("DATABASE_POOL_MIN", "5"))
-DB_POOL_MAX = int(os.getenv("DATABASE_POOL_MAX", "30"))
-REDIS_POOL_MAX = int(os.getenv("REDIS_POOL_MAX", "30"))
+# DB 커넥션 풀 크기 환경 변수화 (SECURITY_AND_AUDIT.md 2.3 & 2.15)
+DB_POOL_MIN = int(os.getenv("DATABASE_POOL_MIN") or 5)
+DB_POOL_MAX = int(os.getenv("DATABASE_POOL_MAX") or 30)
+REDIS_POOL_MAX = int(os.getenv("REDIS_POOL_MAX") or 30)
 
 DB_CONFIG = {
-    "host": os.getenv("DATABASE_HOST", "localhost"),
-    "port": int(os.getenv("DATABASE_PORT", "3306")),
-    "user": os.getenv("DATABASE_USER", "root"),
+    "host": os.getenv("DATABASE_HOST") or "localhost",
+    "port": int(os.getenv("DATABASE_PORT") or 3306),
+    "user": os.getenv("DATABASE_USER") or "root",
     "password": os.getenv("DATABASE_PASSWORD"),
-    "database": os.getenv("DATABASE_NAME", "swMeister"),
+    "database": os.getenv("DATABASE_NAME") or "swMeister",
     "autocommit": True,
 }
 

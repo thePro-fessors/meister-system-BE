@@ -7,6 +7,16 @@ from dotenv import load_dotenv
 
 from core.logger import log_otp, logger
 import html as html_module
+import re
+
+EMAIL_REGEX = re.compile(r"^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+(?:\.[a-zA-Z0-9-]+)+$")
+
+
+def validate_email_format(email: str) -> bool:
+    """RFC 5322 호환 이메일 형식 검증 (SECURITY_AND_AUDIT.md 1.20)"""
+    if not email or len(email) > 320 or len(email) < 5:
+        return False
+    return bool(EMAIL_REGEX.match(email))
 
 load_dotenv()
 
@@ -212,6 +222,9 @@ async def send_otp_email(to_email: str, otp_code: str, user_name: str = "사용�
     추후 docker_mailserver 도입을 통한 자체 발신 시스템을 구현할 수 있습니다.
     따라서, MVP 배포시 docker_mailserver를 서버에 올려 실제로 테스트를 진행할 예정입니다.
     """
+    if not validate_email_format(to_email):
+        raise ValueError(f"유효하지 않은 이메일 형식입니다: {to_email}")
+
     subject = f"[{SMTP_FROM_NAME}] 본인인증 번호 안내 ({otp_code})"
     html_content = _create_otp_html(otp_code, user_name)
 

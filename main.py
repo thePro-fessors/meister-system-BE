@@ -98,7 +98,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 🔒 보안 응답 헤더 미들웨어 (SECURITY_AND_AUDIT.md 1.7)
+# 🔒 보안 응답 헤더 미들웨어 (SECURITY_AND_AUDIT.md 1.7 & 1.19)
 @app.middleware("http")
 async def add_security_headers(request: Request, call_next):
     response = await call_next(request)
@@ -108,6 +108,8 @@ async def add_security_headers(request: Request, call_next):
     response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
     response.headers["Cache-Control"] = "no-store"
     response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
+    response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+    response.headers["Content-Security-Policy"] = "default-src 'self'; frame-ancestors 'none'; object-src 'none';"
     return response
 
 # 라우터 등록: /auth 및 /api/auth 동시 지원 (FE 호환성 보장)

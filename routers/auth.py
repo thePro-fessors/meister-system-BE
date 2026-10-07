@@ -29,7 +29,13 @@ from fastapi.responses import JSONResponse
 import bcrypt
 import redis.asyncio as aioredis
 
-from core.email import send_otp_email
+from core.academic import (
+    _YEAR_ID_CACHE,
+    clear_year_cache,
+    get_current_year,
+    get_year_id,
+)
+from core.email import send_otp_email, validate_email_format
 from core.logger import logger
 from database import get_db, get_redis
 from sr_format import *
@@ -47,10 +53,6 @@ router = APIRouter(
     prefix="/auth",
     tags=["auth", "database"],
 )
-
-# 학년도 ID 인메모리 캐시 (year -> year_id)
-# 로그인 및 내 정보 조회 시 academic_years 테이블 반복 서브쿼리 병목 제거
-_YEAR_ID_CACHE: dict[int, int] = {}
 
 
 # ==============================================================================
@@ -80,29 +82,6 @@ def verify_password_sync(plain_password: str, hashed_password: str) -> bool:
 async def verify_password(plain_password: str, hashed_password: str) -> bool:
     """CPU-bound bcrypt 검증 작업을 별도 스레드풀로 오프로딩하여 이벤트 루프 블로킹을 방지합니다."""
     return await asyncio.to_thread(verify_password_sync, plain_password, hashed_password)
-
-
-async def get_current_year(date: datetime | None = None) -> int:
-    """3월 1일 학사력 기준 현재 학년도 계산 (1~2월은 직전 연도에 귀속)"""
-    target = date or datetime.now()
-    if target.month < 3:
-        return target.year - 1
-    return target.year
-
-
-async def get_year_id(conn: asyncmy.Connection, year: int) -> Optional[int]:
-    """학사년도(year)에 대응하는 year_id를 캐싱하여 불필요한 반복 서브쿼리를 방지합니다. (DATA-04: 하드코딩 1 폴백 제거)"""
-    global _YEAR_ID_CACHE
-    if year in _YEAR_ID_CACHE:
-        return _YEAR_ID_CACHE[year]
-
-    async with conn.cursor(cursor=DictCursor) as cur:
-        await cur.execute("SELECT year_id FROM academic_years WHERE year = %s LIMIT 1", (year,))
-        row = await cur.fetchone()
-        if row:
-            _YEAR_ID_CACHE[year] = row["year_id"]
-            return row["year_id"]
-    return None
 
 
 # ==============================================================================
@@ -495,7 +474,8 @@ async def send_otp(
     5. BackgroundTasks로 비동기 메일 발송하여 API 응답 지연을 0.05초 이하로 유지
     6. [보안] IP별 1시간당 10회 OTP 발송 제한 (Distributed Email Bombing 방어, 프록시 호환)
     """
-    if not req.email:
+    clean_mail = (req.email or "").strip().lower()
+    if not clean_mail or not validate_email_format(clean_mail):
         return JSONResponse(
             status_code=400,
             content=SrFormat(
@@ -504,12 +484,11 @@ async def send_otp(
                 data=None,
                 error=Error(
                     code="VALIDATION_ERROR",
-                    message="요청이 올바르지 않습니다."
+                    message="올바른 이메일 형식이 아닙니다."
                 )
             ).model_dump()
         )
 
-    clean_mail = req.email.strip().lower()
     client_ip = get_client_ip(request)
 
     # ── [보안 1.2] IP별 1시간당 10회 OTP 발송 제한 (Distributed Email Bombing 방어) ──
@@ -585,7 +564,7 @@ async def send_otp(
                 WHERE email = %s AND is_deleted = FALSE
                 LIMIT 1
                 """
-                await cur.execute(sql_cmd, (req.email,))
+                await cur.execute(sql_cmd, (clean_mail,))
                 datas = await cur.fetchone()
         else:
             current_yr = await get_current_year()
@@ -600,7 +579,7 @@ async def send_otp(
                     AND sa.grade = %s AND sa.class = %s AND sa.number = %s
                 LIMIT 1
                 """
-                await cur.execute(sql_cmd, (req.email, year_id, req.student_grade, req.student_class, req.student_number))
+                await cur.execute(sql_cmd, (clean_mail, year_id, req.student_grade, req.student_class, req.student_number))
                 datas = await cur.fetchone()
 
         if not datas:
@@ -663,7 +642,8 @@ async def verify_otp(req: VerifyOtpRequest, redis: aioredis.Redis = Depends(get_
     2. 불일치 시 남은 시도 횟수 및 남은 유효시간 정량 반환
     3. 일치 시 기존 OTP 즉시 파기 후, TRNG 32바이트 Opaque Token(`registerToken`)을 발급하여 10분간 보관
     """
-    if not req.email or not req.verify_code:
+    clean_mail = (req.email or "").strip().lower()
+    if not clean_mail or not req.verify_code or not validate_email_format(clean_mail):
         return JSONResponse(
             status_code=400,
             content=SrFormat(
@@ -677,7 +657,6 @@ async def verify_otp(req: VerifyOtpRequest, redis: aioredis.Redis = Depends(get_
             ).model_dump()
         )
 
-    clean_mail = req.email.strip().lower()
     clean_code = req.verify_code.strip()
 
     if req.purpose == "change_email":
@@ -809,7 +788,8 @@ async def register_user(
     4. 아이디 중복 검사 (409 DUPLICATE_ID)
     5. 트랜잭션 원자성(ACID) 보장: users 레코드 생성과 students/teachers uuid 업데이트 실패 시 완전 롤백
     """
-    if not req.email or not req.password or not req.id or not req.register_token:
+    clean_mail = (req.email or "").strip().lower()
+    if not clean_mail or not req.password or not req.id or not req.register_token or not validate_email_format(clean_mail):
         return JSONResponse(
             status_code=400,
             content=SrFormat(
@@ -818,7 +798,7 @@ async def register_user(
                 data=None,
                 error=Error(
                     code="VALIDATION_ERROR",
-                    message="필수 인자가 누락되었습니다."
+                    message="올바른 이메일 형식이 아니거나 필수 인자가 누락되었습니다."
                 )
             ).model_dump()
         )
@@ -838,7 +818,6 @@ async def register_user(
             ).model_dump()
         )
 
-    clean_mail = req.email.strip().lower()
     stored_token = await redis.getdel(f"register_token:{clean_mail}")
     if stored_token is None or stored_token != req.register_token:
         return JSONResponse(
@@ -1018,7 +997,8 @@ async def patch_email(
     uuid = current_user["uuid"]
 
     token_val = req.email_change_token or req.emailChangeToken or req.register_token or req.registerToken
-    if not req.email or not req.password or not token_val:
+    clean_mail = (req.email or "").strip().lower()
+    if not clean_mail or not req.password or not token_val or not validate_email_format(clean_mail):
         return JSONResponse(
             status_code=400,
             content=SrFormat(
@@ -1027,12 +1007,10 @@ async def patch_email(
                 data=None,
                 error=Error(
                     code="VALIDATION_ERROR",
-                    message="필수 인자가 누락되었습니다."
+                    message="올바른 이메일 형식이 아니거나 필수 인자가 누락되었습니다."
                 )
             ).model_dump()
         )
-
-    clean_mail = req.email.strip().lower()
 
     # 1. 새 이메일 인증 토큰 원자적 검증 및 소비 (AUTH-01, AUTH-02)
     stored_token = await redis.getdel(f"email_change_token:{clean_mail}")
