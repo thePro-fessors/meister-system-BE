@@ -1780,3 +1780,346 @@ async def batch_register_teachers(
         },
     ).model_dump()
 
+
+# ------------------------------------------------------------------------------
+# 4.8 시스템 종합 감사 로그 조회 API (GET /api/admin/audit-logs)
+# ------------------------------------------------------------------------------
+
+AUDIT_SUBMISSION_STATUS_MAP = {
+    1: "제출완료",
+    2: "검토중",
+    3: "인정완료",
+    4: "반려",
+    5: "재제출요청",
+}
+
+
+@admin_router.get("/audit-logs", summary="시스템 종합 감사 로그 조회 (4.8)", response_model=SrFormat)
+async def get_system_audit_logs(
+    log_type: Optional[str] = Query("ALL", description="로그 유형 필터 ('ALL', 'SUBMISSION', 'MERIT')"),
+    action_type: Optional[str] = Query(None, description="행위 구분 필터 ('CREATE', 'UPDATE', 'DELETE', 'APPROVE', 'REJECT', 등)"),
+    student_id: Optional[int] = Query(None, description="학생 고유 ID 필터"),
+    student_name: Optional[str] = Query(None, description="학생 성명 부분 일치 검색"),
+    modifier_name: Optional[str] = Query(None, description="수정/처리자 성명 부분 일치 검색"),
+    start_date: Optional[str] = Query(None, description="조회 시작 일시 (YYYY-MM-DD 또는 ISO8601)"),
+    end_date: Optional[str] = Query(None, description="조회 종료 일시 (YYYY-MM-DD 또는 ISO8601)"),
+    page: int = Query(1, ge=1, description="페이지 번호 (1부터 시작)"),
+    limit: int = Query(20, ge=1, le=100, description="페이지 당 항목 수 (최대 100)"),
+    conn: Any = Depends(get_db),
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """
+    시스템 종합 감사 로그 조회 엔드포인트 (TODO.md 4.8 & Tech_spec.md 4.8)
+    - 관리자 전용 (check_admin_access)
+    - submissions_logs(증빙 심사 이력) 및 merits_log(상벌점 변경 이력) 통합/필터링 조회
+    - 동적 SQL 파라미터 바인딩으로 SQL Injection 방어
+    - 최신 발생 순(created_at DESC, log_id DESC) 정렬 및 페이지네이션
+    """
+    admin_err = check_admin_access(current_user)
+    if admin_err:
+        return admin_err
+
+    # 1. log_type 정규화
+    normalized_log_type = (log_type or "ALL").strip().upper()
+    if normalized_log_type not in ("ALL", "SUBMISSION", "MERIT"):
+        return JSONResponse(
+            status_code=400,
+            content=SrFormat(
+                status_code=400,
+                success=False,
+                data=None,
+                error=Error(code="INVALID_LOG_TYPE", message="log_type은 'ALL', 'SUBMISSION', 'MERIT' 중 하나여야 합니다."),
+            ).model_dump(),
+        )
+
+    # 2. 날짜 파라미터 유효성 검사 및 정규화
+    norm_start_date = None
+    if start_date:
+        s_date = start_date.strip()
+        if len(s_date) == 10:
+            norm_start_date = f"{s_date} 00:00:00"
+        else:
+            norm_start_date = s_date.replace("T", " ")
+
+    norm_end_date = None
+    if end_date:
+        e_date = end_date.strip()
+        if len(e_date) == 10:
+            norm_end_date = f"{e_date} 23:59:59"
+        else:
+            norm_end_date = e_date.replace("T", " ")
+
+    # 3. submissions_logs 서브쿼리 구성
+    sub_conditions = []
+    sub_params: List[Any] = []
+
+    if action_type:
+        sub_conditions.append("sl.action_type = %s")
+        sub_params.append(action_type.strip())
+    if student_id is not None:
+        sub_conditions.append("s.student_id = %s")
+        sub_params.append(student_id)
+    if student_name:
+        sub_conditions.append("st.name LIKE %s")
+        sub_params.append(f"%{student_name.strip()}%")
+    if modifier_name:
+        sub_conditions.append(
+            "(CASE WHEN u.role IN (2, '2', 'admin') THEN '관리자' "
+            "WHEN t.name IS NOT NULL THEN t.name "
+            "WHEN mst.name IS NOT NULL THEN mst.name "
+            "ELSE '알 수 없음' END) LIKE %s"
+        )
+        sub_params.append(f"%{modifier_name.strip()}%")
+    if norm_start_date:
+        sub_conditions.append("sl.created_at >= %s")
+        sub_params.append(norm_start_date)
+    if norm_end_date:
+        sub_conditions.append("sl.created_at <= %s")
+        sub_params.append(norm_end_date)
+
+    sub_where_clause = f"WHERE {' AND '.join(sub_conditions)}" if sub_conditions else ""
+
+    sub_query = f"""
+    SELECT
+        CONCAT('SUB_', sl.log_id) AS unified_id,
+        sl.log_id AS original_log_id,
+        'SUBMISSION' AS log_type,
+        sl.action_type,
+        sl.submission_id AS target_id,
+        s.student_id,
+        st.name AS student_name,
+        sar.grade AS student_grade,
+        sar.class AS student_class,
+        sar.number AS student_number,
+        sl.modifier_uuid,
+        CASE
+            WHEN u.role IN (2, '2', 'admin') THEN '관리자'
+            WHEN t.name IS NOT NULL THEN t.name
+            WHEN mst.name IS NOT NULL THEN mst.name
+            ELSE '알 수 없음'
+        END AS modifier_name,
+        CASE
+            WHEN u.role IN (2, '2', 'admin') THEN 'admin'
+            WHEN t.teachers_id IS NOT NULL THEN 'teacher'
+            WHEN mst.student_id IS NOT NULL THEN 'student'
+            ELSE 'unknown'
+        END AS modifier_role,
+        sl.old_status_code,
+        sl.new_status_code,
+        sl.old_score,
+        sl.new_score,
+        NULL AS old_points,
+        NULL AS new_points,
+        sl.comment AS reason,
+        s.detail AS target_title,
+        sl.created_at
+    FROM submissions_logs sl
+    JOIN submissions s ON sl.submission_id = s.submission_id
+    JOIN students st ON s.student_id = st.student_id
+    LEFT JOIN (
+        SELECT sar1.*
+        FROM student_academic_records sar1
+        JOIN (
+            SELECT student_id, MAX(year_id) AS max_year_id
+            FROM student_academic_records
+            GROUP BY student_id
+        ) sar_max ON sar1.student_id = sar_max.student_id AND sar1.year_id = sar_max.max_year_id
+    ) sar ON st.student_id = sar.student_id
+    LEFT JOIN users u ON sl.modifier_uuid = u.uuid
+    LEFT JOIN teachers t ON sl.modifier_uuid = t.uuid
+    LEFT JOIN students mst ON sl.modifier_uuid = mst.uuid
+    {sub_where_clause}
+    """
+
+    # 4. merits_log 서브쿼리 구성
+    merit_conditions = []
+    merit_params: List[Any] = []
+
+    if action_type:
+        merit_conditions.append("ml.action_type = %s")
+        merit_params.append(action_type.strip())
+    if student_id is not None:
+        merit_conditions.append("m.student_id = %s")
+        merit_params.append(student_id)
+    if student_name:
+        merit_conditions.append("st.name LIKE %s")
+        merit_params.append(f"%{student_name.strip()}%")
+    if modifier_name:
+        merit_conditions.append(
+            "(CASE WHEN u.role IN (2, '2', 'admin') THEN '관리자' "
+            "WHEN t.name IS NOT NULL THEN t.name "
+            "WHEN mst.name IS NOT NULL THEN mst.name "
+            "ELSE '알 수 없음' END) LIKE %s"
+        )
+        merit_params.append(f"%{modifier_name.strip()}%")
+    if norm_start_date:
+        merit_conditions.append("ml.created_at >= %s")
+        merit_params.append(norm_start_date)
+    if norm_end_date:
+        merit_conditions.append("ml.created_at <= %s")
+        merit_params.append(norm_end_date)
+
+    merit_where_clause = f"WHERE {' AND '.join(merit_conditions)}" if merit_conditions else ""
+
+    merit_query = f"""
+    SELECT
+        CONCAT('MERIT_', ml.log_id) AS unified_id,
+        ml.log_id AS original_log_id,
+        'MERIT' AS log_type,
+        ml.action_type,
+        ml.merits_point_id AS target_id,
+        m.student_id,
+        st.name AS student_name,
+        sar.grade AS student_grade,
+        sar.class AS student_class,
+        sar.number AS student_number,
+        ml.modifier_uuid,
+        CASE
+            WHEN u.role IN (2, '2', 'admin') THEN '관리자'
+            WHEN t.name IS NOT NULL THEN t.name
+            WHEN mst.name IS NOT NULL THEN mst.name
+            ELSE '알 수 없음'
+        END AS modifier_name,
+        CASE
+            WHEN u.role IN (2, '2', 'admin') THEN 'admin'
+            WHEN t.teachers_id IS NOT NULL THEN 'teacher'
+            WHEN mst.student_id IS NOT NULL THEN 'student'
+            ELSE 'unknown'
+        END AS modifier_role,
+        NULL AS old_status_code,
+        NULL AS new_status_code,
+        NULL AS old_score,
+        NULL AS new_score,
+        ml.old_points,
+        ml.new_points,
+        ml.modify_reason AS reason,
+        m.reason AS target_title,
+        ml.created_at
+    FROM merits_log ml
+    JOIN merits m ON ml.merits_point_id = m.merits_point_id
+    JOIN students st ON m.student_id = st.student_id
+    LEFT JOIN (
+        SELECT sar1.*
+        FROM student_academic_records sar1
+        JOIN (
+            SELECT student_id, MAX(year_id) AS max_year_id
+            FROM student_academic_records
+            GROUP BY student_id
+        ) sar_max ON sar1.student_id = sar_max.student_id AND sar1.year_id = sar_max.max_year_id
+    ) sar ON st.student_id = sar.student_id
+    LEFT JOIN users u ON ml.modifier_uuid = u.uuid
+    LEFT JOIN teachers t ON ml.modifier_uuid = t.uuid
+    LEFT JOIN students mst ON ml.modifier_uuid = mst.uuid
+    {merit_where_clause}
+    """
+
+    # 5. log_type에 따른 UNION 또는 단일 쿼리 구성
+    if normalized_log_type == "SUBMISSION":
+        base_query = sub_query
+        base_params = list(sub_params)
+    elif normalized_log_type == "MERIT":
+        base_query = merit_query
+        base_params = list(merit_params)
+    else:  # ALL
+        base_query = f"{sub_query}\nUNION ALL\n{merit_query}"
+        base_params = list(sub_params) + list(merit_params)
+
+    count_query = f"SELECT COUNT(*) AS total_count FROM ({base_query}) AS combined_logs"
+
+    offset = (page - 1) * limit
+    paged_query = f"""
+    SELECT *
+    FROM ({base_query}) AS combined_logs
+    ORDER BY created_at DESC, original_log_id DESC
+    LIMIT %s OFFSET %s
+    """
+    paged_params = list(base_params) + [limit, offset]
+
+    async with conn.cursor(cursor=DictCursor) as cur:
+        # 전체 개수 카운트
+        await cur.execute(count_query, tuple(base_params))
+        count_row = await cur.fetchone()
+        total_count = count_row.get("total_count", 0) if count_row else 0
+
+        # 페이지네이션된 목록 조회
+        await cur.execute(paged_query, tuple(paged_params))
+        rows = await cur.fetchall() or []
+
+    # 6. 반환 DTO 매핑
+    total_pages = (total_count + limit - 1) // limit if total_count > 0 else 0
+    has_next = page < total_pages
+    has_prev = page > 1
+
+    formatted_items = []
+    for r in rows:
+        c_at = r.get("created_at")
+        c_at_str = c_at.isoformat() if hasattr(c_at, "isoformat") else str(c_at) if c_at else None
+
+        o_score = float(r["old_score"]) if r.get("old_score") is not None else None
+        n_score = float(r["new_score"]) if r.get("new_score") is not None else None
+        o_pts = float(r["old_points"]) if r.get("old_points") is not None else None
+        n_pts = float(r["new_points"]) if r.get("new_points") is not None else None
+
+        old_st_code = r.get("old_status_code")
+        new_st_code = r.get("new_status_code")
+
+        log_item = {
+            "id": r["unified_id"],
+            "logId": r["original_log_id"],
+            "logType": r["log_type"],
+            "actionType": r["action_type"],
+            "targetId": r["target_id"],
+            "targetTitle": r.get("target_title"),
+            "student": {
+                "id": r.get("student_id"),
+                "name": r.get("student_name"),
+                "grade": r.get("student_grade"),
+                "classNo": r.get("student_class"),
+                "number": r.get("student_number"),
+            },
+            "modifier": {
+                "uuid": r.get("modifier_uuid"),
+                "name": r.get("modifier_name") or "알 수 없음",
+                "role": r.get("modifier_role") or "unknown",
+            },
+            "changes": {
+                "oldStatusCode": old_st_code,
+                "newStatusCode": new_st_code,
+                "oldStatusName": AUDIT_SUBMISSION_STATUS_MAP.get(old_st_code) if old_st_code is not None else None,
+                "newStatusName": AUDIT_SUBMISSION_STATUS_MAP.get(new_st_code) if new_st_code is not None else None,
+                "oldScore": o_score,
+                "newScore": n_score,
+                "oldPoints": o_pts,
+                "newPoints": n_pts,
+            },
+            "reason": r.get("reason"),
+            "createdAt": c_at_str,
+        }
+        formatted_items.append(log_item)
+
+    return SrFormat(
+        status_code=200,
+        success=True,
+        data={
+            "logs": formatted_items,
+            "pagination": {
+                "totalCount": total_count,
+                "page": page,
+                "limit": limit,
+                "totalPages": total_pages,
+                "hasNext": has_next,
+                "hasPrev": has_prev,
+            },
+            "filter": {
+                "logType": normalized_log_type,
+                "actionType": action_type,
+                "studentId": student_id,
+                "studentName": student_name,
+                "modifierName": modifier_name,
+                "startDate": start_date,
+                "endDate": end_date,
+            },
+        },
+    ).model_dump()
+
+

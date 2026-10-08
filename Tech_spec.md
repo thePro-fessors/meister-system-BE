@@ -257,6 +257,29 @@
   - **대안 및 연계**: 배정된 담임 학년/반이 실제 부산소프트웨어마이스터고의 정규 개설 학급인지 NEIS `classInfo` API와 실시간 교차 검증 (`validateWithNeis=true`)
   - 관련 엔드포인트: `GET /api/admin/neis/teacher-info`
 
+### 4.8 시스템 종합 감사 로그 조회
+- **기능**: 증빙 심사 이력(`submissions_logs`) 및 상벌점 변경 이력(`merits_log`) 통합 감사 로그 필터링 검색
+- **호출 주체**: admin
+- **Method / URL**: `GET /api/admin/audit-logs`
+- **쿼리 파라미터**:
+  - `log_type`: 로그 유형 (`ALL`, `SUBMISSION`, `MERIT`, 기본값 `ALL`)
+  - `action_type`: 행위 구분 (`CREATE`, `UPDATE`, `DELETE`, `APPROVE`, `REJECT` 등)
+  - `student_id`: 대상 학생 고유 ID
+  - `student_name`: 학생 성명 부분 검색 (LIKE `%name%`)
+  - `modifier_name`: 처리자 성명 부분 검색 (교사명, 관리자, 학생명)
+  - `start_date`: 시작 일시 (`YYYY-MM-DD` 또는 ISO8601)
+  - `end_date`: 종료 일시 (`YYYY-MM-DD` 또는 ISO8601)
+  - `page`: 페이지 번호 (기본값 1)
+  - `limit`: 페이지 당 항목 수 (기본값 20, 최대 100)
+- **응답**:
+  - `logs`: 감사 로그 항목 목록 (고유 식별자, 로그 유형, 대상 정보, 학생 학적, 처리자 정보, 변경 전/후 상태 및 점수, 사유, 발생시각)
+  - `pagination`: `{ totalCount, page, limit, totalPages, hasNext, hasPrev }`
+  - `filter`: 적용된 검색 필터 조건 에코
+- **보안/안정성**: **상**.
+  - 관리자 권한 검증 (`check_admin_access`)
+  - 서브쿼리 및 동적 파라미터 바인딩을 통한 SQL Injection 완전 차단
+  - 최신순 인덱스 친화적 정렬 (`created_at DESC, original_log_id DESC`)
+
 ---
 
 ## 5. AI 기능 API (실제 모델 연동 시)
