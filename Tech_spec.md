@@ -242,6 +242,21 @@
   - **대안 및 연계**: NEIS `classInfo` API를 통해 업로드된 학년/반의 실존 여부를 실시간 교차 검증(`validateWithNeis=true`)
   - 관련 엔드포인트: `GET /api/admin/neis/info`, `GET /api/admin/neis/school-info`, `GET /api/admin/neis/classes`
 
+### 4.7 교사 명단 엑셀/CSV 일괄 등록 및 학급 배정
+- **기능**: 교원 명단 일괄 등록 및 담당 교과/담당 학급(담임) 배정 (XLSX, CSV 다중 인코딩 및 NEIS 연동)
+- **호출 주체**: admin
+- **Method / URL**: `POST /api/admin/teachers/batch`
+- **지원 파일/형식**:
+  - XLSX 및 CSV (`UTF-8`, `UTF-8-SIG`, `CP949`, `EUC-KR` 자동 감지)
+  - 컬럼 별칭: 성명/교사명, 이메일, 담당교과, 담당학년/담당반/담당학급(예: '1-2', '2학년 3반', '비담임' 자동 분해)
+- **보안/안정성**: **상**.
+  - 수식 인젝션(Formula Injection: `=`, `+`, `-`, `@`) 접두어 살균
+  - XSS 방어(`html.escape`), 파일 10MB 및 1,000행 제한
+- **NEIS Open API 연동 및 한계 고지**:
+  - **교원 명단 직접 조회 API 미제공 사유**: 개인정보보호법 제18조 및 교원 개인정보 보호 정책에 따라 NEIS 개방 포털은 교원 개인정보(성명, 이메일, 학급 배정 등)를 일체 제공하지 않음
+  - **대안 및 연계**: 배정된 담임 학년/반이 실제 부산소프트웨어마이스터고의 정규 개설 학급인지 NEIS `classInfo` API와 실시간 교차 검증 (`validateWithNeis=true`)
+  - 관련 엔드포인트: `GET /api/admin/neis/teacher-info`
+
 ---
 
 ## 5. AI 기능 API (실제 모델 연동 시)

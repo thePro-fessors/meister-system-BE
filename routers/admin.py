@@ -3,6 +3,7 @@ routers/admin.py - 학년도 관리, 평가 기준 관리, 관리자 통계 개�
 """
 
 import html
+import re
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, Depends, File, Form, Query, Request, UploadFile, status
@@ -17,9 +18,15 @@ except (ImportError, ModuleNotFoundError):
 
 from core.academic import clear_year_cache
 from core.calculator import calculate_student_certification
-from core.excel_parser import parse_student_batch_file, sanitize_text
+from core.excel_parser import (
+    parse_homeroom_field,
+    parse_student_batch_file,
+    parse_teacher_batch_file,
+    sanitize_text,
+)
 from core.neis import (
     explain_neis_student_api_limitation,
+    explain_neis_teacher_api_limitation,
     get_classes_for_year,
     get_school_info,
     validate_class_against_neis,
@@ -123,6 +130,25 @@ class BatchStudentRequest(BaseModel):
     validateWithNeis: Optional[bool] = True
     default_email_domain: Optional[str] = "bssm.hs.kr"
     students: List[BatchStudentItem] = []
+
+
+class BatchTeacherItem(BaseModel):
+    name: str
+    email: Optional[str] = None
+    subject: Optional[str] = None
+    grade: Optional[int] = None
+    class_no: Optional[int] = None
+    classNo: Optional[int] = None
+    homeroom: Optional[str] = None
+
+
+class BatchTeacherRequest(BaseModel):
+    year: Optional[int] = None
+    overwrite: Optional[bool] = True
+    validate_with_neis: Optional[bool] = None
+    validateWithNeis: Optional[bool] = True
+    default_email_domain: Optional[str] = "bssm.hs.kr"
+    teachers: List[BatchTeacherItem] = []
 
 
 # ==============================================================================
@@ -1435,3 +1461,322 @@ async def batch_register_students(
             },
         },
     ).model_dump()
+
+
+# ==============================================================================
+# 5. 교사 명단 엑셀/CSV 일괄 등록 & NEIS 연동 API (4.7)
+# ==============================================================================
+
+@admin_router.get("/neis/teacher-info", summary="NEIS 교원 명단 API 미제공 법적 근거 안내 (4.7)", response_model=SrFormat)
+async def get_neis_teacher_integration_info(
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """
+    NEIS Open API의 교원 명단 직접 조회 API 미제공에 대한 구체적 법적/기술적 근거 및 학급 배정 연동 가이드를 반환합니다.
+    """
+    admin_err = check_admin_access(current_user)
+    if admin_err:
+        return admin_err
+
+    return SrFormat(
+        status_code=200,
+        success=True,
+        data=explain_neis_teacher_api_limitation(),
+    ).model_dump()
+
+
+@admin_router.post("/teachers/batch", summary="교사 명단 엑셀/CSV 일괄 등록 및 학급 배정 (4.7)", response_model=SrFormat)
+async def batch_register_teachers(
+    request: Request,
+    file: Optional[UploadFile] = File(None),
+    year: Optional[int] = Form(None),
+    overwrite: Optional[bool] = Form(True),
+    validate_with_neis: Optional[bool] = Form(None),
+    default_email_domain: Optional[str] = Form("bssm.hs.kr"),
+    conn: Any = Depends(get_db),
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """
+    교사 명단 엑셀(XLSX) 또는 CSV 파일 일괄 등록 및 담당 학급(담임) 배정 엔드포인트 (TODO.md 4.7)
+    - 관리자 전용
+    - XLSX / CSV 파일 자동 감지 및 멀티 인코딩(UTF-8, CP949, EUC-KR) 파싱
+    - 수식 인젝션(Formula Injection) 방어 및 XSS 방어
+    - 담임 배정 시 부산소프트웨어마이스터고 NEIS 개설 학급 실시간 교차 검증 (validate_with_neis)
+    - 교사 정보(teachers) 단일 트랜잭션 원자적 등록 및 갱신
+    """
+    admin_err = check_admin_access(current_user)
+    if admin_err:
+        return admin_err
+
+    content_type = request.headers.get("content-type", "").lower()
+    query_params = request.query_params
+
+    # 1. 쿼리/폼/JSON 파라미터 우선순위 정규화
+    target_year = year if year is not None else (int(query_params.get("year")) if query_params.get("year") else None)
+    is_overwrite = bool(overwrite if overwrite is not None else query_params.get("overwrite", True))
+    should_validate_neis = validate_with_neis if validate_with_neis is not None else True
+    email_domain = default_email_domain or query_params.get("default_email_domain", "bssm.hs.kr")
+
+    valid_records: List[Dict[str, Any]] = []
+    parsing_errors: List[Dict[str, Any]] = []
+
+    # 2. 파일 업로드 또는 JSON 바디 분기 처리
+    if file is not None:
+        file_bytes = await file.read()
+        if len(file_bytes) > 10 * 1024 * 1024:
+            return JSONResponse(
+                status_code=400,
+                content=SrFormat(
+                    status_code=400,
+                    success=False,
+                    data=None,
+                    error=Error(code="FILE_TOO_LARGE", message="파일 크기는 최대 10MB까지 허용됩니다."),
+                ).model_dump(),
+            )
+        try:
+            valid_records, parsing_errors = parse_teacher_batch_file(
+                file_bytes=file_bytes,
+                filename=file.filename or "teachers.xlsx",
+                default_email_domain=email_domain,
+            )
+        except Exception as e:
+            return JSONResponse(
+                status_code=400,
+                content=SrFormat(
+                    status_code=400,
+                    success=False,
+                    data=None,
+                    error=Error(code="FILE_PARSE_ERROR", message=f"파일 파싱 실패: {str(e)}"),
+                ).model_dump(),
+            )
+    elif "application/json" in content_type:
+        try:
+            body = await request.json()
+            if "year" in body and target_year is None:
+                target_year = int(body["year"])
+            if "overwrite" in body:
+                is_overwrite = bool(body["overwrite"])
+            if "validateWithNeis" in body:
+                should_validate_neis = bool(body["validateWithNeis"])
+            elif "validate_with_neis" in body:
+                should_validate_neis = bool(body["validate_with_neis"])
+            if "default_email_domain" in body:
+                email_domain = body["default_email_domain"]
+
+            raw_teachers = body.get("teachers", [])
+            from core.excel_parser import EMAIL_REGEX
+
+            seen_emails = set()
+            seen_homerooms = set()
+
+            for idx, item in enumerate(raw_teachers, start=1):
+                clean_name = sanitize_text(item.get("name"))
+                if not clean_name:
+                    parsing_errors.append({"row": idx, "name": "", "reason": "교사 성명이 누락되었습니다."})
+                    continue
+                if len(clean_name) > 20:
+                    parsing_errors.append({"row": idx, "name": clean_name, "reason": "교사 성명은 20자를 초과할 수 없습니다."})
+                    continue
+                name = html.escape(clean_name)
+
+                # 교과
+                subject = None
+                raw_subj = item.get("subject")
+                if raw_subj:
+                    clean_subj = sanitize_text(raw_subj)
+                    if len(clean_subj) > 20:
+                        parsing_errors.append({"row": idx, "name": clean_name, "reason": "담당교과명은 20자를 초과할 수 없습니다."})
+                        continue
+                    subject = html.escape(clean_subj)
+
+                # 학년/반 (담임)
+                grade = item.get("grade")
+                class_no = item.get("class_no") if item.get("class_no") is not None else item.get("classNo")
+
+                if item.get("homeroom"):
+                    g, c = parse_homeroom_field(item.get("homeroom"))
+                    if g and c:
+                        grade, class_no = g, c
+
+                if (grade is not None and class_no is None) or (grade is None and class_no is not None):
+                    parsing_errors.append({
+                        "row": idx,
+                        "name": clean_name,
+                        "reason": "담임 학년과 반은 함께 지정되어야 합니다. (비담임인 경우 둘 다 비워두세요.)",
+                    })
+                    continue
+
+                if grade is not None:
+                    if not (1 <= grade <= 3):
+                        parsing_errors.append({"row": idx, "name": clean_name, "reason": f"유효하지 않은 담당 학년입니다 ({grade})."})
+                        continue
+                    if not (1 <= class_no <= 20):
+                        parsing_errors.append({"row": idx, "name": clean_name, "reason": f"유효하지 않은 담당 반입니다 ({class_no})."})
+                        continue
+
+                    homeroom_key = (grade, class_no)
+                    if homeroom_key in seen_homerooms:
+                        parsing_errors.append({
+                            "row": idx,
+                            "name": clean_name,
+                            "reason": f"중복된 담임 학급 배정 ({grade}학년 {class_no}반)",
+                        })
+                        continue
+                    seen_homerooms.add(homeroom_key)
+
+                # 이메일
+                email = (item.get("email") or "").strip().lower()
+                if email:
+                    if not EMAIL_REGEX.match(email):
+                        parsing_errors.append({"row": idx, "name": clean_name, "reason": f"올바르지 않은 이메일 형식입니다: {email}"})
+                        continue
+                else:
+                    en_name = re.sub(r"[^a-zA-Z0-9]", "", clean_name).lower()
+                    if en_name:
+                        email = f"{en_name}@{email_domain}"
+                    else:
+                        email = f"teacher_{idx}@{email_domain}"
+
+                if email in seen_emails:
+                    parsing_errors.append({"row": idx, "name": clean_name, "reason": f"중복된 이메일 ({email})"})
+                    continue
+                seen_emails.add(email)
+
+                valid_records.append({
+                    "row_number": idx,
+                    "name": name,
+                    "email": email,
+                    "subject": subject,
+                    "grade": grade,
+                    "class_no": class_no,
+                    "is_homeroom": bool(grade and class_no),
+                })
+        except Exception as e:
+            return JSONResponse(
+                status_code=400,
+                content=SrFormat(
+                    status_code=400,
+                    success=False,
+                    data=None,
+                    error=Error(code="VALIDATION_ERROR", message=f"JSON 바디 파싱 실패: {str(e)}"),
+                ).model_dump(),
+            )
+    else:
+        return JSONResponse(
+            status_code=400,
+            content=SrFormat(
+                status_code=400,
+                success=False,
+                data=None,
+                error=Error(
+                    code="VALIDATION_ERROR",
+                    message="업로드할 엑셀/CSV 파일(file) 또는 교사 명단 JSON(teachers)이 필요합니다.",
+                ),
+            ).model_dump(),
+        )
+
+    # 3. 대상 학년도 확인 (NEIS 검증용)
+    async with conn.cursor(cursor=DictCursor) as cur:
+        if target_year is None:
+            await cur.execute("SELECT year FROM academic_years ORDER BY is_activated DESC, year DESC LIMIT 1")
+            y_row = await cur.fetchone()
+            target_year = y_row["year"] if y_row else 2026
+
+    # 4. NEIS 학급 실시간 교차 검증 (담임 배정 건 대상)
+    neis_validated_classes: Dict[Tuple[int, int], bool] = {}
+    final_to_insert: List[Dict[str, Any]] = []
+
+    if should_validate_neis and valid_records:
+        distinct_classes = set(
+            (t["grade"], t["class_no"]) for t in valid_records if t["grade"] is not None and t["class_no"] is not None
+        )
+        for g, c in distinct_classes:
+            is_valid, err_msg = await validate_class_against_neis(target_year, g, c)
+            neis_validated_classes[(g, c)] = is_valid
+            if not is_valid:
+                for t in valid_records:
+                    if t["grade"] == g and t["class_no"] == c:
+                        parsing_errors.append({
+                            "row": t.get("row_number", 0),
+                            "name": t["name"],
+                            "reason": err_msg or f"NEIS 미인가 학급 ({g}학년 {c}반 담임 배정 불가)",
+                        })
+
+        for t in valid_records:
+            if t["grade"] is None or neis_validated_classes.get((t["grade"], t["class_no"]), True):
+                final_to_insert.append(t)
+    else:
+        final_to_insert = valid_records
+
+    # 5. DB 트랜잭션 원자적 일괄 등록 및 갱신
+    created_count = 0
+    updated_count = 0
+    skipped_count = 0
+
+    try:
+        await conn.autocommit(False)
+        async with conn.cursor(cursor=DictCursor) as cur:
+            for t in final_to_insert:
+                await cur.execute(
+                    "SELECT teachers_id, name, subject, grade, class, is_deleted FROM teachers WHERE email = %s LIMIT 1",
+                    (t["email"],),
+                )
+                ex_teacher = await cur.fetchone()
+
+                if ex_teacher:
+                    teachers_id = ex_teacher["teachers_id"]
+                    if is_overwrite:
+                        await cur.execute(
+                            """
+                            UPDATE teachers
+                            SET name = %s,
+                                subject = %s,
+                                grade = %s,
+                                class = %s,
+                                is_deleted = FALSE
+                            WHERE teachers_id = %s
+                            """,
+                            (t["name"], t["subject"], t["grade"], t["class_no"], teachers_id),
+                        )
+                        updated_count += 1
+                    else:
+                        skipped_count += 1
+                else:
+                    await cur.execute(
+                        """
+                        INSERT INTO teachers (name, subject, grade, class, email, is_deleted)
+                        VALUES (%s, %s, %s, %s, %s, FALSE)
+                        """,
+                        (t["name"], t["subject"], t["grade"], t["class_no"], t["email"]),
+                    )
+                    created_count += 1
+
+        await conn.commit()
+    except Exception:
+        await conn.rollback()
+        raise
+    finally:
+        await conn.autocommit(True)
+
+    return SrFormat(
+        status_code=200,
+        success=True,
+        data={
+            "year": target_year,
+            "totalProcessed": len(final_to_insert) + len(parsing_errors),
+            "successCount": len(final_to_insert),
+            "failedCount": len(parsing_errors),
+            "createdTeachersCount": created_count,
+            "updatedTeachersCount": updated_count,
+            "skippedTeachersCount": skipped_count,
+            "errors": parsing_errors,
+            "neisValidation": {
+                "performed": should_validate_neis,
+                "schoolName": NEIS_SCHOOL_NAME,
+                "officeName": NEIS_OFFICE_NAME,
+                "schoolCode": NEIS_SCHOOL_CODE,
+                "officeCode": NEIS_OFFICE_CODE,
+            },
+        },
+    ).model_dump()
+
