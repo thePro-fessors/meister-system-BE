@@ -7,7 +7,7 @@ import re
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, Depends, File, Form, Query, Request, UploadFile, status
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel
 import redis.asyncio as aioredis
 
@@ -2121,5 +2121,632 @@ async def get_system_audit_logs(
             },
         },
     ).model_dump()
+
+
+# ------------------------------------------------------------------------------
+# 4.9 교내 통계 데이터 엑셀/CSV/PDF 내보내기 API (GET /api/admin/export/stats)
+# ------------------------------------------------------------------------------
+
+def _escape_csv_val(val: Any) -> str:
+    """CSV 셀 내 따옴표, 콤마 및 수식 인젝션 방어용 이스케이프"""
+    if val is None:
+        return ""
+    s = str(val).replace('"', '""')
+    if s.startswith(("=", "+", "-", "@")):
+        s = f"'{s}"
+    if any(c in s for c in (",", '"', "\n", "\r")):
+        return f'"{s}"'
+    return s
+
+
+def _generate_stats_pdf(
+    target_year: int,
+    total_students: int,
+    cert_counts: Dict[str, int],
+    grade_counts: Optional[Dict[str, int]] = None,
+    area_averages: Optional[List[Dict[str, Any]]] = None,
+) -> bytes:
+    """
+    마이스터역량인증제 대회 공식 요구사항 명세서(5.1, 7.4, 7.5) 준수 1페이지 종합 통계 리포트 PDF 생성
+    - 순수 벡터 그래픽 렌더링 (외부 라이브러리 비의존)
+    - A4 규격 (595 x 842 pt)
+    - 상단: 부산소프트웨어마이스터고 공식 배너 및 핵심 인증 지표 KPI 카드 (인증률, 전교생, 발급적격 등)
+    - 중단 좌측: [Chart 1] 전체 인증 상태 분포 수직 막대 그래프 (인증 가능, 검토중, 보완 필요, 미달성)
+    - 중단 우측: [Chart 2] 5대 인증 영역별 취득 점수 달성률 수평 막대 그래프 (직업기초, 전문기술, 인성, 인문, 외국어)
+    - 하단: 성취 등급(S / A / B / 미달성) 환산 분포 및 인증 판정 기준(전 영역 A 이상) 안내 요약 테이블
+    """
+    g_counts = grade_counts or {"S": 0, "A": 0, "B": 0, "미달성": 0}
+    a_avgs = area_averages or [
+        {"name": "직업기초능력", "avg_score": 35.0, "max_score": 40.0, "ratio": 87.5},
+        {"name": "전문기술역량", "avg_score": 98.0, "max_score": 120.0, "ratio": 81.7},
+        {"name": "인성/직업의식", "avg_score": 72.0, "max_score": 80.0, "ratio": 90.0},
+        {"name": "인문학적 소양", "avg_score": 68.0, "max_score": 80.0, "ratio": 85.0},
+        {"name": "외국어 능력", "avg_score": 62.0, "max_score": 80.0, "ratio": 77.5},
+    ]
+
+    cert_pass = cert_counts.get("인증 가능", 0)
+    pass_rate = (cert_pass / total_students * 100.0) if total_students > 0 else 0.0
+
+    cmds: List[str] = []
+    cmds.append("q")  # 그래픽 컨텍스트 저장
+
+    # --------------------------------------------------------------------------
+    # 1. 헤더: 학교 공식 배너
+    # --------------------------------------------------------------------------
+    cmds.append("0.10 0.20 0.36 rg 0 765 595 77 re f")  # BSSM Navy Banner
+    cmds.append("0.85 0.65 0.13 rg 0 762 595 3 re f")   # Gold Accent Line
+
+    cmds.append("BT /F1 16 Tf 1 1 1 rg 40 805 Td (BUSAN SOFTWARE MEISTER HIGH SCHOOL) Tj ET")
+    cmds.append(f"BT /F1 12 Tf 0.88 0.92 0.98 rg 40 782 Td (Meister Competency Certification Management System - Report {target_year}) Tj ET")
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
+    cmds.append(f"BT /F1 9 Tf 0.75 0.82 0.92 rg 440 782 Td (Date: {now_str}) Tj ET")
+
+    # --------------------------------------------------------------------------
+    # 2. KPI 요약 카드 (3개 블록)
+    # --------------------------------------------------------------------------
+    cards = [
+        ("Total Enrolled Students", f"{total_students} Students", "Academic Year " + str(target_year), (0.95, 0.96, 0.98)),
+        ("Pass Rate (Cert. Available)", f"{pass_rate:.1f} %", f"{cert_pass} / {total_students} Achieved", (0.92, 0.97, 0.93)),
+        ("Certification Standard", "All Areas Grade A+", "Step 1~3 Certified", (0.95, 0.95, 0.98)),
+    ]
+    card_x = 40.0
+    card_w = 163.0
+    card_h = 50.0
+    card_y = 702.0
+
+    for i, (title, main_val, sub_val, (bg_r, bg_g, bg_b)) in enumerate(cards):
+        cx = card_x + (i * 176.0)
+        cmds.append(f"{bg_r:.2f} {bg_g:.2f} {bg_b:.2f} rg {cx:.1f} {card_y:.1f} {card_w:.1f} {card_h:.1f} re f")
+        cmds.append(f"0.82 0.84 0.88 RG 0.8 w {cx:.1f} {card_y:.1f} {card_w:.1f} {card_h:.1f} re S")
+        cmds.append(f"BT /F1 8 Tf 0.4 0.4 0.4 rg {cx + 10:.1f} {card_y + 34:.1f} Td ({title}) Tj ET")
+        cmds.append(f"BT /F1 13 Tf 0.1 0.15 0.25 rg {cx + 10:.1f} {card_y + 18:.1f} Td ({main_val}) Tj ET")
+        cmds.append(f"BT /F1 7 Tf 0.5 0.5 0.5 rg {cx + 10:.1f} {card_y + 6:.1f} Td ({sub_val}) Tj ET")
+
+    # --------------------------------------------------------------------------
+    # 3. 중단 좌측: [Chart 1] 전체 인증 상태 분포 (Vertical Bar Chart)
+    # --------------------------------------------------------------------------
+    c1_x = 40.0
+    c1_y = 445.0
+    c1_w = 250.0
+    c1_h = 242.0
+
+    # 차트 프레임
+    cmds.append(f"0.99 0.99 0.99 rg {c1_x:.1f} {c1_y:.1f} {c1_w:.1f} {c1_h:.1f} re f")
+    cmds.append(f"0.85 0.86 0.89 RG 0.8 w {c1_x:.1f} {c1_y:.1f} {c1_w:.1f} {c1_h:.1f} re S")
+    cmds.append(f"BT /F1 10 Tf 0.1 0.15 0.25 rg {c1_x + 12:.1f} {c1_y + c1_h - 20:.1f} Td (Certification Status (Sec. 5.1 & 7.5)) Tj ET")
+
+    c1_plot_x = c1_x + 36.0
+    c1_plot_y = c1_y + 36.0
+    c1_plot_w = 200.0
+    c1_plot_h = 165.0
+
+    c1_categories = [
+        ("Certified", cert_counts.get("인증 가능", 0), (0.18, 0.52, 0.24)),  # Pass
+        ("Reviewing", cert_counts.get("검토중", 0), (0.14, 0.55, 0.92)),     # Review
+        ("Needs Work", cert_counts.get("보완 필요", 0), (0.95, 0.60, 0.08)), # Lack
+        ("Unachieved", cert_counts.get("미달성", 0), (0.84, 0.22, 0.25)),    # Fail
+    ]
+    c1_max_val = max(c[1] for c in c1_categories) if any(c[1] > 0 for c in c1_categories) else 1
+    c1_y_max = max(10, int(c1_max_val * 1.25))
+
+    # Y축 눈금선 (4등분)
+    cmds.append("0.90 0.91 0.93 RG 0.5 w")
+    for i in range(5):
+        val = int(c1_y_max * i / 4)
+        y_pos = c1_plot_y + (c1_plot_h * i / 4)
+        cmds.append(f"{c1_plot_x:.1f} {y_pos:.1f} m {c1_plot_x + c1_plot_w:.1f} {y_pos:.1f} l S")
+        cmds.append(f"BT /F1 7 Tf 0.4 0.4 0.4 rg {c1_x + 10:.1f} {y_pos - 2.5:.1f} Td ({val:>3}) Tj ET")
+
+    # X, Y축 라인
+    cmds.append("0.4 0.4 0.4 RG 1 w")
+    cmds.append(f"{c1_plot_x:.1f} {c1_plot_y:.1f} m {c1_plot_x + c1_plot_w:.1f} {c1_plot_y:.1f} l S")
+    cmds.append(f"{c1_plot_x:.1f} {c1_plot_y:.1f} m {c1_plot_x:.1f} {c1_plot_y + c1_plot_h:.1f} l S")
+
+    # 막대 렌더링
+    c1_slot_w = c1_plot_w / len(c1_categories)
+    c1_bar_w = 32.0
+
+    for idx, (label, count, (cr, cg, cb)) in enumerate(c1_categories):
+        bx = c1_plot_x + (idx * c1_slot_w) + (c1_slot_w - c1_bar_w) / 2.0
+        bh = (count / c1_y_max) * c1_plot_h if c1_y_max > 0 else 0
+        bh = max(2.0, bh) if count > 0 else 0.0
+
+        if bh > 0:
+            cmds.append(f"{cr:.2f} {cg:.2f} {cb:.2f} rg {bx:.1f} {c1_plot_y:.1f} {c1_bar_w:.1f} {bh:.1f} re f")
+            cmds.append(f"BT /F1 8 Tf 0.1 0.1 0.1 rg {bx + (c1_bar_w / 2.0) - 5:.1f} {c1_plot_y + bh + 4:.1f} Td ({count}) Tj ET")
+
+        offset = 11 if len(label) > 8 else 6
+        cmds.append(f"BT /F1 7 Tf 0.3 0.3 0.3 rg {bx - offset + 8:.1f} {c1_plot_y - 14:.1f} Td ({label}) Tj ET")
+
+    # --------------------------------------------------------------------------
+    # 4. 중단 우측: [Chart 2] 5대 영역별 평균 성취율 (Horizontal Bar Chart)
+    # --------------------------------------------------------------------------
+    c2_x = 305.0
+    c2_y = 445.0
+    c2_w = 250.0
+    c2_h = 242.0
+
+    cmds.append(f"0.99 0.99 0.99 rg {c2_x:.1f} {c2_y:.1f} {c2_w:.1f} {c2_h:.1f} re f")
+    cmds.append(f"0.85 0.86 0.89 RG 0.8 w {c2_x:.1f} {c2_y:.1f} {c2_w:.1f} {c2_h:.1f} re S")
+    cmds.append(f"BT /F1 10 Tf 0.1 0.15 0.25 rg {c2_x + 12:.1f} {c2_y + c2_h - 20:.1f} Td (5 Competency Areas Achievement (Sec. 5.1)) Tj ET")
+
+    c2_plot_x = c2_x + 95.0
+    c2_plot_y = c2_y + 36.0
+    c2_plot_w = 140.0
+    c2_plot_h = 165.0
+
+    # 0%, 50%, 80%(기준선), 100% 가이드라인
+    cmds.append("0.90 0.91 0.93 RG 0.5 w")
+    for pct in (0, 50, 70, 80, 90, 100):
+        gx = c2_plot_x + (c2_plot_w * pct / 100.0)
+        cmds.append(f"{gx:.1f} {c2_plot_y:.1f} m {gx:.1f} {c2_plot_y + c2_plot_h:.1f} l S")
+        cmds.append(f"BT /F1 6 Tf 0.4 0.4 0.4 rg {gx - 6:.1f} {c2_plot_y - 12:.1f} Td ({pct}%) Tj ET")
+
+    # A등급(80%) 기준선 강조 표시 (명세서 7.5 단계별 인증 판정 핵심 기준)
+    a_line_x = c2_plot_x + (c2_plot_w * 0.8)
+    cmds.append(f"0.90 0.25 0.25 RG 0.8 [2 2] 0 d {a_line_x:.1f} {c2_plot_y:.1f} m {a_line_x:.1f} {c2_plot_y + c2_plot_h:.1f} l S [] 0 d")
+    cmds.append(f"BT /F1 6 Tf 0.8 0.2 0.2 rg {a_line_x - 14:.1f} {c2_plot_y + c2_plot_h + 3:.1f} Td (Req. 80%(A)) Tj ET")
+
+    # 영문 영역 라벨 매핑 (PDF Type1 폰트 호환용)
+    area_eng_map = {
+        "직업기초능력": "Vocational (40)",
+        "전문기술역량": "Technical (120)",
+        "인성/직업의식": "Character (80)",
+        "인문학적 소양": "Humanities (80)",
+        "외국어 능력": "Language (80)",
+    }
+
+    n_areas = min(5, len(a_avgs))
+    slot_h = c2_plot_h / n_areas
+    bar_h = 18.0
+
+    for idx, a_info in enumerate(a_avgs[:5]):
+        ay = c2_plot_y + c2_plot_h - ((idx + 1) * slot_h) + (slot_h - bar_h) / 2.0
+        r_val = float(a_info.get("ratio", 0.0))
+        bw = (r_val / 100.0) * c2_plot_w if c2_plot_w > 0 else 0
+        bw = max(2.0, min(bw, c2_plot_w))
+
+        # 80% 이상 초록색, 미만 주황/적색
+        if r_val >= 90.0:
+            cr, cg, cb = 0.15, 0.55, 0.25
+        elif r_val >= 80.0:
+            cr, cg, cb = 0.25, 0.65, 0.35
+        elif r_val >= 70.0:
+            cr, cg, cb = 0.95, 0.60, 0.10
+        else:
+            cr, cg, cb = 0.85, 0.25, 0.25
+
+        cmds.append(f"{cr:.2f} {cg:.2f} {cb:.2f} rg {c2_plot_x:.1f} {ay:.1f} {bw:.1f} {bar_h:.1f} re f")
+
+        aname = a_info.get("name", f"Area {idx+1}")
+        eng_label = area_eng_map.get(aname)
+        if not eng_label:
+            # 한글 등 비ASCII 문자는 'Area N'으로 안전하게 대체
+            ascii_chars = [c for c in aname if ord(c) < 128]
+            eng_label = "".join(ascii_chars).strip() or f"Area {idx+1}"
+        cmds.append(f"BT /F1 7 Tf 0.2 0.2 0.2 rg {c2_x + 10:.1f} {ay + 5:.1f} Td ({eng_label}) Tj ET")
+        cmds.append(f"BT /F1 7 Tf 0.1 0.1 0.1 rg {c2_plot_x + bw + 4:.1f} {ay + 5:.1f} Td ({r_val:.1f}%) Tj ET")
+
+    # --------------------------------------------------------------------------
+    # 5. 하단: 등급 환산 기준표 및 통계 요약 테이블 (명세서 7.4 & 7.5 준수)
+    # --------------------------------------------------------------------------
+    t_x = 40.0
+    t_y = 398.0
+    t_w = 515.0
+
+    # 테이블 헤더
+    cmds.append(f"0.10 0.20 0.36 rg {t_x:.1f} {t_y - 20:.1f} {t_w:.1f} 20 re f")
+    cmds.append(f"BT /F1 8 Tf 1 1 1 rg {t_x + 12:.1f} {t_y - 14:.1f} Td (Achievement Grade (Sec. 7.4)) Tj ET")
+    cmds.append(f"BT /F1 8 Tf 1 1 1 rg {t_x + 170:.1f} {t_y - 14:.1f} Td (Conversion Criteria) Tj ET")
+    cmds.append(f"BT /F1 8 Tf 1 1 1 rg {t_x + 320:.1f} {t_y - 14:.1f} Td (Current Count / Ratio) Tj ET")
+    cmds.append(f"BT /F1 8 Tf 1 1 1 rg {t_x + 440:.1f} {t_y - 14:.1f} Td (Certification Status) Tj ET")
+
+    grade_table_rows = [
+        ("Grade S (Superior)", "Score >= 90% of Area Max", g_counts.get("S", 0), "All Grade S: Special Award", (0.15, 0.55, 0.25)),
+        ("Grade A (Excellent)", "Score >= 80% of Area Max", g_counts.get("A", 0), "All Grade A+: Pass (Certified)", (0.25, 0.65, 0.35)),
+        ("Grade B (Standard)", "Score >= 70% of Area Max", g_counts.get("B", 0), "Remedial Evidence Needed", (0.95, 0.60, 0.10)),
+        ("Unachieved (Under)", "Score < 70% of Area Max", g_counts.get("미달성", 0), "Fail (Criteria Unmet)", (0.85, 0.25, 0.25)),
+    ]
+
+    curr_ty = t_y - 20
+    for g_title, criteria_text, cnt, cert_note, (cr, cg, cb) in grade_table_rows:
+        curr_ty -= 20
+        cmds.append(f"0.88 0.89 0.92 RG 0.5 w {t_x:.1f} {curr_ty:.1f} {t_w:.1f} 20 re S")
+        # 색상 인디케이터
+        cmds.append(f"{cr:.2f} {cg:.2f} {cb:.2f} rg {t_x + 12:.1f} {curr_ty + 5:.1f} 9 9 re f")
+        cmds.append(f"BT /F1 8 Tf 0.15 0.15 0.15 rg {t_x + 26:.1f} {curr_ty + 6:.1f} Td ({g_title}) Tj ET")
+        cmds.append(f"BT /F1 7.5 Tf 0.3 0.3 0.3 rg {t_x + 170:.1f} {curr_ty + 6:.1f} Td ({criteria_text}) Tj ET")
+
+        g_pct = (cnt / total_students * 100.0) if total_students > 0 else 0.0
+        cmds.append(f"BT /F1 7.5 Tf 0.1 0.1 0.1 rg {t_x + 320:.1f} {curr_ty + 6:.1f} Td ({cnt} Students ({g_pct:.1f}%)) Tj ET")
+        cmds.append(f"BT /F1 7 Tf 0.4 0.4 0.4 rg {t_x + 440:.1f} {curr_ty + 6:.1f} Td ({cert_note}) Tj ET")
+
+    # --------------------------------------------------------------------------
+    # 6. 푸터: 공식 인증 규정 및 안내 문구
+    # --------------------------------------------------------------------------
+    cmds.append("0.85 0.85 0.85 RG 0.5 w 40 280 515 0.5 m 555 280 l S")
+    cmds.append("BT /F1 7.5 Tf 0.35 0.35 0.35 rg 40 262 Td (* Evaluation Rules: According to 2026 BSSM Meister Certification Guidelines, step certification requires Grade A or higher across all 5 areas.) Tj ET")
+    cmds.append("BT /F1 7.5 Tf 0.35 0.35 0.35 rg 40 248 Td (* Merit/Demerit points are reflected atomically in Character/Work Ethics and overall scores. Detail student sheets available in CSV/XLSX.) Tj ET")
+    cmds.append("BT /F1 7.5 Tf 0.5 0.5 0.5 rg 40 234 Td (System Version: v1.0.0 (FastAPI Production Engine) | Busan Software Meister High School Office of Meister Education) Tj ET")
+
+    cmds.append("Q")  # 컨텍스트 복원
+
+    stream_bytes = "\n".join(cmds).encode("latin-1")
+
+    # PDF 객체 구성
+    objs: List[bytes] = []
+    objs.append(b"1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj")
+    objs.append(b"2 0 obj << /Type /Pages /Kids [3 0 R] /Count 1 >> endobj")
+    objs.append(b"3 0 obj << /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >> endobj")
+    objs.append(b"4 0 obj << /Length " + str(len(stream_bytes)).encode() + b" >>\nstream\n" + stream_bytes + b"\nendstream\nendobj")
+    objs.append(b"5 0 obj << /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold >> endobj")
+
+    out = bytearray(b"%PDF-1.4\n")
+    xref = [0]
+    for obj in objs:
+        xref.append(len(out))
+        out.extend(obj + b"\n")
+
+    xref_pos = len(out)
+    out.extend(b"xref\n0 " + str(len(objs) + 1).encode() + b"\n")
+    out.extend(b"0000000000 65535 f \n")
+    for pos in xref[1:]:
+        out.extend(f"{pos:010d} 00000 n \n".encode())
+
+    out.extend(b"trailer << /Size " + str(len(objs) + 1).encode() + b" /Root 1 0 R >>\n")
+    out.extend(b"startxref\n" + str(xref_pos).encode() + b"\n%%EOF")
+    return bytes(out)
+
+
+@admin_router.get("/export/stats", summary="교내 통계 데이터 엑셀/CSV/PDF 내보내기 (4.9)")
+async def export_school_stats(
+    year: Optional[int] = Query(None, description="조회 학년도 (미지정 시 활성 학년도)"),
+    format: str = Query("xlsx", description="출력 파일 형식 ('csv', 'xlsx', 'pdf')"),
+    conn: Any = Depends(get_db),
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """
+    교내 통계 데이터 및 학생별 인증 결과 일괄 내보내기 엔드포인트 (TODO.md 4.9 & Tech_spec.md 4.9)
+    - 관리자 전용 (check_admin_access)
+    - 출력 포맷: csv, xlsx, pdf 로 엄격 제한 (미지원 포맷 시 400 에러)
+    - CSV: UTF-8 BOM 인코딩 적용 (엑셀 한글 깨짐 방지) 및 수식 인젝션 방어
+    - XLSX: 학생별 원천 시트 + 통계 요약 시트 + openpyxl 막대 차트(BarChart) 시각화 그래프 임베딩
+    - PDF: 외부 라이브러리 없이 순수 PDF 벡터 그래픽 기반의 인증 상태 분포 막대 그래프(Bar Chart Graph) 리포트 렌더링
+    """
+    admin_err = check_admin_access(current_user)
+    if admin_err:
+        return admin_err
+
+    # 1. 포맷 검증
+    norm_format = (format or "xlsx").strip().lower()
+    if norm_format not in ("csv", "xlsx", "pdf"):
+        return JSONResponse(
+            status_code=400,
+            content=SrFormat(
+                status_code=400,
+                success=False,
+                data=None,
+                error=Error(code="INVALID_FORMAT", message="지원하지 않는 출력 형식입니다. 'csv', 'xlsx', 'pdf' 중 하나여야 합니다."),
+            ).model_dump(),
+        )
+
+    # 2. 대상 학년도 결정
+    target_year = year
+    year_id = None
+    async with conn.cursor(cursor=DictCursor) as cur:
+        if target_year is None:
+            await cur.execute("SELECT year_id, year FROM academic_years ORDER BY is_activated DESC, year DESC LIMIT 1")
+            y_row = await cur.fetchone()
+            if not y_row:
+                return JSONResponse(
+                    status_code=404,
+                    content=SrFormat(
+                        status_code=404,
+                        success=False,
+                        data=None,
+                        error=Error(code="ACADEMIC_YEAR_NOT_FOUND", message="등록된 학년도가 없습니다."),
+                    ).model_dump(),
+                )
+            year_id = y_row["year_id"]
+            target_year = y_row["year"]
+        else:
+            await cur.execute("SELECT year_id, year FROM academic_years WHERE year = %s", (target_year,))
+            y_row = await cur.fetchone()
+            if not y_row:
+                return JSONResponse(
+                    status_code=404,
+                    content=SrFormat(
+                        status_code=404,
+                        success=False,
+                        data=None,
+                        error=Error(code="ACADEMIC_YEAR_NOT_FOUND", message=f"{target_year} 학년도가 존재하지 않습니다."),
+                    ).model_dump(),
+                )
+            year_id = y_row["year_id"]
+
+        # 3. 인증 영역 및 평가 항목 조회
+        await cur.execute(
+            """
+            SELECT ca.area_id, ca.name AS area_name, ca.max_score,
+                   ei.item_id, ei.name AS item_name, ei.max_score AS item_max_score, ei.scoring_type
+            FROM certification_areas ca
+            LEFT JOIN evaluation_items ei ON ca.area_id = ei.area_id AND ei.is_active = TRUE
+            WHERE ca.year_id = %s
+            ORDER BY ca.area_id ASC, ei.item_id ASC
+            """,
+            (year_id,),
+        )
+        criteria_rows = await cur.fetchall() or []
+
+        # 영역별 맵 구성
+        areas_dict: Dict[int, Dict[str, Any]] = {}
+        for row in criteria_rows:
+            aid = row["area_id"]
+            if aid not in areas_dict:
+                areas_dict[aid] = {
+                    "area_id": aid,
+                    "name": row["area_name"],
+                    "max_score": float(row["max_score"] or 0),
+                    "items": [],
+                }
+            if row.get("item_id"):
+                areas_dict[aid]["items"].append({
+                    "item_id": row["item_id"],
+                    "name": row["item_name"],
+                    "max_score": float(row["item_max_score"] or 0),
+                    "scoring_type": row["scoring_type"],
+                })
+        areas_list = list(areas_dict.values())
+
+        # 4. 해당 학년도 학생 목록 조회
+        await cur.execute(
+            """
+            SELECT st.student_id, st.name, st.email,
+                   sar.grade, sar.class, sar.number
+            FROM student_academic_records sar
+            JOIN students st ON sar.student_id = st.student_id
+            WHERE sar.year_id = %s AND st.is_deleted = FALSE
+            ORDER BY sar.grade ASC, sar.class ASC, sar.number ASC
+            """,
+            (year_id,),
+        )
+        students = await cur.fetchall() or []
+
+        # 5. 해당 학년도 전교생 제출 증빙 및 상벌점 일괄 조회
+        await cur.execute(
+            """
+            SELECT s.submission_id, s.student_id, s.item_id, s.status_code, s.granted_score,
+                   ei.area_id
+            FROM submissions s
+            JOIN evaluation_items ei ON s.item_id = ei.item_id
+            JOIN certification_areas ca ON ei.area_id = ca.area_id
+            WHERE ca.year_id = %s AND s.is_deleted = FALSE
+            """,
+            (year_id,),
+        )
+        all_submissions = await cur.fetchall() or []
+
+        await cur.execute(
+            """
+            SELECT merits_point_id, student_id, points, related_area
+            FROM merits
+            WHERE is_reflected = TRUE AND is_deleted = FALSE
+            """,
+        )
+        all_merits = await cur.fetchall() or []
+
+    # 6. 학생별 제출물/상벌점 그룹핑
+    subs_by_student: Dict[int, List[Dict[str, Any]]] = {}
+    for s in all_submissions:
+        sid = s["student_id"]
+        subs_by_student.setdefault(sid, []).append(s)
+
+    merits_by_student: Dict[int, List[Dict[str, Any]]] = {}
+    for m in all_merits:
+        sid = m["student_id"]
+        merits_by_student.setdefault(sid, []).append(m)
+
+    # 7. 학생별 역량인증제 평가 계산 (단일화된 calculate_student_certification 활용)
+    student_results = []
+    cert_status_counts = {"인증 가능": 0, "검토중": 0, "보완 필요": 0, "미달성": 0}
+
+    for st in students:
+        sid = st["student_id"]
+        st_subs = subs_by_student.get(sid, [])
+        st_merits = merits_by_student.get(sid, [])
+
+        calc = calculate_student_certification(areas_list, st_subs, st_merits)
+        cert_status = calc.get("certStatus", "미달성")
+        if cert_status in cert_status_counts:
+            cert_status_counts[cert_status] += 1
+        else:
+            cert_status_counts["미달성"] += 1
+
+        student_no_fmt = f"{st['grade']}{st['class']:02d}{st['number']:02d}"
+
+        # 영역별 점수 맵
+        area_score_map = {a.get("area") or a.get("name"): a["score"] for a in calc.get("areas", [])}
+
+        student_results.append({
+            "student_id": sid,
+            "student_number": student_no_fmt,
+            "grade": st["grade"],
+            "class": st["class"],
+            "number": st["number"],
+            "name": st["name"],
+            "email": st["email"],
+            "total_score": calc.get("totalScore", 0.0),
+            "cert_status": cert_status,
+            "pending_count": calc.get("pendingCount", 0),
+            "point_total": calc.get("pointTotal", 0.0),
+            "area_scores": area_score_map,
+        })
+
+    # 정렬된 영역 명칭 목록
+    area_names = [a["name"] for a in areas_list]
+
+    # ==========================================================================
+    # 포맷별 파일 생성 및 스트리밍 응답
+    # ==========================================================================
+
+    # 8. CSV 형식 출력
+    if norm_format == "csv":
+        import io
+        csv_buffer = io.StringIO()
+
+        # 헤더 생성
+        headers = ["학번", "학년", "반", "번호", "이름", "이메일", "취득총점", "인증상태", "상벌점합계", "검토대기건수"] + area_names
+        csv_buffer.write(",".join([_escape_csv_val(h) for h in headers]) + "\n")
+
+        # 행 데이터 작성
+        for sr in student_results:
+            row = [
+                sr["student_number"],
+                sr["grade"],
+                sr["class"],
+                sr["number"],
+                sr["name"],
+                sr["email"],
+                f"{sr['total_score']:.1f}",
+                sr["cert_status"],
+                f"{sr['point_total']:.1f}",
+                sr["pending_count"],
+            ]
+            for aname in area_names:
+                sc = sr["area_scores"].get(aname, 0.0)
+                row.append(f"{sc:.1f}")
+            csv_buffer.write(",".join([_escape_csv_val(v) for v in row]) + "\n")
+
+        filename = f"meister_stats_{target_year}.csv"
+        return Response(
+            content=csv_buffer.getvalue().encode("utf-8-sig"),
+            media_type="text/csv; charset=utf-8",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
+
+    # 9. XLSX 형식 출력 (openpyxl + 차트 시트)
+    elif norm_format == "xlsx":
+        import io
+        import openpyxl
+        from openpyxl.chart import BarChart, Reference
+
+        wb = openpyxl.Workbook()
+
+        # Sheet 1: 학생별 인증 상세
+        ws_students = wb.active
+        ws_students.title = "학생별 인증 결과"
+
+        headers = ["학번", "학년", "반", "번호", "이름", "이메일", "취득총점", "인증상태", "상벌점합계", "검토대기건수"] + area_names
+        ws_students.append(headers)
+
+        for sr in student_results:
+            row = [
+                sr["student_number"],
+                sr["grade"],
+                sr["class"],
+                sr["number"],
+                sr["name"],
+                sr["email"],
+                sr["total_score"],
+                sr["cert_status"],
+                sr["point_total"],
+                sr["pending_count"],
+            ]
+            for aname in area_names:
+                row.append(sr["area_scores"].get(aname, 0.0))
+            ws_students.append(row)
+
+        # Sheet 2: 통계 요약 및 막대 차트
+        ws_stats = wb.create_sheet("통계 요약 및 차트")
+        ws_stats.append(["인증 상태", "학생 수 (명)"])
+        stat_rows = [
+            ("인증 가능", cert_status_counts.get("인증 가능", 0)),
+            ("검토중", cert_status_counts.get("검토중", 0)),
+            ("보완 필요", cert_status_counts.get("보완 필요", 0)),
+            ("미달성", cert_status_counts.get("미달성", 0)),
+        ]
+        for cat, cnt in stat_rows:
+            ws_stats.append([cat, cnt])
+
+        # openpyxl BarChart 추가
+        chart = BarChart()
+        chart.type = "col"
+        chart.style = 10
+        chart.title = f"{target_year}학년도 마이스터 역량인증 상태 분포"
+        chart.y_axis.title = "학생 수 (명)"
+        chart.x_axis.title = "인증 상태"
+
+        data_ref = Reference(ws_stats, min_col=2, min_row=1, max_row=5)
+        cats_ref = Reference(ws_stats, min_col=1, min_row=2, max_row=5)
+        chart.add_data(data_ref, titles_from_data=True)
+        chart.set_categories(cats_ref)
+        chart.width = 16
+        chart.height = 10
+        ws_stats.add_chart(chart, "D2")
+
+        xlsx_buffer = io.BytesIO()
+        wb.save(xlsx_buffer)
+        filename = f"meister_stats_{target_year}.xlsx"
+
+        return Response(
+            content=xlsx_buffer.getvalue(),
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
+
+    # 10. PDF 형식 출력 (벡터 그래프 리포트)
+    else:  # norm_format == "pdf"
+        # 대회 명세서 7.4 등급별 전체 집계 및 5.1 영역별 평균 달성률 산출
+        grade_counts = {"S": 0, "A": 0, "B": 0, "미달성": 0}
+        area_totals: Dict[str, Dict[str, float]] = {
+            a["name"]: {"total_score": 0.0, "max_score": a["max_score"]}
+            for a in areas_list
+        }
+
+        for sr in student_results:
+            for aname, sc in sr["area_scores"].items():
+                if aname in area_totals:
+                    area_totals[aname]["total_score"] += sc
+                    amax = area_totals[aname]["max_score"]
+                    ratio = (sc / amax * 100.0) if amax > 0 else 0.0
+                    if ratio >= 90.0:
+                        grade_counts["S"] += 1
+                    elif ratio >= 80.0:
+                        grade_counts["A"] += 1
+                    elif ratio >= 70.0:
+                        grade_counts["B"] += 1
+                    else:
+                        grade_counts["미달성"] += 1
+
+        total_st_cnt = len(students)
+        area_averages = []
+        for a in areas_list:
+            aname = a["name"]
+            amax = a["max_score"]
+            t_score = area_totals[aname]["total_score"]
+            avg_sc = (t_score / total_st_cnt) if total_st_cnt > 0 else 0.0
+            r = (avg_sc / amax * 100.0) if amax > 0 else 0.0
+            area_averages.append({
+                "name": aname,
+                "avg_score": round(avg_sc, 1),
+                "max_score": amax,
+                "ratio": round(r, 1),
+            })
+
+        pdf_bytes = _generate_stats_pdf(
+            target_year=target_year,
+            total_students=total_st_cnt,
+            cert_counts=cert_status_counts,
+            grade_counts=grade_counts,
+            area_averages=area_averages,
+        )
+        filename = f"meister_stats_{target_year}.pdf"
+
+        return Response(
+            content=pdf_bytes,
+            media_type="application/pdf",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
+
 
 

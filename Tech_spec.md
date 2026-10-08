@@ -280,6 +280,22 @@
   - 서브쿼리 및 동적 파라미터 바인딩을 통한 SQL Injection 완전 차단
   - 최신순 인덱스 친화적 정렬 (`created_at DESC, original_log_id DESC`)
 
+### 4.9 교내 통계 데이터 엑셀/CSV/PDF 내보내기
+- **기능**: 학생별 5대 영역 취득점수 및 최종 인증 판정 결과 일괄 파일 내보내기
+- **호출 주체**: admin
+- **Method / URL**: `GET /api/admin/export/stats`
+- **쿼리 파라미터**:
+  - `year`: 조회 학년도 (미지정 시 활성 학년도)
+  - `format`: 출력 형식 (`csv`, `xlsx`, `pdf` 엄격 제한, 기본값 `xlsx`)
+- **출력 형식별 상세**:
+  - `csv`: UTF-8 with BOM 인코딩 (MS Excel 한글 깨짐 방지), 수식 인젝션(`=`, `+`, `-`, `@`) 방어, 학생별 상세 점수 및 영역별 점수
+  - `xlsx`: 다중 시트 구성 (`학생별 인증 결과` 원천 시트 + `통계 요약 및 차트` 집계 시트) 및 openpyxl 막대 차트(`BarChart`) 시각화 임베딩
+  - `pdf`: 외부 무거운 라이브러리 비의존 순수 벡터 그래픽 렌더링. A4 규격 학교 공식 리포트 헤더, 인증 상태(인증 가능, 검토중, 보완 필요, 미달성) 분포 막대 그래프(Bar Chart Graph), 요약 테이블 및 범례 포함
+- **보안/안정성**: **상**.
+  - 관리자 권한 검증 (`check_admin_access`)
+  - 미지원 포맷 전달 시 `400 INVALID_FORMAT` 차단
+  - 일괄 집계 시 소프트 삭제(`is_deleted = TRUE`) 학생 배제 및 계산 로직(`calculate_student_certification`) 단일화
+
 ---
 
 ## 5. AI 기능 API (실제 모델 연동 시)
