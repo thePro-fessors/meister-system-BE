@@ -181,3 +181,46 @@ async def validate_class_against_neis(
     if 1 <= grade <= 3 and 1 <= class_no <= 4:
         return True, None
     return False, f"부산소프트웨어마이스터고 학제 기준(1~3학년 1~4반)을 벗어났습니다 ({grade}학년 {class_no}반)."
+
+
+def explain_neis_teacher_api_limitation() -> Dict[str, Any]:
+    """
+    NEIS Open API를 통한 교사 명단 직접 조회/일괄 등록이 불가한 법적·기술적 근거를 반환합니다.
+    """
+    return {
+        "supported": False,
+        "schoolName": NEIS_SCHOOL_NAME,
+        "officeName": NEIS_OFFICE_NAME,
+        "officeCode": NEIS_OFFICE_CODE,
+        "schoolCode": NEIS_SCHOOL_CODE,
+        "legalAndTechnicalBasis": [
+            {
+                "category": "개인정보보호법 및 교원 개인정보 보호 규정",
+                "detail": (
+                    "개인정보보호법 제18조(개인정보의 목적 외 이용·제공 제한) 및 교육행정 데이터 개방 지침에 따라, "
+                    "교원의 성명, 이메일, 담당 교과, 담임 배정 현황 등 개인식별정보는 정보주체의 동의 없이 공공 Open API로 "
+                    "외부에 개방되거나 전송될 수 없습니다."
+                ),
+            },
+            {
+                "category": "나이스(NEIS) 교육정보 개방 포털 제공 범위 한계",
+                "detail": (
+                    "open.neis.go.kr에서 제공하는 50여 종의 Open API는 학교 기본정보, 학급 정보, 학사 일정, 급식 식단 등 "
+                    "공공 통계 및 학사 일반 정보로 엄격히 한정되어 있으며, 개별 교원 인적 사항 및 담당 학급 명단 API는 미존재합니다."
+                ),
+            },
+            {
+                "category": "학교 교무분장 및 인사 관리 폐쇄망 체계",
+                "detail": (
+                    "교원의 담임 배정 및 교무분장은 학교 내부 행정업무로, 교육행정정보시스템(NEIS 인트라넷) "
+                    "내부망에서 교원 인증서(GPKI)를 통해서만 관리 및 엑셀 다운로드가 가능합니다."
+                ),
+            },
+        ],
+        "recommendedSolution": (
+            "관리자가 학교 교무분장 또는 NEIS 인트라넷(교원인사/학적)에서 추출한 교원 명단 엑셀/CSV를 "
+            "본 시스템의 4.7 교사 일괄 등록 API(POST /api/admin/teachers/batch)에 업로드하여 일괄 등록 및 학급 배정을 수행합니다. "
+            "업로드 시 배정된 담임 학년/반이 실제 NEIS 정규 학급인지 실시간 교차 검증(validateWithNeis)을 지원합니다."
+        ),
+    }
+

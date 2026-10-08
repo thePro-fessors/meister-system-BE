@@ -309,3 +309,230 @@ def parse_student_batch_file(
             errors.append({"row": offset, "name": "", "reason": f"행 처리 중 예기치 않은 오류: {str(e)}"})
 
     return valid_records, errors
+
+
+# ==============================================================================
+# 교사 명단 엑셀 / CSV 파싱 (TODO.md 4.7)
+# ==============================================================================
+
+TEACHER_COLUMN_ALIASES = {
+    "name": {"성명", "이름", "교사명", "교사성명", "교원명", "name", "teachername", "teacher_name"},
+    "email": {"이메일", "전자우편", "email", "mail", "teacheremail", "teacher_email"},
+    "subject": {"담당교과", "교과", "과목", "담당과목", "subject"},
+    "grade": {"담당학년", "학년", "grade", "homeroomgrade", "homeroom_grade"},
+    "class_no": {"담당반", "반", "학급", "class", "classno", "class_no", "homeroomclass", "homeroom_class"},
+    "homeroom": {"담당학급", "담임학급", "담임", "homeroom"},
+}
+
+
+def find_teacher_column_mapping(headers: List[str]) -> Dict[str, int]:
+    """교사 헤더 행에서 필드 인덱스를 매핑합니다."""
+    mapping: Dict[str, int] = {}
+    for idx, header in enumerate(headers):
+        if not header:
+            continue
+        norm = normalize_column_name(header)
+        for field, aliases in TEACHER_COLUMN_ALIASES.items():
+            if norm in aliases and field not in mapping:
+                mapping[field] = idx
+                break
+    return mapping
+
+
+def parse_homeroom_field(val: Any) -> Tuple[Optional[int], Optional[int]]:
+    """
+    담임 학급 문자열에서 학년과 반을 추출합니다.
+    예: '1-2' -> (1, 2)
+        '2학년 3반' -> (2, 3)
+        '3-04' -> (3, 4)
+        '비담임', '-', '없음', '' -> (None, None)
+    """
+    if val is None:
+        return None, None
+    text = str(val).strip()
+    if not text or text in ("비담임", "-", "없음", "해당없음", "X", "x", "N/A", "null", "None"):
+        return None, None
+    m = re.search(r"(\d)\s*(?:학년\s*|[-/]\s*)(\d+)", text)
+    if m:
+        try:
+            return int(m.group(1)), int(m.group(2))
+        except ValueError:
+            pass
+    return None, None
+
+
+def parse_teacher_batch_file(
+    file_bytes: bytes,
+    filename: str,
+    default_email_domain: str = "bssm.hs.kr",
+    max_rows: int = 1000,
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """
+    XLSX 또는 CSV 파일을 분석하여 교사 목록과 행별 검증 에러 목록을 반환합니다.
+
+    반환값:
+    - valid_records: 정상 파싱된 교사 정보 리스트
+    - errors: 유효성 검증 실패 행 리스트 [{"row": int, "name": str, "reason": str}]
+    """
+    ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+    if ext == "csv":
+        raw_rows = parse_csv_content(file_bytes)
+    elif ext in ("xlsx", "xls"):
+        raw_rows = parse_xlsx_content(file_bytes)
+    else:
+        raise ValueError(f"지원하지 않는 파일 형식입니다 (.{ext}). XLSX 또는 CSV 파일만 업로드 가능합니다.")
+
+    if not raw_rows:
+        raise ValueError("파일에 유효한 데이터 행이 존재하지 않습니다.")
+
+    if len(raw_rows) > max_rows:
+        raise ValueError(f"한 번에 최대 {max_rows}행까지만 일괄 등록 가능합니다 (현재: {len(raw_rows)}행).")
+
+    # 1. 헤더 행 탐색
+    header_idx = -1
+    col_map: Dict[str, int] = {}
+
+    for i in range(min(5, len(raw_rows))):
+        current_headers = [str(c or "") for c in raw_rows[i]]
+        mapping = find_teacher_column_mapping(current_headers)
+        if "name" in mapping and ("email" in mapping or "subject" in mapping or "grade" in mapping or "homeroom" in mapping):
+            header_idx = i
+            col_map = mapping
+            break
+
+    if header_idx == -1:
+        if len(raw_rows[0]) >= 2:
+            header_idx = -1
+            col_map = {"name": 0, "email": 1}
+            if len(raw_rows[0]) >= 3:
+                col_map["subject"] = 2
+            if len(raw_rows[0]) >= 5:
+                col_map["grade"] = 3
+                col_map["class_no"] = 4
+        else:
+            raise ValueError("엑셀 헤더를 인식할 수 없습니다. '성명', '이메일', '담당교과'(선택), '담당학급'(선택) 컬럼이 필요합니다.")
+
+    valid_records: List[Dict[str, Any]] = []
+    errors: List[Dict[str, Any]] = []
+    seen_emails: Set[str] = set()
+    seen_homerooms: Set[Tuple[int, int]] = set()
+
+    data_rows = raw_rows[header_idx + 1 :] if header_idx >= 0 else raw_rows
+
+    for offset, row in enumerate(data_rows, start=header_idx + 2 if header_idx >= 0 else 1):
+        try:
+            # 1) 성명
+            name_idx = col_map.get("name")
+            raw_name = row[name_idx] if name_idx is not None and name_idx < len(row) else None
+            clean_name = sanitize_text(raw_name)
+
+            if not clean_name:
+                errors.append({"row": offset, "name": "", "reason": "교사 성명이 누락되었습니다."})
+                continue
+
+            if len(clean_name) > 20:
+                errors.append({"row": offset, "name": clean_name, "reason": "교사 성명은 20자를 초과할 수 없습니다."})
+                continue
+
+            name = html.escape(clean_name)
+
+            # 2) 담당교과
+            subject: Optional[str] = None
+            if "subject" in col_map and col_map["subject"] < len(row) and row[col_map["subject"]] is not None:
+                clean_subj = sanitize_text(row[col_map["subject"]])
+                if clean_subj:
+                    if len(clean_subj) > 20:
+                        errors.append({"row": offset, "name": clean_name, "reason": "담당교과명은 20자를 초과할 수 없습니다."})
+                        continue
+                    subject = html.escape(clean_subj)
+
+            # 3) 담당학급 (담임 배정)
+            grade: Optional[int] = None
+            class_no: Optional[int] = None
+
+            if "homeroom" in col_map and col_map["homeroom"] < len(row) and row[col_map["homeroom"]] is not None:
+                g, c = parse_homeroom_field(row[col_map["homeroom"]])
+                if g and c:
+                    grade, class_no = g, c
+
+            if grade is None and "grade" in col_map and col_map["grade"] < len(row) and row[col_map["grade"]] is not None:
+                raw_g = str(row[col_map["grade"]]).strip()
+                if raw_g and raw_g not in ("비담임", "-", "없음", "해당없음"):
+                    try:
+                        grade = int(re.sub(r"[^\d]", "", raw_g))
+                    except ValueError:
+                        pass
+
+            if class_no is None and "class_no" in col_map and col_map["class_no"] < len(row) and row[col_map["class_no"]] is not None:
+                raw_c = str(row[col_map["class_no"]]).strip()
+                if raw_c and raw_c not in ("비담임", "-", "없음", "해당없음"):
+                    try:
+                        class_no = int(re.sub(r"[^\d]", "", raw_c))
+                    except ValueError:
+                        pass
+
+            # 학년/반 정합성 검증 (둘 다 있거나 둘 다 없어야 함)
+            if (grade is not None and class_no is None) or (grade is None and class_no is not None):
+                errors.append({
+                    "row": offset,
+                    "name": clean_name,
+                    "reason": "담임 학년과 반은 함께 지정되어야 합니다. (비담임인 경우 둘 다 비워두세요.)",
+                })
+                continue
+
+            if grade is not None:
+                if not (1 <= grade <= 3):
+                    errors.append({"row": offset, "name": clean_name, "reason": f"유효하지 않은 담당 학년입니다 ({grade}). 고등학교는 1~3학년이어야 합니다."})
+                    continue
+                if not (1 <= class_no <= 20):
+                    errors.append({"row": offset, "name": clean_name, "reason": f"유효하지 않은 담당 반 번호입니다 ({class_no})."})
+                    continue
+
+                homeroom_key = (grade, class_no)
+                if homeroom_key in seen_homerooms:
+                    errors.append({
+                        "row": offset,
+                        "name": clean_name,
+                        "reason": f"파일 내에 동일한 학급({grade}학년 {class_no}반) 담임이 중복 배정되었습니다.",
+                    })
+                    continue
+                seen_homerooms.add(homeroom_key)
+
+            # 4) 이메일
+            email: Optional[str] = None
+            if "email" in col_map and col_map["email"] < len(row) and row[col_map["email"]] is not None:
+                raw_email = str(row[col_map["email"]]).strip().lower()
+                if raw_email:
+                    if not EMAIL_REGEX.match(raw_email):
+                        errors.append({"row": offset, "name": clean_name, "reason": f"올바르지 않은 이메일 형식입니다: {raw_email}"})
+                        continue
+                    email = raw_email
+
+            if not email:
+                # 이메일 누락 시 교사 기본 이메일 규격 자동 생성
+                # 영문자만 있으면 사용, 아니면 teacher_{offset}@{domain}
+                en_name = re.sub(r"[^a-zA-Z0-9]", "", clean_name).lower()
+                if en_name:
+                    email = f"{en_name}@{default_email_domain}"
+                else:
+                    email = f"teacher_{offset}@{default_email_domain}"
+
+            if email in seen_emails:
+                errors.append({"row": offset, "name": clean_name, "reason": f"파일 내에 동일한 이메일({email})이 중복으로 존재합니다."})
+                continue
+            seen_emails.add(email)
+
+            valid_records.append({
+                "row_number": offset,
+                "name": name,
+                "email": email,
+                "subject": subject,
+                "grade": grade,
+                "class_no": class_no,
+                "is_homeroom": bool(grade and class_no),
+            })
+
+        except Exception as e:
+            errors.append({"row": offset, "name": "", "reason": f"행 처리 중 예기치 않은 오류: {str(e)}"})
+
+    return valid_records, errors
