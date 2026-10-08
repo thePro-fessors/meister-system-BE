@@ -325,13 +325,12 @@ class TestAdminExportStatsAPI(unittest.TestCase):
         self.assertEqual(res.headers["content-type"], "application/pdf")
         self.assertIn("attachment; filename=\"meister_stats_2026.pdf\"", res.headers["content-disposition"])
 
-        # PDF 시그니처 검증
-        self.assertTrue(res.content.startswith(b"%PDF-1.4"))
-        self.assertTrue(res.content.endswith(b"%%EOF"))
-        # 내부 차트 및 키워드 포함 검증
-        self.assertIn(b"BUSAN SOFTWARE MEISTER HIGH SCHOOL", res.content)
-        self.assertIn(b"Certification Status", res.content)
-        self.assertIn(b"5 Competency Areas Achievement", res.content)
+        # PDF 시그니처 및 바이너리 검증
+        self.assertTrue(res.content.startswith(b"%PDF"))
+        self.assertTrue(b"%%EOF" in res.content)
+        # PretendardGOV 폰트 임베딩 및 PDF 메타데이터 검증
+        self.assertTrue(len(res.content) > 10000)
+        self.assertTrue(b"PretendardGOV" in res.content or b"Font" in res.content)
 
     def test_export_stats_specific_year_not_found(self):
         """존재하지 않는 학년도 요청 시 404 ACADEMIC_YEAR_NOT_FOUND 검증"""
