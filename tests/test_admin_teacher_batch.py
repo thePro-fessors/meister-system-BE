@@ -66,30 +66,57 @@ class TeacherBatchMockCursor:
             self._current_result = [t for t in self.conn.db_teachers if t["email"] == target_email]
 
         # teachers 갱신
-        elif "UPDATE teachers SET name = %s, subject = %s, grade = %s, class = %s" in sql_clean:
-            t_id = params[4]
-            found = False
-            for t in self.conn.db_teachers:
-                if t["teachers_id"] == t_id:
-                    t["name"] = params[0]
-                    t["subject"] = params[1]
-                    t["grade"] = params[2]
-                    t["class"] = params[3]
-                    found = True
-            self.rowcount = 1 if found else 0
+        elif "UPDATE teachers" in sql_clean:
+            if "position" in sql_clean and len(params) >= 7:
+                t_id = params[6]
+                found = False
+                for t in self.conn.db_teachers:
+                    if t["teachers_id"] == t_id:
+                        t["name"] = params[0]
+                        t["subject"] = params[1]
+                        t["position"] = params[2]
+                        t["department"] = params[3]
+                        t["grade"] = params[4]
+                        t["class"] = params[5]
+                        found = True
+                self.rowcount = 1 if found else 0
+            else:
+                t_id = params[4]
+                found = False
+                for t in self.conn.db_teachers:
+                    if t["teachers_id"] == t_id:
+                        t["name"] = params[0]
+                        t["subject"] = params[1]
+                        t["grade"] = params[2]
+                        t["class"] = params[3]
+                        found = True
+                self.rowcount = 1 if found else 0
 
         # teachers 삽입
         elif "INSERT INTO teachers" in sql_clean:
             new_id = len(self.conn.db_teachers) + 1
-            t_data = {
-                "teachers_id": new_id,
-                "name": params[0],
-                "subject": params[1],
-                "grade": params[2],
-                "class": params[3],
-                "email": params[4],
-                "is_deleted": False,
-            }
+            if len(params) >= 7:
+                t_data = {
+                    "teachers_id": new_id,
+                    "name": params[0],
+                    "subject": params[1],
+                    "position": params[2],
+                    "department": params[3],
+                    "grade": params[4],
+                    "class": params[5],
+                    "email": params[6],
+                    "is_deleted": False,
+                }
+            else:
+                t_data = {
+                    "teachers_id": new_id,
+                    "name": params[0],
+                    "subject": params[1],
+                    "grade": params[2],
+                    "class": params[3],
+                    "email": params[4],
+                    "is_deleted": False,
+                }
             self.conn.db_teachers.append(t_data)
             self.lastrowid = new_id
 

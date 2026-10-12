@@ -17,6 +17,7 @@ import csv
 import html
 import io
 import re
+import zipfile
 from typing import Any, Dict, List, Optional, Set, Tuple
 import openpyxl
 
@@ -121,22 +122,36 @@ def parse_csv_content(file_bytes: bytes) -> List[List[Any]]:
     return rows
 
 
+MAX_UNCOMPRESSED_XLSX_BYTES = 50 * 1024 * 1024  # 50MB 압축 해제 상한 (Zip Bomb 방어)
+
+
 def parse_xlsx_content(file_bytes: bytes) -> List[List[Any]]:
     """XLSX 바이트 데이터를 openpyxl로 파싱합니다."""
     try:
-        wb = openpyxl.load_workbook(io.BytesIO(file_bytes), data_only=True)
+        with zipfile.ZipFile(io.BytesIO(file_bytes)) as zf:
+            total_uncompressed = sum(info.file_size for info in zf.infolist())
+            if total_uncompressed > MAX_UNCOMPRESSED_XLSX_BYTES:
+                raise ValueError("엑셀 파일 내부 압축 해제 용량이 허용 한도(50MB)를 초과했습니다 (Zip Bomb 방어).")
+    except zipfile.BadZipFile:
+        raise ValueError("유효하지 않은 XLSX(ZIP) 파일 구조입니다.")
+
+    try:
+        wb = openpyxl.load_workbook(io.BytesIO(file_bytes), data_only=True, read_only=True)
     except Exception as e:
         raise ValueError(f"XLSX 엑셀 파일을 읽을 수 없습니다: {e}")
 
-    ws = wb.active
-    if not ws:
-        raise ValueError("엑셀 시트가 비어있습니다.")
+    try:
+        ws = wb.active
+        if not ws:
+            raise ValueError("엑셀 시트가 비어있습니다.")
 
-    rows: List[List[Any]] = []
-    for row in ws.iter_rows(values_only=True):
-        if any(cell is not None and str(cell).strip() != "" for cell in row):
-            rows.append(list(row))
-    return rows
+        rows: List[List[Any]] = []
+        for row in ws.iter_rows(values_only=True):
+            if any(cell is not None and str(cell).strip() != "" for cell in row):
+                rows.append(list(row))
+        return rows
+    finally:
+        wb.close()
 
 
 def parse_student_batch_file(
@@ -319,6 +334,8 @@ TEACHER_COLUMN_ALIASES = {
     "name": {"성명", "이름", "교사명", "교사성명", "교원명", "name", "teachername", "teacher_name"},
     "email": {"이메일", "전자우편", "email", "mail", "teacheremail", "teacher_email"},
     "subject": {"담당교과", "교과", "과목", "담당과목", "subject"},
+    "position": {"직책", "보직", "구분", "담임구분", "역할", "position", "role", "title", "duty"},
+    "department": {"부서", "소속부서", "담당부서", "교무부서", "department", "dept", "division"},
     "grade": {"담당학년", "학년", "grade", "homeroomgrade", "homeroom_grade"},
     "class_no": {"담당반", "반", "학급", "class", "classno", "class_no", "homeroomclass", "homeroom_class"},
     "homeroom": {"담당학급", "담임학급", "담임", "homeroom"},
@@ -415,7 +432,7 @@ def parse_teacher_batch_file(
     valid_records: List[Dict[str, Any]] = []
     errors: List[Dict[str, Any]] = []
     seen_emails: Set[str] = set()
-    seen_homerooms: Set[Tuple[int, int]] = set()
+    seen_homeroom_positions: Set[Tuple[int, int, str]] = set()
 
     data_rows = raw_rows[header_idx + 1 :] if header_idx >= 0 else raw_rows
 
@@ -446,7 +463,26 @@ def parse_teacher_batch_file(
                         continue
                     subject = html.escape(clean_subj)
 
-            # 3) 담당학급 (담임 배정)
+            # 2-1) 직책 (position: 정담임, 부담임, 임시담임, 학년부장, 부서부장 등) 및 소속 부서 (department)
+            position: Optional[str] = None
+            if "position" in col_map and col_map["position"] < len(row) and row[col_map["position"]] is not None:
+                clean_pos = sanitize_text(row[col_map["position"]])
+                if clean_pos:
+                    if len(clean_pos) > 30:
+                        errors.append({"row": offset, "name": clean_name, "reason": "직책명은 30자를 초과할 수 없습니다."})
+                        continue
+                    position = html.escape(clean_pos)
+
+            department: Optional[str] = None
+            if "department" in col_map and col_map["department"] < len(row) and row[col_map["department"]] is not None:
+                clean_dept = sanitize_text(row[col_map["department"]])
+                if clean_dept:
+                    if len(clean_dept) > 40:
+                        errors.append({"row": offset, "name": clean_name, "reason": "부서명은 40자를 초과할 수 없습니다."})
+                        continue
+                    department = html.escape(clean_dept)
+
+            # 3) 담당학급 (담임/부담임/임시담임 배정)
             grade: Optional[int] = None
             class_no: Optional[int] = None
 
@@ -471,12 +507,20 @@ def parse_teacher_batch_file(
                     except ValueError:
                         pass
 
-            # 학년/반 정합성 검증 (둘 다 있거나 둘 다 없어야 함)
-            if (grade is not None and class_no is None) or (grade is None and class_no is not None):
+            # 학년/반 정합성 검증 (둘 다 있거나 둘 다 없어야 함 - 단, 학년부장은 학년만 단독 지정 허용)
+            is_grade_head_pos = position == "학년부장"
+            if not is_grade_head_pos and ((grade is not None and class_no is None) or (grade is None and class_no is not None)):
                 errors.append({
                     "row": offset,
                     "name": clean_name,
                     "reason": "담임 학년과 반은 함께 지정되어야 합니다. (비담임인 경우 둘 다 비워두세요.)",
+                })
+                continue
+            if is_grade_head_pos and grade is None:
+                errors.append({
+                    "row": offset,
+                    "name": clean_name,
+                    "reason": "학년부장은 담당 학년이 필수입니다.",
                 })
                 continue
 
@@ -484,19 +528,25 @@ def parse_teacher_batch_file(
                 if not (1 <= grade <= 3):
                     errors.append({"row": offset, "name": clean_name, "reason": f"유효하지 않은 담당 학년입니다 ({grade}). 고등학교는 1~3학년이어야 합니다."})
                     continue
-                if not (1 <= class_no <= 20):
+                if class_no is not None and not (1 <= class_no <= 20):
                     errors.append({"row": offset, "name": clean_name, "reason": f"유효하지 않은 담당 반 번호입니다 ({class_no})."})
                     continue
 
-                homeroom_key = (grade, class_no)
-                if homeroom_key in seen_homerooms:
+                # 학급이 있고 position 미지정 시 '정담임' 부여
+                if not position:
+                    position = "정담임"
+
+                homeroom_pos_key = (grade, class_no, position)
+                if homeroom_pos_key in seen_homeroom_positions:
                     errors.append({
                         "row": offset,
                         "name": clean_name,
-                        "reason": f"파일 내에 동일한 학급({grade}학년 {class_no}반) 담임이 중복 배정되었습니다.",
+                        "reason": f"파일 내에 동일한 학급({grade}학년 {class_no or '전체'}반) 담임 직책({position})이 중복 배정되었습니다.",
                     })
                     continue
-                seen_homerooms.add(homeroom_key)
+                seen_homeroom_positions.add(homeroom_pos_key)
+            elif not position:
+                position = "교과전담"
 
             # 4) 이메일
             email: Optional[str] = None
@@ -527,6 +577,8 @@ def parse_teacher_batch_file(
                 "name": name,
                 "email": email,
                 "subject": subject,
+                "position": position,
+                "department": department,
                 "grade": grade,
                 "class_no": class_no,
                 "is_homeroom": bool(grade and class_no),
