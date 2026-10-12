@@ -84,24 +84,34 @@ class PatchAreaRequest(BaseModel):
     name: Optional[str] = None
     max_score: Optional[float] = None
     maxScore: Optional[float] = None
+    subject: Optional[str] = None
+    department: Optional[str] = None
+    teacher_ids: Optional[List[int]] = None
+    teacherIds: Optional[List[int]] = None
 
 
 class CreateItemRequest(BaseModel):
     name: str
     max_score: Optional[float] = None
     maxScore: Optional[float] = None
+    subject: Optional[str] = None
+    department: Optional[str] = None
     scoring_type: Optional[int] = None
     scoringType: Optional[int] = None
     target_grade: Optional[int] = None
     targetGrade: Optional[int] = None
     requires_evidence: Optional[bool] = None
     requiresEvidence: Optional[bool] = None
+    teacher_ids: Optional[List[int]] = None
+    teacherIds: Optional[List[int]] = None
 
 
 class UpdateItemRequest(BaseModel):
     name: Optional[str] = None
     max_score: Optional[float] = None
     maxScore: Optional[float] = None
+    subject: Optional[str] = None
+    department: Optional[str] = None
     scoring_type: Optional[int] = None
     scoringType: Optional[int] = None
     target_grade: Optional[int] = None
@@ -110,6 +120,8 @@ class UpdateItemRequest(BaseModel):
     requiresEvidence: Optional[bool] = None
     is_active: Optional[bool] = None
     isActive: Optional[bool] = None
+    teacher_ids: Optional[List[int]] = None
+    teacherIds: Optional[List[int]] = None
 
 
 class BatchStudentItem(BaseModel):
@@ -137,6 +149,8 @@ class BatchTeacherItem(BaseModel):
     name: str
     email: Optional[str] = None
     subject: Optional[str] = None
+    position: Optional[str] = None
+    department: Optional[str] = None
     grade: Optional[int] = None
     class_no: Optional[int] = None
     classNo: Optional[int] = None
@@ -431,7 +445,7 @@ async def copy_year_criteria(
                 # 해당 영역의 항목 복제 (벌크 배치 최적화: SECURITY_AND_AUDIT.md 2.9)
                 await cur.execute(
                     """
-                    SELECT name, max_score, scoring_type, target_grade, requires_evidence
+                    SELECT name, department, max_score, scoring_type, target_grade, requires_evidence
                     FROM evaluation_items
                     WHERE area_id = %s AND is_active = TRUE
                     """,
@@ -444,6 +458,7 @@ async def copy_year_criteria(
                         (
                             t_area_id,
                             s_item["name"],
+                            s_item.get("department"),
                             s_item["max_score"],
                             s_item["scoring_type"],
                             s_item["target_grade"],
@@ -453,9 +468,9 @@ async def copy_year_criteria(
                     ]
                     insert_sql = """
                         INSERT INTO evaluation_items (
-                            area_id, name, max_score, scoring_type, target_grade, requires_evidence, is_active
+                            area_id, name, department, max_score, scoring_type, target_grade, requires_evidence, is_active
                         )
-                        VALUES (%s, %s, %s, %s, %s, %s, TRUE)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, TRUE)
                     """
                     if hasattr(cur, "executemany"):
                         await cur.executemany(insert_sql, items_params)
@@ -488,6 +503,9 @@ async def copy_year_criteria(
 # ==============================================================================
 
 @criteria_router.get("", summary="평가 기준 조회 (영역 및 항목) (API-03)", response_model=SrFormat)
+@criteria_router.get("/", summary="평가 기준 조회 (영역 및 항목) (API-03)", response_model=SrFormat, include_in_schema=False)
+@admin_router.get("/criteria", summary="평가 기준 조회 (영역 및 항목) (API-03) [Admin 별칭]", response_model=SrFormat)
+@admin_router.get("/criteria/", summary="평가 기준 조회 (영역 및 항목) (API-03) [Admin 별칭]", response_model=SrFormat, include_in_schema=False)
 async def get_criteria(
     year: Optional[int] = Query(None, description="조회 학년도 (미지정 시 활성/최신 학년도)"),
     conn: Any = Depends(get_db),
@@ -531,7 +549,8 @@ async def get_criteria(
         # 영역 목록 조회
         await cur.execute(
             """
-            SELECT area_id AS areaId, year_id AS yearId, grade, name, max_score AS maxScore
+            SELECT area_id AS areaId, year_id AS yearId, grade, name, max_score AS maxScore,
+                   subject, department
             FROM certification_areas
             WHERE year_id = %s
             ORDER BY grade ASC, area_id ASC
@@ -547,6 +566,38 @@ async def get_criteria(
                 data={"year": target_year, "yearId": year_id, "areas": []},
             ).model_dump()
 
+        area_ids = [(a.get("areaId") or a.get("area_id")) for a in areas]
+        placeholders = ", ".join(["%s"] * len(area_ids))
+
+        # 영역 전담 교사 N명 매핑 조회
+        area_teachers_map: Dict[int, List[Dict[str, Any]]] = {}
+        area_teacher_ids_map: Dict[int, List[int]] = {}
+        try:
+            await cur.execute(
+                f"""
+                SELECT cat.area_id, cat.teacher_id, t.name, t.subject, t.department
+                FROM certification_area_teachers cat
+                JOIN teachers t ON cat.teacher_id = t.teachers_id
+                WHERE cat.area_id IN ({placeholders}) AND t.is_deleted = FALSE
+                ORDER BY t.name ASC
+                """,
+                tuple(area_ids),
+            )
+            cat_rows = await cur.fetchall() or []
+            for r in cat_rows:
+                aid = r.get("area_id")
+                tid = r.get("teacher_id")
+                area_teacher_ids_map.setdefault(aid, []).append(tid)
+                area_teachers_map.setdefault(aid, []).append({
+                    "id": tid,
+                    "teachersId": tid,
+                    "name": r.get("name"),
+                    "subject": r.get("subject"),
+                    "department": r.get("department"),
+                })
+        except Exception:
+            pass
+
         norm_areas = []
         for a in areas:
             a_id = a.get("areaId") or a.get("area_id")
@@ -555,11 +606,12 @@ async def get_criteria(
                 "yearId": a.get("yearId") or a.get("year_id"),
                 "grade": a.get("grade"),
                 "name": a.get("name"),
+                "subject": a.get("subject"),
+                "department": a.get("department"),
                 "maxScore": float(a.get("maxScore") if a.get("maxScore") is not None else a.get("max_score", 0.0)),
+                "teacherIds": area_teacher_ids_map.get(a_id, []),
+                "assignedTeachers": area_teachers_map.get(a_id, []),
             })
-
-        area_ids = [a["areaId"] for a in norm_areas]
-        placeholders = ", ".join(["%s"] * len(area_ids))
 
         await cur.execute(
             f"""
@@ -567,6 +619,8 @@ async def get_criteria(
                 item_id AS itemId,
                 area_id AS areaId,
                 name,
+                subject,
+                department,
                 max_score AS maxScore,
                 scoring_type AS scoringType,
                 target_grade AS targetGrade,
@@ -578,20 +632,57 @@ async def get_criteria(
             """,
             tuple(area_ids),
         )
-        items = await cur.fetchall()
+        items = await cur.fetchall() or []
+
+        # 항목 전담 교사 N명 매핑 조회
+        item_teachers_map: Dict[int, List[Dict[str, Any]]] = {}
+        item_teacher_ids_map: Dict[int, List[int]] = {}
+        if items:
+            item_ids = [(it.get("itemId") or it.get("item_id")) for it in items]
+            it_placeholders = ", ".join(["%s"] * len(item_ids))
+            try:
+                await cur.execute(
+                    f"""
+                    SELECT eit.item_id, eit.teacher_id, t.name, t.subject, t.department
+                    FROM evaluation_item_teachers eit
+                    JOIN teachers t ON eit.teacher_id = t.teachers_id
+                    WHERE eit.item_id IN ({it_placeholders}) AND t.is_deleted = FALSE
+                    ORDER BY t.name ASC
+                    """,
+                    tuple(item_ids),
+                )
+                eit_rows = await cur.fetchall() or []
+                for r in eit_rows:
+                    iid = r.get("item_id")
+                    tid = r.get("teacher_id")
+                    item_teacher_ids_map.setdefault(iid, []).append(tid)
+                    item_teachers_map.setdefault(iid, []).append({
+                        "id": tid,
+                        "teachersId": tid,
+                        "name": r.get("name"),
+                        "subject": r.get("subject"),
+                        "department": r.get("department"),
+                    })
+            except Exception:
+                pass
 
     items_by_area: Dict[int, List[Dict[str, Any]]] = {}
     for it in items:
         it_area_id = it.get("areaId") or it.get("area_id")
+        it_id = it.get("itemId") or it.get("item_id")
         norm_it = {
-            "itemId": it.get("itemId") or it.get("item_id"),
+            "itemId": it_id,
             "areaId": it_area_id,
             "name": it.get("name"),
+            "subject": it.get("subject"),
+            "department": it.get("department"),
             "maxScore": float(it.get("maxScore") if it.get("maxScore") is not None else it.get("max_score", 0.0)),
             "scoringType": it.get("scoringType") or it.get("scoring_type"),
             "targetGrade": it.get("targetGrade") or it.get("target_grade"),
             "requiresEvidence": bool(it.get("requiresEvidence") if "requiresEvidence" in it else it.get("requires_evidence", False)),
             "isActive": bool(it.get("isActive") if "isActive" in it else it.get("is_active", True)),
+            "teacherIds": item_teacher_ids_map.get(it_id, []),
+            "assignedTeachers": item_teachers_map.get(it_id, []),
         }
         items_by_area.setdefault(it_area_id, []).append(norm_it)
 
@@ -606,6 +697,7 @@ async def get_criteria(
 
 
 @criteria_router.patch("/areas/{area_id}", summary="평가 영역 배점/정보 수정 (API-03)", response_model=SrFormat)
+@admin_router.patch("/criteria/areas/{area_id}", summary="평가 영역 배점/정보 수정 (API-03) [Admin 별칭]", response_model=SrFormat)
 async def patch_criteria_area(
     area_id: int,
     req: PatchAreaRequest,
@@ -629,7 +721,7 @@ async def patch_criteria_area(
         )
 
     async with conn.cursor(cursor=DictCursor) as cur:
-        await cur.execute("SELECT area_id, name, max_score FROM certification_areas WHERE area_id = %s LIMIT 1", (area_id,))
+        await cur.execute("SELECT area_id, name, max_score, subject, department FROM certification_areas WHERE area_id = %s LIMIT 1", (area_id,))
         existing = await cur.fetchone()
         if not existing:
             return JSONResponse(
@@ -668,21 +760,119 @@ async def patch_criteria_area(
         else:
             updated_name = existing["name"]
 
+        if req.subject is not None:
+            raw_subj = req.subject.strip()
+            if raw_subj and len(raw_subj) > 40:
+                return JSONResponse(
+                    status_code=400,
+                    content=SrFormat(
+                        status_code=400,
+                        success=False,
+                        data=None,
+                        error=Error(code="VALIDATION_ERROR", message="담당 교과명은 최대 40자까지 가능합니다."),
+                    ).model_dump(),
+                )
+            updated_subject = html.escape(raw_subj) if raw_subj else None
+        else:
+            updated_subject = existing.get("subject")
+
+        if req.department is not None:
+            raw_dept = req.department.strip()
+            if raw_dept and len(raw_dept) > 40:
+                return JSONResponse(
+                    status_code=400,
+                    content=SrFormat(
+                        status_code=400,
+                        success=False,
+                        data=None,
+                        error=Error(code="VALIDATION_ERROR", message="담당 부서명은 최대 40자까지 가능합니다."),
+                    ).model_dump(),
+                )
+            updated_department = html.escape(raw_dept) if raw_dept else None
+        else:
+            updated_department = existing.get("department")
+
         updated_score = new_score if new_score is not None else float(existing["max_score"])
 
-        await cur.execute(
-            "UPDATE certification_areas SET name = %s, max_score = %s WHERE area_id = %s",
-            (updated_name, updated_score, area_id),
-        )
+        try:
+            await cur.execute(
+                "UPDATE certification_areas SET name = %s, max_score = %s, subject = %s, department = %s WHERE area_id = %s",
+                (updated_name, updated_score, updated_subject, updated_department, area_id),
+            )
+        except Exception:
+            await cur.execute(
+                "UPDATE certification_areas SET name = %s, max_score = %s WHERE area_id = %s",
+                (updated_name, updated_score, area_id),
+            )
+
+        tids = req.teacher_ids if req.teacher_ids is not None else req.teacherIds
+        if tids is not None:
+            try:
+                await cur.execute("DELETE FROM certification_area_teachers WHERE area_id = %s", (area_id,))
+                clean_tids = [tid for tid in set(tids) if isinstance(tid, int) and tid > 0]
+                if clean_tids:
+                    placeholders_t = ", ".join(["%s"] * len(clean_tids))
+                    await cur.execute(
+                        f"SELECT teachers_id FROM teachers WHERE teachers_id IN ({placeholders_t}) AND is_deleted = FALSE",
+                        tuple(clean_tids),
+                    )
+                    valid_rows = await cur.fetchall() or []
+                    valid_tids = [
+                        (r[0] if isinstance(r, (list, tuple)) else r.get("teachers_id"))
+                        for r in valid_rows
+                    ]
+                    for tid in valid_tids:
+                        await cur.execute(
+                            "INSERT INTO certification_area_teachers (area_id, teacher_id) VALUES (%s, %s)",
+                            (area_id, tid),
+                        )
+            except Exception:
+                pass
+
+        assigned_teachers = []
+        assigned_teacher_ids = []
+        try:
+            await cur.execute(
+                """
+                SELECT cat.teacher_id, t.name, t.subject, t.department
+                FROM certification_area_teachers cat
+                JOIN teachers t ON cat.teacher_id = t.teachers_id
+                WHERE cat.area_id = %s AND t.is_deleted = FALSE
+                ORDER BY t.name ASC
+                """,
+                (area_id,),
+            )
+            cat_rows = await cur.fetchall() or []
+            for r in cat_rows:
+                tid = r.get("teacher_id")
+                assigned_teacher_ids.append(tid)
+                assigned_teachers.append({
+                    "id": tid,
+                    "teachersId": tid,
+                    "name": r.get("name"),
+                    "subject": r.get("subject"),
+                    "department": r.get("department"),
+                })
+        except Exception:
+            pass
 
     return SrFormat(
         status_code=200,
         success=True,
-        data={"areaId": area_id, "name": updated_name, "maxScore": updated_score},
+        data={
+            "areaId": area_id,
+            "name": updated_name,
+            "maxScore": updated_score,
+            "subject": updated_subject,
+            "department": updated_department,
+            "teacherIds": assigned_teacher_ids,
+            "assignedTeachers": assigned_teachers,
+        },
     ).model_dump()
 
 
 @criteria_router.post("/areas/{area_id}/items", summary="평가 항목 추가 (API-03)", response_model=SrFormat)
+@admin_router.post("/criteria/areas/{area_id}/items", summary="평가 항목 추가 (API-03) [Admin 별칭]", response_model=SrFormat)
 async def create_criteria_item(
     area_id: int,
     req: CreateItemRequest,
@@ -753,6 +943,32 @@ async def create_criteria_item(
             ).model_dump(),
         )
 
+    raw_subj = (req.subject or "").strip() if req.subject is not None else None
+    if raw_subj and len(raw_subj) > 40:
+        return JSONResponse(
+            status_code=400,
+            content=SrFormat(
+                status_code=400,
+                success=False,
+                data=None,
+                error=Error(code="VALIDATION_ERROR", message="담당 교과명은 최대 40자까지 가능합니다."),
+            ).model_dump(),
+        )
+    clean_subj = html.escape(raw_subj) if raw_subj else None
+
+    raw_dept = (req.department or "").strip() if req.department is not None else None
+    if raw_dept and len(raw_dept) > 40:
+        return JSONResponse(
+            status_code=400,
+            content=SrFormat(
+                status_code=400,
+                success=False,
+                data=None,
+                error=Error(code="VALIDATION_ERROR", message="담당 부서명은 최대 40자까지 가능합니다."),
+            ).model_dump(),
+        )
+    clean_dept = html.escape(raw_dept) if raw_dept else None
+
     async with conn.cursor(cursor=DictCursor) as cur:
         await cur.execute("SELECT area_id FROM certification_areas WHERE area_id = %s LIMIT 1", (area_id,))
         if not await cur.fetchone():
@@ -766,18 +982,79 @@ async def create_criteria_item(
                 ).model_dump(),
             )
 
-        await cur.execute(
-            """
-            INSERT INTO evaluation_items (
-                area_id, name, max_score, scoring_type, target_grade, requires_evidence, is_active
+        try:
+            await cur.execute(
+                """
+                INSERT INTO evaluation_items (
+                    area_id, name, subject, department, max_score, scoring_type, target_grade, requires_evidence, is_active
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, TRUE)
+                """,
+                (area_id, clean_name, clean_subj, clean_dept, max_score, scoring_type, target_grade, requires_ev),
             )
-            VALUES (%s, %s, %s, %s, %s, %s, TRUE)
-            """,
-            (area_id, clean_name, max_score, scoring_type, target_grade, requires_ev),
-        )
+        except Exception:
+            await cur.execute(
+                """
+                INSERT INTO evaluation_items (
+                    area_id, name, department, max_score, scoring_type, target_grade, requires_evidence, is_active
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, TRUE)
+                """,
+                (area_id, clean_name, clean_dept, max_score, scoring_type, target_grade, requires_ev),
+            )
         await cur.execute("SELECT LAST_INSERT_ID() AS last_id")
         last_row = await cur.fetchone()
         item_id = last_row[0] if isinstance(last_row, (list, tuple)) else last_row["last_id"]
+
+        tids = req.teacher_ids if req.teacher_ids is not None else req.teacherIds
+        if tids:
+            clean_tids = [tid for tid in set(tids) if isinstance(tid, int) and tid > 0]
+            if clean_tids:
+                try:
+                    placeholders_t = ", ".join(["%s"] * len(clean_tids))
+                    await cur.execute(
+                        f"SELECT teachers_id FROM teachers WHERE teachers_id IN ({placeholders_t}) AND is_deleted = FALSE",
+                        tuple(clean_tids),
+                    )
+                    valid_rows = await cur.fetchall() or []
+                    valid_tids = [
+                        (r[0] if isinstance(r, (list, tuple)) else r.get("teachers_id"))
+                        for r in valid_rows
+                    ]
+                    for tid in valid_tids:
+                        await cur.execute(
+                            "INSERT INTO evaluation_item_teachers (item_id, teacher_id) VALUES (%s, %s)",
+                            (item_id, tid),
+                        )
+                except Exception:
+                    pass
+
+        assigned_teachers = []
+        assigned_teacher_ids = []
+        try:
+            await cur.execute(
+                """
+                SELECT eit.teacher_id, t.name, t.subject, t.department
+                FROM evaluation_item_teachers eit
+                JOIN teachers t ON eit.teacher_id = t.teachers_id
+                WHERE eit.item_id = %s AND t.is_deleted = FALSE
+                ORDER BY t.name ASC
+                """,
+                (item_id,),
+            )
+            eit_rows = await cur.fetchall() or []
+            for r in eit_rows:
+                tid = r.get("teacher_id")
+                assigned_teacher_ids.append(tid)
+                assigned_teachers.append({
+                    "id": tid,
+                    "teachersId": tid,
+                    "name": r.get("name"),
+                    "subject": r.get("subject"),
+                    "department": r.get("department"),
+                })
+        except Exception:
+            pass
 
     return JSONResponse(
         status_code=201,
@@ -788,16 +1065,21 @@ async def create_criteria_item(
                 "itemId": item_id,
                 "areaId": area_id,
                 "name": clean_name,
+                "subject": clean_subj,
+                "department": clean_dept,
                 "maxScore": max_score,
                 "scoringType": scoring_type,
                 "targetGrade": target_grade,
                 "requiresEvidence": requires_ev,
+                "teacherIds": assigned_teacher_ids,
+                "assignedTeachers": assigned_teachers,
             },
         ).model_dump(),
     )
 
 
 @criteria_router.patch("/items/{item_id}", summary="평가 항목 수정 (API-03)", response_model=SrFormat)
+@admin_router.patch("/criteria/items/{item_id}", summary="평가 항목 수정 (API-03) [Admin 별칭]", response_model=SrFormat)
 async def update_criteria_item(
     item_id: int,
     req: UpdateItemRequest,
@@ -822,7 +1104,7 @@ async def update_criteria_item(
                 ).model_dump(),
             )
 
-        new_max_score = req.max_score if req.max_score is not None else (req.maxScore if req.maxScore is not None else float(existing["max_score"]))
+        new_max_score = req.max_score if req.max_score is not None else (req.maxScore if req.maxScore is not None else float(existing.get("max_score", existing.get("maxScore", 10.0))))
         if new_max_score <= 0 or new_max_score > 1000:
             return JSONResponse(
                 status_code=400,
@@ -868,10 +1150,42 @@ async def update_criteria_item(
                     ).model_dump(),
                 )
         else:
-            new_name = existing["name"]
+            new_name = existing.get("name", "")
 
-        new_type = req.scoring_type if req.scoring_type is not None else (req.scoringType if req.scoringType is not None else existing["scoring_type"])
-        new_grade = req.target_grade if req.target_grade is not None else (req.targetGrade if req.targetGrade is not None else existing["target_grade"])
+        if req.subject is not None:
+            raw_subj = req.subject.strip()
+            if raw_subj and len(raw_subj) > 40:
+                return JSONResponse(
+                    status_code=400,
+                    content=SrFormat(
+                        status_code=400,
+                        success=False,
+                        data=None,
+                        error=Error(code="VALIDATION_ERROR", message="담당 교과명은 최대 40자까지 가능합니다."),
+                    ).model_dump(),
+                )
+            new_subj = html.escape(raw_subj) if raw_subj else None
+        else:
+            new_subj = existing.get("subject")
+
+        if req.department is not None:
+            raw_dept = req.department.strip()
+            if raw_dept and len(raw_dept) > 40:
+                return JSONResponse(
+                    status_code=400,
+                    content=SrFormat(
+                        status_code=400,
+                        success=False,
+                        data=None,
+                        error=Error(code="VALIDATION_ERROR", message="담당 부서명은 최대 40자까지 가능합니다."),
+                    ).model_dump(),
+                )
+            new_dept = html.escape(raw_dept) if raw_dept else None
+        else:
+            new_dept = existing.get("department")
+
+        new_type = req.scoring_type if req.scoring_type is not None else (req.scoringType if req.scoringType is not None else existing.get("scoring_type", existing.get("scoringType", 1)))
+        new_grade = req.target_grade if req.target_grade is not None else (req.targetGrade if req.targetGrade is not None else existing.get("target_grade", existing.get("targetGrade", 0)))
         if new_grade is not None and new_grade not in (0, 1, 2, 3):
             return JSONResponse(
                 status_code=400,
@@ -882,22 +1196,91 @@ async def update_criteria_item(
                     error=Error(code="VALIDATION_ERROR", message="대상 학년은 0(전학년), 1, 2, 3 중 하나여야 합니다."),
                 ).model_dump(),
             )
-        new_req_ev = req.requires_evidence if req.requires_evidence is not None else (req.requiresEvidence if req.requiresEvidence is not None else existing["requires_evidence"])
-        new_active = req.is_active if req.is_active is not None else (req.isActive if req.isActive is not None else existing["is_active"])
+        new_req_ev = req.requires_evidence if req.requires_evidence is not None else (req.requiresEvidence if req.requiresEvidence is not None else existing.get("requires_evidence", existing.get("requiresEvidence", True)))
+        new_active = req.is_active if req.is_active is not None else (req.isActive if req.isActive is not None else existing.get("is_active", existing.get("isActive", True)))
 
-        await cur.execute(
-            """
-            UPDATE evaluation_items
-            SET name = %s,
-                max_score = %s,
-                scoring_type = %s,
-                target_grade = %s,
-                requires_evidence = %s,
-                is_active = %s
-            WHERE item_id = %s
-            """,
-            (new_name, new_max_score, new_type, new_grade, new_req_ev, new_active, item_id),
-        )
+        try:
+            await cur.execute(
+                """
+                UPDATE evaluation_items
+                SET name = %s,
+                    subject = %s,
+                    department = %s,
+                    max_score = %s,
+                    scoring_type = %s,
+                    target_grade = %s,
+                    requires_evidence = %s,
+                    is_active = %s
+                WHERE item_id = %s
+                """,
+                (new_name, new_subj, new_dept, new_max_score, new_type, new_grade, new_req_ev, new_active, item_id),
+            )
+        except Exception:
+            await cur.execute(
+                """
+                UPDATE evaluation_items
+                SET name = %s,
+                    department = %s,
+                    max_score = %s,
+                    scoring_type = %s,
+                    target_grade = %s,
+                    requires_evidence = %s,
+                    is_active = %s
+                WHERE item_id = %s
+                """,
+                (new_name, new_dept, new_max_score, new_type, new_grade, new_req_ev, new_active, item_id),
+            )
+
+        tids = req.teacher_ids if req.teacher_ids is not None else req.teacherIds
+        if tids is not None:
+            try:
+                await cur.execute("DELETE FROM evaluation_item_teachers WHERE item_id = %s", (item_id,))
+                clean_tids = [tid for tid in set(tids) if isinstance(tid, int) and tid > 0]
+                if clean_tids:
+                    placeholders_t = ", ".join(["%s"] * len(clean_tids))
+                    await cur.execute(
+                        f"SELECT teachers_id FROM teachers WHERE teachers_id IN ({placeholders_t}) AND is_deleted = FALSE",
+                        tuple(clean_tids),
+                    )
+                    valid_rows = await cur.fetchall() or []
+                    valid_tids = [
+                        (r[0] if isinstance(r, (list, tuple)) else r.get("teachers_id"))
+                        for r in valid_rows
+                    ]
+                    for tid in valid_tids:
+                        await cur.execute(
+                            "INSERT INTO evaluation_item_teachers (item_id, teacher_id) VALUES (%s, %s)",
+                            (item_id, tid),
+                        )
+            except Exception:
+                pass
+
+        assigned_teachers = []
+        assigned_teacher_ids = []
+        try:
+            await cur.execute(
+                """
+                SELECT eit.teacher_id, t.name, t.subject, t.department
+                FROM evaluation_item_teachers eit
+                JOIN teachers t ON eit.teacher_id = t.teachers_id
+                WHERE eit.item_id = %s AND t.is_deleted = FALSE
+                ORDER BY t.name ASC
+                """,
+                (item_id,),
+            )
+            eit_rows = await cur.fetchall() or []
+            for r in eit_rows:
+                tid = r.get("teacher_id")
+                assigned_teacher_ids.append(tid)
+                assigned_teachers.append({
+                    "id": tid,
+                    "teachersId": tid,
+                    "name": r.get("name"),
+                    "subject": r.get("subject"),
+                    "department": r.get("department"),
+                })
+        except Exception:
+            pass
 
     return SrFormat(
         status_code=200,
@@ -905,16 +1288,21 @@ async def update_criteria_item(
         data={
             "itemId": item_id,
             "name": new_name,
+            "subject": new_subj,
+            "department": new_dept,
             "maxScore": new_max_score,
             "scoringType": new_type,
             "targetGrade": new_grade,
             "requiresEvidence": bool(new_req_ev),
             "isActive": bool(new_active),
+            "teacherIds": assigned_teacher_ids,
+            "assignedTeachers": assigned_teachers,
         },
     ).model_dump()
 
 
 @criteria_router.delete("/items/{item_id}", summary="평가 항목 삭제 (소프트 삭제) (API-03)", response_model=SrFormat)
+@admin_router.delete("/criteria/items/{item_id}", summary="평가 항목 삭제 (소프트 삭제) (API-03) [Admin 별칭]", response_model=SrFormat)
 async def delete_criteria_item(
     item_id: int,
     conn: Any = Depends(get_db),
@@ -1375,6 +1763,20 @@ async def batch_register_students(
         await conn.autocommit(False)
         async with conn.cursor(cursor=DictCursor) as cur:
             for st in final_to_insert:
+                # [보안 1.24] 교사 명단(teachers)에 이미 등록된 이메일인지 교차 검증 (Role Confusion 방지)
+                await cur.execute(
+                    "SELECT teachers_id FROM teachers WHERE email = %s AND is_deleted = FALSE LIMIT 1",
+                    (st["email"],),
+                )
+                if await cur.fetchone():
+                    parsing_errors.append({
+                        "row": st.get("row_number", 0),
+                        "name": st["name"],
+                        "reason": f"교사 명단에 이미 등록된 이메일({st['email']})이므로 학생으로 등록할 수 없습니다.",
+                    })
+                    skipped_count += 1
+                    continue
+
                 # 1) students 테이블 조회/생성
                 await cur.execute(
                     "SELECT student_id, name, is_deleted FROM students WHERE email = %s LIMIT 1",
@@ -1568,7 +1970,7 @@ async def batch_register_teachers(
             from core.excel_parser import EMAIL_REGEX
 
             seen_emails = set()
-            seen_homerooms = set()
+            seen_homeroom_positions = set()
 
             for idx, item in enumerate(raw_teachers, start=1):
                 clean_name = sanitize_text(item.get("name"))
@@ -1590,7 +1992,28 @@ async def batch_register_teachers(
                         continue
                     subject = html.escape(clean_subj)
 
-                # 학년/반 (담임)
+                # 직책 및 부서
+                position = None
+                raw_pos = item.get("position")
+                if raw_pos:
+                    clean_pos = sanitize_text(raw_pos)
+                    if clean_pos:
+                        if len(clean_pos) > 30:
+                            parsing_errors.append({"row": idx, "name": clean_name, "reason": "직책명은 30자를 초과할 수 없습니다."})
+                            continue
+                        position = html.escape(clean_pos)
+
+                department = None
+                raw_dept = item.get("department")
+                if raw_dept:
+                    clean_dept = sanitize_text(raw_dept)
+                    if clean_dept:
+                        if len(clean_dept) > 40:
+                            parsing_errors.append({"row": idx, "name": clean_name, "reason": "부서명은 40자를 초과할 수 없습니다."})
+                            continue
+                        department = html.escape(clean_dept)
+
+                # 학년/반 (담임 및 학년부장)
                 grade = item.get("grade")
                 class_no = item.get("class_no") if item.get("class_no") is not None else item.get("classNo")
 
@@ -1599,11 +2022,19 @@ async def batch_register_teachers(
                     if g and c:
                         grade, class_no = g, c
 
-                if (grade is not None and class_no is None) or (grade is None and class_no is not None):
+                is_grade_head_pos = position == "학년부장"
+                if not is_grade_head_pos and ((grade is not None and class_no is None) or (grade is None and class_no is not None)):
                     parsing_errors.append({
                         "row": idx,
                         "name": clean_name,
                         "reason": "담임 학년과 반은 함께 지정되어야 합니다. (비담임인 경우 둘 다 비워두세요.)",
+                    })
+                    continue
+                if is_grade_head_pos and grade is None:
+                    parsing_errors.append({
+                        "row": idx,
+                        "name": clean_name,
+                        "reason": "학년부장은 담당 학년이 필수입니다.",
                     })
                     continue
 
@@ -1611,19 +2042,24 @@ async def batch_register_teachers(
                     if not (1 <= grade <= 3):
                         parsing_errors.append({"row": idx, "name": clean_name, "reason": f"유효하지 않은 담당 학년입니다 ({grade})."})
                         continue
-                    if not (1 <= class_no <= 20):
+                    if class_no is not None and not (1 <= class_no <= 20):
                         parsing_errors.append({"row": idx, "name": clean_name, "reason": f"유효하지 않은 담당 반입니다 ({class_no})."})
                         continue
 
-                    homeroom_key = (grade, class_no)
-                    if homeroom_key in seen_homerooms:
+                    if not position:
+                        position = "정담임"
+
+                    homeroom_pos_key = (grade, class_no, position)
+                    if homeroom_pos_key in seen_homeroom_positions:
                         parsing_errors.append({
                             "row": idx,
                             "name": clean_name,
-                            "reason": f"중복된 담임 학급 배정 ({grade}학년 {class_no}반)",
+                            "reason": f"중복된 담임 학급 배정 ({grade}학년 {class_no or '전체'}반 {position})",
                         })
                         continue
-                    seen_homerooms.add(homeroom_key)
+                    seen_homeroom_positions.add(homeroom_pos_key)
+                elif not position:
+                    position = "교과전담"
 
                 # 이메일
                 email = (item.get("email") or "").strip().lower()
@@ -1648,6 +2084,8 @@ async def batch_register_teachers(
                     "name": name,
                     "email": email,
                     "subject": subject,
+                    "position": position,
+                    "department": department,
                     "grade": grade,
                     "class_no": class_no,
                     "is_homeroom": bool(grade and class_no),
@@ -1718,6 +2156,20 @@ async def batch_register_teachers(
         await conn.autocommit(False)
         async with conn.cursor(cursor=DictCursor) as cur:
             for t in final_to_insert:
+                # [보안 1.24] 학생 명단(students)에 이미 등록된 이메일인지 교차 검증 (Role Confusion 방지)
+                await cur.execute(
+                    "SELECT student_id FROM students WHERE email = %s AND is_deleted = FALSE LIMIT 1",
+                    (t["email"],),
+                )
+                if await cur.fetchone():
+                    parsing_errors.append({
+                        "row": t.get("row_number", 0),
+                        "name": t["name"],
+                        "reason": f"학생 명단에 이미 등록된 이메일({t['email']})이므로 교사로 등록할 수 없습니다.",
+                    })
+                    skipped_count += 1
+                    continue
+
                 await cur.execute(
                     "SELECT teachers_id, name, subject, grade, class, is_deleted FROM teachers WHERE email = %s LIMIT 1",
                     (t["email"],),
@@ -1732,12 +2184,14 @@ async def batch_register_teachers(
                             UPDATE teachers
                             SET name = %s,
                                 subject = %s,
+                                position = %s,
+                                department = %s,
                                 grade = %s,
                                 class = %s,
                                 is_deleted = FALSE
                             WHERE teachers_id = %s
                             """,
-                            (t["name"], t["subject"], t["grade"], t["class_no"], teachers_id),
+                            (t["name"], t["subject"], t.get("position", "교과전담"), t.get("department"), t["grade"], t["class_no"], teachers_id),
                         )
                         updated_count += 1
                     else:
@@ -1745,10 +2199,10 @@ async def batch_register_teachers(
                 else:
                     await cur.execute(
                         """
-                        INSERT INTO teachers (name, subject, grade, class, email, is_deleted)
-                        VALUES (%s, %s, %s, %s, %s, FALSE)
+                        INSERT INTO teachers (name, subject, position, department, grade, class, email, is_deleted)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, FALSE)
                         """,
-                        (t["name"], t["subject"], t["grade"], t["class_no"], t["email"]),
+                        (t["name"], t["subject"], t.get("position", "교과전담"), t.get("department"), t["grade"], t["class_no"], t["email"]),
                     )
                     created_count += 1
 
@@ -2128,13 +2582,21 @@ async def get_system_audit_logs(
 # 4.9 교내 통계 데이터 엑셀/CSV/PDF 내보내기 API (GET /api/admin/export/stats)
 # ------------------------------------------------------------------------------
 
+def _sanitize_spreadsheet_cell(val: Any) -> Any:
+    """XLSX 및 CSV 셀 수식 인젝션(Formula Injection) 방어: 선행 공백/탭 뒤 수식 기호 포함"""
+    if val is None or isinstance(val, (int, float, bool)):
+        return val
+    s = str(val)
+    if s.lstrip(" \t\r\n").startswith(("=", "+", "-", "@", "|")) or s.startswith(("\t", "\r")):
+        return f"'{s}"
+    return s
+
+
 def _escape_csv_val(val: Any) -> str:
     """CSV 셀 내 따옴표, 콤마 및 수식 인젝션 방어용 이스케이프"""
     if val is None:
         return ""
-    s = str(val).replace('"', '""')
-    if s.startswith(("=", "+", "-", "@")):
-        s = f"'{s}"
+    s = str(_sanitize_spreadsheet_cell(val)).replace('"', '""')
     if any(c in s for c in (",", '"', "\n", "\r")):
         return f'"{s}"'
     return s
@@ -2274,12 +2736,16 @@ async def export_school_stats(
         )
         all_submissions = await cur.fetchall() or []
 
+        start_date_str = f"{target_year}-03-01"
+        end_date_str = f"{target_year + 1}-03-01"
         await cur.execute(
             """
-            SELECT merits_point_id, student_id, points, related_area
+            SELECT merits_point_id, student_id, type, points, related_area
             FROM merits
             WHERE is_reflected = TRUE AND is_deleted = FALSE
+              AND (occurred_at IS NULL OR (occurred_at >= %s AND occurred_at < %s))
             """,
+            (start_date_str, end_date_str),
         )
         all_merits = await cur.fetchall() or []
 
@@ -2326,7 +2792,7 @@ async def export_school_stats(
             "total_score": calc.get("totalScore", 0.0),
             "cert_status": cert_status,
             "pending_count": calc.get("pendingCount", 0),
-            "point_total": calc.get("pointTotal", 0.0),
+            "point_total": calc.get("totalMeritScore", calc.get("pointTotal", 0.0)),
             "area_scores": area_score_map,
         })
 
@@ -2385,7 +2851,7 @@ async def export_school_stats(
         ws_students.title = "학생별 인증 결과"
 
         headers = ["학번", "학년", "반", "번호", "이름", "이메일", "취득총점", "인증상태", "상벌점합계", "검토대기건수"] + area_names
-        ws_students.append(headers)
+        ws_students.append([_sanitize_spreadsheet_cell(h) for h in headers])
 
         for sr in student_results:
             row = [
@@ -2402,7 +2868,7 @@ async def export_school_stats(
             ]
             for aname in area_names:
                 row.append(sr["area_scores"].get(aname, 0.0))
-            ws_students.append(row)
+            ws_students.append([_sanitize_spreadsheet_cell(v) for v in row])
 
         # Sheet 2: 통계 요약 및 막대 차트
         ws_stats = wb.create_sheet("통계 요약 및 차트")
