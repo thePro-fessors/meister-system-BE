@@ -333,11 +333,11 @@ async def get_uploaded_file(
                 ).model_dump(),
             )
     else:
-        auth_error = await authorize_student_access(
+        from core.authorization import authorize_submission_access
+        auth_error = await authorize_submission_access(
             actor={"uuid": user_uuid, "role": user_role},
-            student_id=sub_row["student_id"],
+            submission_id=sub_row["submission_id"],
             conn=conn,
-            year=sub_row.get("year"),
             action="read",
         )
         if auth_error:
@@ -412,11 +412,11 @@ async def issue_download_ticket(
                 ).model_dump(),
             )
     else:
-        auth_error = await authorize_student_access(
+        from core.authorization import authorize_submission_access
+        auth_error = await authorize_submission_access(
             actor=current_user,
-            student_id=sub_row["student_id"],
+            submission_id=sub_row["submission_id"],
             conn=conn,
-            year=sub_row.get("year"),
             action="read",
         )
         if auth_error:

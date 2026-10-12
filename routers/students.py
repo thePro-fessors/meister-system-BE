@@ -634,7 +634,8 @@ async def handle_submit_evidence(
                 ).model_dump(),
             )
 
-        if not eval_item["is_active"]:
+        is_item_active = eval_item.get("is_active") in (1, True, "1")
+        if not is_item_active:
             return JSONResponse(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 content=SrFormat(
@@ -648,8 +649,9 @@ async def handle_submit_evidence(
                 ).model_dump(),
             )
 
-        # DATA-04: 신규 제출은 활성화된 학년도에만 허용
-        if eval_item.get("year_is_activated") is False:
+        # DATA-04: 신규 제출은 활성화된 학년도에만 허용 (0, False, NULL, 누락값 모두 거부)
+        is_year_active = eval_item.get("year_is_activated") in (1, True, "1")
+        if not is_year_active:
             return JSONResponse(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 content=SrFormat(

@@ -552,9 +552,28 @@ async def delete_submission(
         await conn.autocommit(False)
         async with conn.cursor() as cur:
             await cur.execute(
-                "UPDATE submissions SET is_deleted = TRUE, updated_at = NOW() WHERE submission_id = %s",
+                """
+                UPDATE submissions 
+                SET is_deleted = TRUE, updated_at = NOW() 
+                WHERE submission_id = %s 
+                  AND status_code != 3 
+                  AND is_deleted = FALSE
+                """,
                 (submission_id,),
             )
+            row_cnt = getattr(cur, "rowcount", 1)
+            if row_cnt == 0:
+                await conn.rollback()
+                return JSONResponse(
+                    status_code=409,
+                    content=SrFormat(
+                        status_code=409,
+                        success=False,
+                        data=None,
+                        error=Error(code="CONFLICT", message="이미 승인 처리되었거나 삭제된 증빙자료는 삭제할 수 없습니다."),
+                    ).model_dump(),
+                )
+
             await cur.execute(
                 """
                 INSERT INTO submissions_logs (
@@ -866,7 +885,7 @@ async def approve_submission(
                     reviewed_at = NOW(),
                     teacher_comment = %s,
                     updated_at = NOW()
-                WHERE submission_id = %s AND status_code IN (1, 2)
+                WHERE submission_id = %s AND status_code IN (1, 2) AND is_deleted = FALSE
                 """,
                 (score, reviewer_id, comment, submission_id),
             )
@@ -1044,7 +1063,7 @@ async def reject_submission(
                     reviewed_at = NOW(),
                     teacher_comment = %s,
                     updated_at = NOW()
-                WHERE submission_id = %s AND status_code IN (1, 2)
+                WHERE submission_id = %s AND status_code IN (1, 2) AND is_deleted = FALSE
                 """,
                 (target_status, reviewer_id, comment, submission_id),
             )
@@ -1238,7 +1257,7 @@ async def modify_submission_score(
                     reviewer_id = COALESCE(%s, reviewer_id),
                     reviewed_at = NOW(),
                     updated_at = NOW()
-                WHERE submission_id = %s AND status_code = 3
+                WHERE submission_id = %s AND status_code = 3 AND is_deleted = FALSE
                 """,
                 (score, comment, reviewer_id, submission_id),
             )

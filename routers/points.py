@@ -77,6 +77,7 @@ class CreatePointRequest(BaseModel):
 
 class UpdatePointRequest(BaseModel):
     points: Optional[float] = None
+    score: Optional[float] = None
     reason: Optional[str] = None
     type: Optional[str] = None
     occurred_at: Optional[str] = None
@@ -309,8 +310,10 @@ async def update_point(
         elif t_clean in ("DEMERIT", "-", "벌점"):
             new_type = "-"
 
-    if req.points is not None:
-        if req.points <= 0 or req.points > 100:
+    input_points = req.points if req.points is not None else req.score
+    if input_points is not None:
+        abs_pts = abs(input_points)
+        if abs_pts <= 0 or abs_pts > 100:
             return JSONResponse(
                 status_code=400,
                 content=SrFormat(
@@ -320,10 +323,16 @@ async def update_point(
                     error=Error(code="VALIDATION_ERROR", message="상벌점 점수는 0 초과 100 이하의 숫자여야 합니다."),
                 ).model_dump(),
             )
+        # FE가 score에 부호를 명시하여 전송한 경우 자동 타입 보정
+        if req.score is not None and req.type is None:
+            if req.score < 0:
+                new_type = "-"
+            elif req.score > 0:
+                new_type = "+"
         if new_type == "+":
-            new_points = abs(req.points)
+            new_points = abs_pts
         else:
-            new_points = -abs(req.points)
+            new_points = -abs_pts
     else:
         new_points = old_points
 

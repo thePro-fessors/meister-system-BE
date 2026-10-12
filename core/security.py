@@ -194,38 +194,96 @@ async def verify_and_consume_download_ticket(
 ) -> Optional[Dict[str, Any]]:
     """
     일회용 다운로드 티켓을 검증하고 파일 경로 일치 시 즉시 소비(Single-use 원자적 삭제)합니다.
+    (H. P2: Redis Lua 스크립트 또는 원자적 소비를 통해 동시 요청 시 2회 성공 Race Condition 원천 차단)
     """
     if not ticket_id or not redis:
         return None
 
     ticket_key = f"download_ticket:{ticket_id}"
-    raw_data = await redis.get(ticket_key)
-    if not raw_data:
-        return None
-
-    try:
-        data = json.loads(raw_data)
-    except Exception:
-        await redis.delete(ticket_key)
-        return None
-
-    expected_path = data.get("file_path", "").strip().lstrip("/\\")
     req_path = requested_file_path.strip().lstrip("/\\")
-    if expected_path.startswith("uploads/"):
-        expected_path = expected_path[8:]
     if req_path.startswith("uploads/"):
         req_path = req_path[8:]
-
-    expected_path = os.path.normpath(expected_path).replace("\\", "/")
     req_path = os.path.normpath(req_path).replace("\\", "/")
 
-    # 발급 대상 파일 경로와 요청 파일 경로 불일치 시 거부 (경로 탈취 방어, 티켓은 보존)
-    if expected_path != req_path:
-        return None
+    raw_data = None
+    # 1. Redis Lua 스크립트로 원자적 경로 검증 및 단 1회 삭제
+    if hasattr(redis, "eval"):
+        try:
+            LUA_CONSUME_TICKET = """
+            local raw = redis.call('GET', KEYS[1])
+            if not raw then
+                return nil
+            end
+            local ok, data = pcall(cjson.decode, raw)
+            if not ok or type(data) ~= 'table' then
+                redis.call('DEL', KEYS[1])
+                return nil
+            end
+            local expected = data['file_path'] or ''
+            if string.sub(expected, 1, 1) == '/' or string.sub(expected, 1, 1) == '\\\\' then
+                expected = string.sub(expected, 2)
+            end
+            if string.sub(expected, 1, 8) == 'uploads/' then
+                expected = string.sub(expected, 9)
+            end
+            if expected == ARGV[1] then
+                redis.call('DEL', KEYS[1])
+                return raw
+            else
+                return 'PATH_MISMATCH'
+            end
+            """
+            res = await redis.eval(LUA_CONSUME_TICKET, 1, ticket_key, req_path)
+            if res is None or res == "PATH_MISMATCH":
+                return None
+            raw_data = res
+        except Exception:
+            raw_data = None
 
-    # 경로 일치 확인 후 티켓 소비 및 즉시 파기 (Single-use 보장)
-    await redis.delete(ticket_key)
+    # 2. Lua 미지원 또는 폴백 환경 (GETDEL 원자적 소비)
+    if raw_data is None:
+        if hasattr(redis, "getdel"):
+            raw_data = await redis.getdel(ticket_key)
+            if not raw_data:
+                return None
+            try:
+                data = json.loads(raw_data)
+            except Exception:
+                return None
+            expected_path = data.get("file_path", "").strip().lstrip("/\\")
+            if expected_path.startswith("uploads/"):
+                expected_path = expected_path[8:]
+            expected_path = os.path.normpath(expected_path).replace("\\", "/")
+            if expected_path != req_path:
+                # 경로 불일치 시 티켓 복구 (오류 시에도 티켓 보존)
+                await redis.setex(ticket_key, 60, raw_data)
+                return None
+            return {
+                "uuid": data.get("uuid"),
+                "role": data.get("role"),
+            }
+        else:
+            raw_data = await redis.get(ticket_key)
+            if not raw_data:
+                return None
+            try:
+                data = json.loads(raw_data)
+            except Exception:
+                await redis.delete(ticket_key)
+                return None
+            expected_path = data.get("file_path", "").strip().lstrip("/\\")
+            if expected_path.startswith("uploads/"):
+                expected_path = expected_path[8:]
+            expected_path = os.path.normpath(expected_path).replace("\\", "/")
+            if expected_path != req_path:
+                return None
+            await redis.delete(ticket_key)
+            return {
+                "uuid": data.get("uuid"),
+                "role": data.get("role"),
+            }
 
+    data = json.loads(raw_data)
     return {
         "uuid": data.get("uuid"),
         "role": data.get("role"),
