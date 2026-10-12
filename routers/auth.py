@@ -127,19 +127,30 @@ class PatchEmailRequest(BaseModel):
 
 # 비밀번호 복잡도 정책: 3종 이상(영문, 숫자, 특수문자) 조합 시 최소 8자, 또는 2종 이상 조합 시 최소 10자, 최대 72바이트 (SECURITY_AND_AUDIT.md 1.5, TODO.md 6.1 P2)
 def validate_password_complexity(password: str) -> bool:
-    if not password or len(password) < 8 or len(password.encode("utf-8")) > 72:
+    """
+    비밀번호 복잡도 및 유효성을 검증합니다.
+    - 최소 8자 이상, 최대 72바이트
+    - 영문자, 숫자, 특수문자 중:
+      * 3종 이상 조합 시: 최소 8자 이상
+      * 2종 이상 조합 시: 최소 10자 이상
+    """
+    if not password:
         return False
+    pw_bytes = password.encode("utf-8")
+    if len(password) < 8 or len(pw_bytes) > 72:
+        return False
+
     has_letter = bool(re.search(r"[A-Za-z]", password))
     has_digit = bool(re.search(r"\d", password))
     has_special = bool(re.search(r"[!@#$%^&*()_\-+=~`[\]{}|\\:;\"'<>,.?/]", password))
+
     types_count = sum([has_letter, has_digit, has_special])
+
     if len(password) >= 10 and types_count >= 2:
         return True
     if len(password) >= 8 and types_count >= 3:
         return True
     return False
-
-PASSWORD_REGEX = re.compile(r"^(?=.*[A-Za-z])(?=.*\d).{8,}$")
 
 
 # ==============================================================================
