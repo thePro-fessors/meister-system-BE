@@ -142,8 +142,9 @@ async def create_point(
             ).model_dump(),
         )
 
-    # 점수 상하한선 방어 검증 (0 초과 100 이하)
-    if raw_points <= 0 or raw_points > 100:
+    # 점수 상하한선 방어 검증 (0 초과 100 이하, 음수로 들어온 경우 절댓값 기준 허용)
+    abs_points = abs(raw_points)
+    if abs_points <= 0 or abs_points > 100:
         return JSONResponse(
             status_code=400,
             content=SrFormat(
@@ -154,14 +155,17 @@ async def create_point(
             ).model_dump(),
         )
 
-    # 부호 및 구분 정규화 (SCORE-02)
-    raw_type = req.type.strip().upper()
-    if raw_type in ("MERIT", "+", "상점"):
+    # 부호 및 구분 정규화 (SCORE-02 & FE 호환: 점수가 음수이면 자동으로 벌점으로 판정)
+    raw_type = (req.type or "").strip().upper()
+    if raw_points < 0:
+        norm_type = "-"
+        norm_score = -abs_points
+    elif raw_type in ("MERIT", "+", "상점"):
         norm_type = "+"
-        norm_score = abs(raw_points)
+        norm_score = abs_points
     elif raw_type in ("DEMERIT", "-", "벌점"):
         norm_type = "-"
-        norm_score = -abs(raw_points)
+        norm_score = -abs_points
     else:
         return JSONResponse(
             status_code=400,

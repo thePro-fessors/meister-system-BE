@@ -33,7 +33,7 @@ CREATE TABLE certification_area_teachers
 
 CREATE TABLE chat_conversations
 (
-  conversation_id VARCHAR(36)  NOT NULL,
+  conversation_id VARCHAR(64)  NOT NULL,
   user_uuid       VARCHAR(36)  NOT NULL COMMENT '유저 고유 ID',
   title           VARCHAR(100) NULL    ,
   created_at      DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -44,7 +44,7 @@ CREATE TABLE chat_conversations
 CREATE TABLE chat_messages
 (
   message_id      BIGINT      NOT NULL AUTO_INCREMENT,
-  conversation_id VARCHAR(36) NOT NULL,
+  conversation_id VARCHAR(64) NOT NULL,
   sender_role     VARCHAR(10) NOT NULL COMMENT 'USER/ASSISTANT',
   content         TEXT        NOT NULL,
   created_at      TIMESTAMP   NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -393,6 +393,13 @@ CREATE INDEX idx_cat_teacher_id
 
 CREATE INDEX idx_eit_teacher_id
   ON evaluation_item_teachers (teacher_id);
+
+-- AI 챗봇 대화 세션 및 메시지 조회 최적화 인덱스 (TODO.md 5.1.2)
+CREATE INDEX idx_chat_conversations_user
+  ON chat_conversations (user_uuid, updated_at DESC);
+
+CREATE INDEX idx_chat_messages_conversation
+  ON chat_messages (conversation_id, created_at ASC);
 
 -- ============================================================================
 -- 초기 기초 데이터 시드 (OPS-01)

@@ -502,12 +502,25 @@ async def copy_year_criteria(
 # 2. 평가 기준 관리 API (/api/criteria)
 # ==============================================================================
 
+SCORING_TYPE_NAMES: Dict[int, str] = {
+    1: "고정점수형",
+    2: "등급환산형",
+    3: "구간점수형",
+    4: "시간계산형",
+    5: "감점형",
+    6: "가산점형",
+    7: "최대점제한형",
+    8: "최상위인정형",
+}
+
+
 @criteria_router.get("", summary="평가 기준 조회 (영역 및 항목) (API-03)", response_model=SrFormat)
 @criteria_router.get("/", summary="평가 기준 조회 (영역 및 항목) (API-03)", response_model=SrFormat, include_in_schema=False)
 @admin_router.get("/criteria", summary="평가 기준 조회 (영역 및 항목) (API-03) [Admin 별칭]", response_model=SrFormat)
 @admin_router.get("/criteria/", summary="평가 기준 조회 (영역 및 항목) (API-03) [Admin 별칭]", response_model=SrFormat, include_in_schema=False)
 async def get_criteria(
     year: Optional[int] = Query(None, description="조회 학년도 (미지정 시 활성/최신 학년도)"),
+    grade: Optional[int] = Query(None, description="조회 학년 필터 (1, 2, 3) (미지정 시 전체 학년)"),
     conn: Any = Depends(get_db),
     current_user: Dict[str, Any] = Depends(get_current_user),
 ):
@@ -546,17 +559,20 @@ async def get_criteria(
                 )
             year_id = y_row["year_id"]
 
-        # 영역 목록 조회
-        await cur.execute(
-            """
+        # 영역 목록 조회 (학년 필터 적용 가능)
+        area_sql = """
             SELECT area_id AS areaId, year_id AS yearId, grade, name, max_score AS maxScore,
                    subject, department
             FROM certification_areas
             WHERE year_id = %s
-            ORDER BY grade ASC, area_id ASC
-            """,
-            (year_id,),
-        )
+        """
+        area_params: List[Any] = [year_id]
+        if grade is not None:
+            area_sql += " AND grade = %s"
+            area_params.append(grade)
+        area_sql += " ORDER BY grade ASC, area_id ASC"
+
+        await cur.execute(area_sql, tuple(area_params))
         areas = await cur.fetchall()
 
         if not areas:
@@ -670,6 +686,8 @@ async def get_criteria(
     for it in items:
         it_area_id = it.get("areaId") or it.get("area_id")
         it_id = it.get("itemId") or it.get("item_id")
+        sc_type_code = it.get("scoringType") or it.get("scoring_type")
+        sc_type_name = SCORING_TYPE_NAMES.get(sc_type_code, "고정점수형") if isinstance(sc_type_code, int) else str(sc_type_code or "고정점수형")
         norm_it = {
             "itemId": it_id,
             "areaId": it_area_id,
@@ -677,7 +695,8 @@ async def get_criteria(
             "subject": it.get("subject"),
             "department": it.get("department"),
             "maxScore": float(it.get("maxScore") if it.get("maxScore") is not None else it.get("max_score", 0.0)),
-            "scoringType": it.get("scoringType") or it.get("scoring_type"),
+            "scoringType": sc_type_code,
+            "scoringTypeName": sc_type_name,
             "targetGrade": it.get("targetGrade") or it.get("target_grade"),
             "requiresEvidence": bool(it.get("requiresEvidence") if "requiresEvidence" in it else it.get("requires_evidence", False)),
             "isActive": bool(it.get("isActive") if "isActive" in it else it.get("is_active", True)),

@@ -37,6 +37,7 @@ from routers.submissions import router as submissions_router
 from routers.points import router as points_router
 from routers.teachers import router as teachers_router
 from routers.admin import years_router, criteria_router, admin_router
+from routers.ai import router as ai_router
 from sr_format import Error, SrFormat
 
 
@@ -132,6 +133,9 @@ app.include_router(teachers_router)
 app.include_router(years_router)
 app.include_router(criteria_router)
 app.include_router(admin_router)
+
+# AI 서비스 라우터 등록 (/api/ai - 5.1~5.3 및 FE Copilot 연동)
+app.include_router(ai_router)
 
 # 📁 [보안 3.1] 증빙자료 파일 안전 조회 및 다운로드 (RBAC 및 학생 소유권 인가 검증)
 # 기존 단순 StaticFiles 마운트의 무인가 개인정보 탈취(IDOR) 취약점을 해소
