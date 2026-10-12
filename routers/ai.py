@@ -806,31 +806,66 @@ async def student_chat(
                     )
                     existing_conv = await cur.fetchone()
                     # 타 사용자 세션 접근 시도 엄격 차단 (IDOR 방어)
-                    if existing_conv and existing_conv.get("user_uuid") != user_uuid:
-                        return JSONResponse(
-                            status_code=status.HTTP_403_FORBIDDEN,
-                            content=SrFormat(
+                    if existing_conv:
+                        if existing_conv.get("user_uuid") != user_uuid:
+                            return JSONResponse(
                                 status_code=status.HTTP_403_FORBIDDEN,
-                                success=False,
-                                data=None,
-                                error=Error(
-                                    code="FORBIDDEN_CONVERSATION_ACCESS",
-                                    message="타 학생의 대화 세션에 접근할 수 없습니다 (IDOR 차단).",
-                                ),
-                            ).model_dump(),
-                        )
-                    elif not existing_conv:
-                        await cur.execute(
-                            """
-                            INSERT INTO chat_conversations (conversation_id, user_uuid, title, created_at, updated_at)
-                            VALUES (%s, %s, %s, NOW(), NOW())
-                            """,
-                            (conv_id, user_uuid, title_text),
-                        )
+                                content=SrFormat(
+                                    status_code=status.HTTP_403_FORBIDDEN,
+                                    success=False,
+                                    data=None,
+                                    error=Error(
+                                        code="FORBIDDEN_CONVERSATION_ACCESS",
+                                        message="타 학생의 대화 세션에 접근할 수 없습니다 (IDOR 차단).",
+                                    ),
+                                ).model_dump(),
+                            )
+                    else:
+                        # 신규 세션 동시 생성 시 충돌(Duplicate Key) 방어
+                        try:
+                            await cur.execute(
+                                """
+                                INSERT INTO chat_conversations (conversation_id, user_uuid, title, created_at, updated_at)
+                                VALUES (%s, %s, %s, NOW(), NOW())
+                                """,
+                                (conv_id, user_uuid, title_text),
+                            )
+                        except Exception:
+                            # 동시성 경합으로 타 트랜잭션이 먼저 생성한 경우 소유자 재조회 및 검증
+                            await cur.execute(
+                                "SELECT user_uuid FROM chat_conversations WHERE conversation_id = %s LIMIT 1",
+                                (conv_id,),
+                            )
+                            conflict_conv = await cur.fetchone()
+                            if not conflict_conv or conflict_conv.get("user_uuid") != user_uuid:
+                                return JSONResponse(
+                                    status_code=status.HTTP_403_FORBIDDEN,
+                                    content=SrFormat(
+                                        status_code=status.HTTP_403_FORBIDDEN,
+                                        success=False,
+                                        data=None,
+                                        error=Error(
+                                            code="FORBIDDEN_CONVERSATION_ACCESS",
+                                            message="타 학생의 대화 세션에 접근할 수 없습니다 (IDOR 차단).",
+                                        ),
+                                    ).model_dump(),
+                                )
                 if hasattr(conn, "commit"):
                     await conn.commit()
             except Exception as ce:
-                logger.warning(f"[CONV_CHECK_WARN] 대화 세션 확인 경고: {ce}")
+                logger.error(f"[CONV_CHECK_ERR] 대화 세션 소유권 검증 DB 오류: {ce}")
+                return JSONResponse(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    content=SrFormat(
+                        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                        success=False,
+                        data=None,
+                        error=Error(
+                            code="DATABASE_ERROR",
+                            message="대화 세션 소유권 확인 중 오류가 발생했습니다.",
+                        ),
+                    ).model_dump(),
+                )
     else:
         # VARCHAR(36) 및 VARCHAR(64) 모두 안전 호환 (36자 고정)
         conv_id = f"conv-{uuid.uuid4().hex[:31]}"
@@ -849,7 +884,19 @@ async def student_chat(
                 if hasattr(conn, "commit"):
                     await conn.commit()
             except Exception as ce:
-                logger.warning(f"[CONV_CREATE_WARN] 대화 세션 생성 경고: {ce}")
+                logger.error(f"[CONV_CREATE_ERR] 대화 세션 생성 오류: {ce}")
+                return JSONResponse(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    content=SrFormat(
+                        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                        success=False,
+                        data=None,
+                        error=Error(
+                            code="DATABASE_ERROR",
+                            message="신규 대화 세션 생성 중 오류가 발생했습니다.",
+                        ),
+                    ).model_dump(),
+                )
 
     # 6. 최근 대화 이력 10건 조회 및 사용자 질문 영속화 (`chat_messages`)
     history_messages: List[Dict[str, Any]] = []
@@ -858,16 +905,17 @@ async def student_chat(
         try:
             cur_kwargs = {"cursor": DictCursor} if DictCursor else {}
             async with conn.cursor(**cur_kwargs) as cur:
-                # 최근 대화 이력 10건 최신순 조회 후 시간순 정렬 (오래된 대화가 아닌 최근 대화 우선)
+                # 소유자 검증 보장을 위해 chat_conversations와 JOIN 조회
                 await cur.execute(
                     """
-                    SELECT sender_role, content
-                    FROM chat_messages
-                    WHERE conversation_id = %s
+                    SELECT m.sender_role, m.content
+                    FROM chat_messages m
+                    JOIN chat_conversations c ON m.conversation_id = c.conversation_id
+                    WHERE m.conversation_id = %s AND c.user_uuid = %s
                     ORDER BY message_id DESC
                     LIMIT 10
                     """,
-                    (conv_id,),
+                    (conv_id, user_uuid),
                 )
                 raw_history = await cur.fetchall() or []
                 history_messages = list(reversed(raw_history))
@@ -1731,31 +1779,66 @@ async def teacher_chat(
                         (conv_id,),
                     )
                     existing_conv = await cur.fetchone()
-                    if existing_conv and existing_conv.get("user_uuid") != user_uuid:
-                        return JSONResponse(
-                            status_code=status.HTTP_403_FORBIDDEN,
-                            content=SrFormat(
+                    if existing_conv:
+                        if existing_conv.get("user_uuid") != user_uuid:
+                            return JSONResponse(
                                 status_code=status.HTTP_403_FORBIDDEN,
-                                success=False,
-                                data=None,
-                                error=Error(
-                                    code="FORBIDDEN_CONVERSATION_ACCESS",
-                                    message="타 사용자의 대화 세션에 접근할 수 없습니다 (IDOR 차단).",
-                                ),
-                            ).model_dump(),
-                        )
-                    elif not existing_conv:
-                        await cur.execute(
-                            """
-                            INSERT INTO chat_conversations (conversation_id, user_uuid, title, created_at, updated_at)
-                            VALUES (%s, %s, %s, NOW(), NOW())
-                            """,
-                            (conv_id, user_uuid, title_text),
-                        )
+                                content=SrFormat(
+                                    status_code=status.HTTP_403_FORBIDDEN,
+                                    success=False,
+                                    data=None,
+                                    error=Error(
+                                        code="FORBIDDEN_CONVERSATION_ACCESS",
+                                        message="타 사용자의 대화 세션에 접근할 수 없습니다 (IDOR 차단).",
+                                    ),
+                                ).model_dump(),
+                            )
+                    else:
+                        # 신규 세션 동시 생성 시 충돌(Duplicate Key) 방어
+                        try:
+                            await cur.execute(
+                                """
+                                INSERT INTO chat_conversations (conversation_id, user_uuid, title, created_at, updated_at)
+                                VALUES (%s, %s, %s, NOW(), NOW())
+                                """,
+                                (conv_id, user_uuid, title_text),
+                            )
+                        except Exception:
+                            # 동시성 경합으로 타 트랜잭션이 먼저 생성한 경우 소유자 재조회 및 검증
+                            await cur.execute(
+                                "SELECT user_uuid FROM chat_conversations WHERE conversation_id = %s LIMIT 1",
+                                (conv_id,),
+                            )
+                            conflict_conv = await cur.fetchone()
+                            if not conflict_conv or conflict_conv.get("user_uuid") != user_uuid:
+                                return JSONResponse(
+                                    status_code=status.HTTP_403_FORBIDDEN,
+                                    content=SrFormat(
+                                        status_code=status.HTTP_403_FORBIDDEN,
+                                        success=False,
+                                        data=None,
+                                        error=Error(
+                                            code="FORBIDDEN_CONVERSATION_ACCESS",
+                                            message="타 사용자의 대화 세션에 접근할 수 없습니다 (IDOR 차단).",
+                                        ),
+                                    ).model_dump(),
+                                )
                 if hasattr(conn, "commit"):
                     await conn.commit()
             except Exception as ce:
-                logger.warning(f"[TEACHER_CONV_CHECK_WARN] 대화 세션 확인 경고: {ce}")
+                logger.error(f"[TEACHER_CONV_CHECK_ERR] 교사 대화 세션 소유권 확인 DB 오류: {ce}")
+                return JSONResponse(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    content=SrFormat(
+                        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                        success=False,
+                        data=None,
+                        error=Error(
+                            code="DATABASE_ERROR",
+                            message="대화 세션 소유권 확인 중 오류가 발생했습니다.",
+                        ),
+                    ).model_dump(),
+                )
     else:
         conv_id = f"conv-teacher-{uuid.uuid4().hex[:23]}"
         if conn is not None:
@@ -1773,7 +1856,19 @@ async def teacher_chat(
                 if hasattr(conn, "commit"):
                     await conn.commit()
             except Exception as ce:
-                logger.warning(f"[TEACHER_CONV_CREATE_WARN] 대화 세션 생성 경고: {ce}")
+                logger.error(f"[TEACHER_CONV_CREATE_ERR] 대화 세션 생성 오류: {ce}")
+                return JSONResponse(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    content=SrFormat(
+                        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                        success=False,
+                        data=None,
+                        error=Error(
+                            code="DATABASE_ERROR",
+                            message="신규 대화 세션 생성 중 오류가 발생했습니다.",
+                        ),
+                    ).model_dump(),
+                )
 
     # 7. 최근 대화 이력 10건 조회 및 교사 질문 영속화 (`chat_messages`, sender_role='TEACHER')
     history_messages: List[Dict[str, Any]] = []
@@ -1781,15 +1876,17 @@ async def teacher_chat(
         try:
             cur_kwargs = {"cursor": DictCursor} if DictCursor else {}
             async with conn.cursor(**cur_kwargs) as cur:
+                # 소유자 검증 보장을 위해 chat_conversations와 JOIN 조회
                 await cur.execute(
                     """
-                    SELECT sender_role, content
-                    FROM chat_messages
-                    WHERE conversation_id = %s
+                    SELECT m.sender_role, m.content
+                    FROM chat_messages m
+                    JOIN chat_conversations c ON m.conversation_id = c.conversation_id
+                    WHERE m.conversation_id = %s AND c.user_uuid = %s
                     ORDER BY message_id DESC
                     LIMIT 10
                     """,
-                    (conv_id,),
+                    (conv_id, user_uuid),
                 )
                 raw_history = await cur.fetchall() or []
                 history_messages = list(reversed(raw_history))
