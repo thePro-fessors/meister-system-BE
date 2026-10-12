@@ -166,6 +166,17 @@ class BatchTeacherRequest(BaseModel):
     teachers: List[BatchTeacherItem] = []
 
 
+class RecalculateBatchRequest(BaseModel):
+    year: Optional[int] = None
+    grade: Optional[int] = None
+    student_id: Optional[int] = None
+    studentId: Optional[int] = None
+    dry_run: Optional[bool] = False
+    dryRun: Optional[bool] = False
+    fix_anomalies: Optional[bool] = False
+    fixAnomalies: Optional[bool] = False
+
+
 # ==============================================================================
 # 1. 학년도 관리 API (/api/years)
 # ==============================================================================
@@ -2980,6 +2991,296 @@ async def export_school_stats(
             media_type="application/pdf",
             headers={"Content-Disposition": f'attachment; filename="{filename}"'},
         )
+
+
+# ==============================================================================
+# 10. 관리자 데이터 정합성 검증 및 재계산 배치 (4.10) (POST /api/admin/recalculate)
+# ==============================================================================
+
+@admin_router.post("/recalculate", summary="관리자 수동 데이터 정합성 검증 및 재계산 배치 (4.10)", response_model=SrFormat)
+async def recalculate_student_certifications(
+    req: Optional[RecalculateBatchRequest] = None,
+    conn: Any = Depends(get_db),
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """
+    관리자 수동 데이터 정합성 검증 및 재계산 배치 (4.10).
+    기준 변경 또는 대량 제출/상벌점 변동 시 전교생 총점 및 인증 상태 배치 동기화,
+    배점 한도 초과/음수 점수 등 이상치(Anomalies) 탐지 및 자동 정규화 지원.
+    """
+    admin_err = check_admin_access(current_user)
+    if admin_err:
+        return admin_err
+
+    payload = req or RecalculateBatchRequest()
+    target_year = payload.year
+    filter_grade = payload.grade
+    filter_student_id = payload.studentId or payload.student_id
+    is_dry_run = bool(payload.dryRun or payload.dry_run)
+    fix_anomalies = bool(payload.fixAnomalies or payload.fix_anomalies)
+
+    cur_kwargs = {"cursor": DictCursor} if DictCursor else {}
+    async with conn.cursor(**cur_kwargs) as cur:
+        # 1. 대상 학년도 식별
+        if target_year is not None:
+            await cur.execute("SELECT year_id, year FROM academic_years WHERE year = %s LIMIT 1", (target_year,))
+            y_row = await cur.fetchone()
+            if not y_row:
+                return JSONResponse(
+                    status_code=404,
+                    content=SrFormat(
+                        status_code=404,
+                        success=False,
+                        data=None,
+                        error=Error(code="YEAR_NOT_FOUND", message=f"{target_year}학년도를 찾을 수 없습니다."),
+                    ).model_dump(),
+                )
+            year_id = y_row["year_id"]
+            target_year = y_row["year"]
+        else:
+            await cur.execute("SELECT year_id, year FROM academic_years WHERE is_activated = TRUE LIMIT 1")
+            y_row = await cur.fetchone()
+            if not y_row:
+                await cur.execute("SELECT year_id, year FROM academic_years ORDER BY year DESC LIMIT 1")
+                y_row = await cur.fetchone()
+            if not y_row:
+                return JSONResponse(
+                    status_code=404,
+                    content=SrFormat(
+                        status_code=404,
+                        success=False,
+                        data=None,
+                        error=Error(code="YEAR_NOT_FOUND", message="등록된 학년도가 없습니다."),
+                    ).model_dump(),
+                )
+            year_id = y_row["year_id"]
+            target_year = y_row["year"]
+
+        # 2. 평가 기준(영역 및 평가 항목) 조회
+        await cur.execute(
+            """
+            SELECT ca.area_id, ca.grade, ca.name AS area_name, ca.max_score AS area_max_score,
+                   ei.item_id, ei.name AS item_name, ei.max_score AS item_max_score, ei.scoring_type, ei.is_active
+            FROM certification_areas ca
+            LEFT JOIN evaluation_items ei ON ca.area_id = ei.area_id
+            WHERE ca.year_id = %s
+            ORDER BY ca.grade ASC, ca.area_id ASC, ei.item_id ASC
+            """,
+            (year_id,),
+        )
+        criteria_rows = await cur.fetchall() or []
+
+        areas_seen_by_grade: Dict[int, Dict[int, Dict[str, Any]]] = {}
+        for row in criteria_rows:
+            g = row.get("grade", 1)
+            aid = row["area_id"]
+            if g not in areas_seen_by_grade:
+                areas_seen_by_grade[g] = {}
+            if aid not in areas_seen_by_grade[g]:
+                areas_seen_by_grade[g][aid] = {
+                    "area_id": aid,
+                    "name": row.get("area_name"),
+                    "max_score": float(row.get("area_max_score") or 0.0),
+                    "grade": g,
+                }
+
+        areas_by_grade: Dict[int, List[Dict[str, Any]]] = {
+            g: list(adict.values()) for g, adict in areas_seen_by_grade.items()
+        }
+
+        # 3. 대상 학생 목록 조회
+        st_sql = """
+            SELECT st.student_id, st.name, st.email,
+                   sar.grade, sar.class AS class_no, sar.number
+            FROM student_academic_records sar
+            JOIN students st ON sar.student_id = st.student_id
+            WHERE sar.year_id = %s AND st.is_deleted = FALSE
+        """
+        st_params: List[Any] = [year_id]
+        if filter_grade is not None:
+            st_sql += " AND sar.grade = %s"
+            st_params.append(filter_grade)
+        if filter_student_id is not None:
+            st_sql += " AND st.student_id = %s"
+            st_params.append(filter_student_id)
+        st_sql += " ORDER BY sar.grade ASC, sar.class ASC, sar.number ASC"
+
+        await cur.execute(st_sql, tuple(st_params))
+        students = await cur.fetchall() or []
+
+        # 4. 제출 증빙 목록 조회
+        sub_sql = """
+            SELECT s.submission_id, s.student_id, s.item_id, s.status_code, s.granted_score,
+                   ei.area_id, ei.scoring_type, ei.max_score AS item_max_score, ei.name AS item_name, ei.is_active
+            FROM submissions s
+            JOIN evaluation_items ei ON s.item_id = ei.item_id
+            JOIN certification_areas ca ON ei.area_id = ca.area_id
+            WHERE ca.year_id = %s AND s.is_deleted = FALSE
+        """
+        sub_params: List[Any] = [year_id]
+        if filter_student_id is not None:
+            sub_sql += " AND s.student_id = %s"
+            sub_params.append(filter_student_id)
+
+        await cur.execute(sub_sql, tuple(sub_params))
+        all_submissions = await cur.fetchall() or []
+
+        # 5. 당해 학사년도(3.1~익년 3.1) 상벌점 조회
+        start_date_str = f"{target_year}-03-01"
+        end_date_str = f"{target_year + 1}-03-01"
+        merit_sql = """
+            SELECT merits_point_id, student_id, type, points, related_area
+            FROM merits
+            WHERE is_reflected = TRUE AND is_deleted = FALSE
+              AND (occurred_at IS NULL OR (occurred_at >= %s AND occurred_at < %s))
+        """
+        merit_params: List[Any] = [start_date_str, end_date_str]
+        if filter_student_id is not None:
+            merit_sql += " AND student_id = %s"
+            merit_params.append(filter_student_id)
+
+        await cur.execute(merit_sql, tuple(merit_params))
+        all_merits = await cur.fetchall() or []
+
+        # 6. 이상치(Anomalies) 검출 및 자동 보정
+        anomalies: List[Dict[str, Any]] = []
+        fixed_count = 0
+        admin_uuid = current_user.get("uuid") or current_user.get("sub") or "admin"
+
+        for sub in all_submissions:
+            sub_id = sub["submission_id"]
+            st_id = sub["student_id"]
+            status_code = sub.get("status_code", 1)
+            g_score = float(sub.get("granted_score") or 0.0)
+            it_max = float(sub.get("item_max_score") or 0.0)
+            it_active = bool(sub.get("is_active", True))
+            it_name = sub.get("item_name", "미확인 항목")
+
+            # 승인 완료(3) 상태인 건의 점수 정합성 검증
+            if status_code == 3:
+                issue = None
+                target_fix = None
+                if it_max > 0 and g_score > it_max:
+                    issue = "EXCEEDED_MAX_SCORE"
+                    target_fix = it_max
+                elif g_score < 0:
+                    issue = "NEGATIVE_SCORE"
+                    target_fix = 0.0
+                elif not it_active:
+                    issue = "INACTIVE_ITEM_SCORED"
+
+                if issue:
+                    anomalies.append({
+                        "submissionId": sub_id,
+                        "studentId": st_id,
+                        "itemName": it_name,
+                        "grantedScore": g_score,
+                        "itemMaxScore": it_max,
+                        "issueType": issue,
+                    })
+
+                    if fix_anomalies and not is_dry_run and target_fix is not None:
+                        await cur.execute(
+                            "UPDATE submissions SET granted_score = %s WHERE submission_id = %s",
+                            (target_fix, sub_id),
+                        )
+                        await cur.execute(
+                            """
+                            INSERT INTO submissions_logs (submission_id, action, reviewer_id, old_score, granted_score, teacher_comment, created_at)
+                            VALUES (%s, 'SCORE_MODIFY', %s, %s, %s, %s, NOW())
+                            """,
+                            (
+                                sub_id,
+                                admin_uuid,
+                                g_score,
+                                target_fix,
+                                f"[관리자 재계산 배치 자동 보정] {issue} (기존 {g_score}점 -> {target_fix}점)",
+                            ),
+                        )
+                        sub["granted_score"] = target_fix
+                        fixed_count += 1
+
+        if fix_anomalies and not is_dry_run and fixed_count > 0:
+            if hasattr(conn, "commit"):
+                await conn.commit()
+
+        # 7. 학생별 데이터 그룹핑 및 calculate_student_certification 배치 실행
+        subs_by_student: Dict[int, List[Dict[str, Any]]] = {}
+        for s in all_submissions:
+            sid = s["student_id"]
+            subs_by_student.setdefault(sid, []).append(s)
+
+        merits_by_student: Dict[int, List[Dict[str, Any]]] = {}
+        for m in all_merits:
+            sid = m["student_id"]
+            merits_by_student.setdefault(sid, []).append(m)
+
+        cert_status_counts = {"인증 가능": 0, "검토중": 0, "보완 필요": 0}
+        grade_counts = {"S": 0, "A": 0, "B": 0, "미달성": 0}
+        total_scores_sum = 0.0
+        recalculated_students: List[Dict[str, Any]] = []
+
+        for st in students:
+            sid = st["student_id"]
+            st_grade = st.get("grade", 1)
+            areas_for_student = areas_by_grade.get(st_grade, [])
+            st_subs = subs_by_student.get(sid, [])
+            st_merits = merits_by_student.get(sid, [])
+
+            calc = calculate_student_certification(areas_for_student, st_subs, st_merits)
+            st_status = calc.get("certStatus", "보완 필요")
+            st_total = float(calc.get("totalScore", 0.0))
+            st_merit = float(calc.get("totalMeritScore", 0.0))
+            st_pending = int(calc.get("pendingCount", 0))
+
+            total_scores_sum += st_total
+            cert_status_counts[st_status] = cert_status_counts.get(st_status, 0) + 1
+
+            if st_status == "인증 가능":
+                grade_counts["S" if st_total >= 90.0 else "A"] += 1
+            elif st_status == "검토중":
+                grade_counts["B"] += 1
+            else:
+                grade_counts["미달성"] += 1
+
+            if len(recalculated_students) < 50:
+                recalculated_students.append({
+                    "studentId": sid,
+                    "name": st["name"],
+                    "grade": st_grade,
+                    "classNo": st.get("class_no"),
+                    "number": st.get("number"),
+                    "totalScore": round(st_total, 1),
+                    "certStatus": st_status,
+                    "totalMeritScore": round(st_merit, 1),
+                    "pendingCount": st_pending,
+                })
+
+        total_st_cnt = len(students)
+        avg_score = round(total_scores_sum / total_st_cnt, 1) if total_st_cnt > 0 else 0.0
+
+        return SrFormat(
+            status_code=200,
+            success=True,
+            data={
+                "targetYear": target_year,
+                "yearId": year_id,
+                "totalProcessedStudents": total_st_cnt,
+                "averageTotalScore": avg_score,
+                "certStatusCounts": cert_status_counts,
+                "gradeCounts": grade_counts,
+                "anomaliesCount": len(anomalies),
+                "anomaliesFixedCount": fixed_count,
+                "anomaliesFound": anomalies[:100],
+                "isDryRun": is_dry_run,
+                "filter": {
+                    "year": target_year,
+                    "grade": filter_grade,
+                    "studentId": filter_student_id,
+                },
+                "sampleStudents": recalculated_students,
+            },
+        ).model_dump()
 
 
 
