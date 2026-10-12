@@ -13,13 +13,23 @@ ALTER TABLE academic_years
 
 CREATE TABLE certification_areas
 (
-  area_id   INT         NOT NULL AUTO_INCREMENT COMMENT '인증 영역 고유 ID',
-  year_id   INT         NOT NULL COMMENT '대상 학년도 ID',
-  grade     TINYINT     NOT NULL DEFAULT 1 COMMENT '대상 학년 (1, 2, 3)',
-  name      VARCHAR(60) NOT NULL COMMENT '인증 영역',
-  max_score INT         NOT NULL,
+  area_id    INT         NOT NULL AUTO_INCREMENT COMMENT '인증 영역 고유 ID',
+  year_id    INT         NOT NULL COMMENT '대상 학년도 ID',
+  grade      TINYINT     NOT NULL DEFAULT 1 COMMENT '대상 학년 (1, 2, 3)',
+  name       VARCHAR(60) NOT NULL COMMENT '인증 영역',
+  max_score  INT         NOT NULL,
+  subject    VARCHAR(40) NULL     COMMENT '2순위: 평가 담당 교과',
+  department VARCHAR(40) NULL     COMMENT '3순위: 평가 담당 부서',
   PRIMARY KEY (area_id)
 ) COMMENT '인증 영역 관리 테이블';
+
+CREATE TABLE certification_area_teachers
+(
+  area_id    INT      NOT NULL COMMENT '인증 영역 ID',
+  teacher_id INT      NOT NULL COMMENT '교사 고유 ID',
+  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (area_id, teacher_id)
+) COMMENT '인증 영역별 전담 평가 교사 N:M 매핑 테이블';
 
 CREATE TABLE chat_conversations
 (
@@ -48,11 +58,21 @@ CREATE TABLE evaluation_items
   name              VARCHAR(100) NULL     COMMENT '평가 항목 이름',
   target_grade      TINYINT      NULL     DEFAULT 0 COMMENT '대상 학년',
   max_score         DECIMAL(5,2) NULL     COMMENT '최대 제한 점수',
+  subject           VARCHAR(40)  NULL     COMMENT '2순위: 평가 담당 교과 (NULL이면 상위 영역 상속)',
+  department        VARCHAR(40)  NULL     COMMENT '3순위: 평가 담당 부서 (NULL이면 상위 영역 상속)',
   scoring_type      TINYINT      NOT NULL COMMENT '점수 산정 방식',
   requires_evidence BOOL         NOT NULL DEFAULT TRUE,
   is_active         BOOL         NULL     DEFAULT FALSE COMMENT '활성 상태',
   PRIMARY KEY (item_id)
 ) COMMENT '세부 평가 항목 테이블';
+
+CREATE TABLE evaluation_item_teachers
+(
+  item_id    INT      NOT NULL COMMENT '평가 항목 ID',
+  teacher_id INT      NOT NULL COMMENT '교사 고유 ID',
+  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (item_id, teacher_id)
+) COMMENT '평가 항목별 전담 평가 교사 N:M 매핑 테이블';
 
 CREATE TABLE merits
 (
@@ -170,6 +190,8 @@ CREATE TABLE teachers
   teachers_id INT          NOT NULL AUTO_INCREMENT COMMENT '교사 고유 ID',
   name        VARCHAR(20)  NOT NULL COMMENT '교사 성명',
   subject     VARCHAR(20)  NULL     COMMENT '담당교과',
+  position    VARCHAR(30)  NULL     DEFAULT '교과전담' COMMENT '직책 (정담임, 부담임, 임시담임, 학년부장, 부서부장, 교과전담 등)',
+  department  VARCHAR(40)  NULL     COMMENT '소속 부서 (마이스터부, 외국어교육부, 인문소양부, 학생생활안전부, 교무기획부 등)',
   grade       TINYINT      NULL     COMMENT '담당 학년',
   class       TINYINT      NULL     COMMENT '담당 반',
   email       VARCHAR(255) NOT NULL COMMENT '교사 이메일',
@@ -246,10 +268,34 @@ ALTER TABLE certification_areas
     FOREIGN KEY (year_id)
     REFERENCES academic_years (year_id);
 
+ALTER TABLE certification_area_teachers
+  ADD CONSTRAINT FK_certification_areas_TO_certification_area_teachers
+    FOREIGN KEY (area_id)
+    REFERENCES certification_areas (area_id)
+    ON DELETE CASCADE;
+
+ALTER TABLE certification_area_teachers
+  ADD CONSTRAINT FK_teachers_TO_certification_area_teachers
+    FOREIGN KEY (teacher_id)
+    REFERENCES teachers (teachers_id)
+    ON DELETE CASCADE;
+
 ALTER TABLE evaluation_items
   ADD CONSTRAINT FK_certification_areas_TO_evaluation_items
     FOREIGN KEY (area_id)
     REFERENCES certification_areas (area_id);
+
+ALTER TABLE evaluation_item_teachers
+  ADD CONSTRAINT FK_evaluation_items_TO_evaluation_item_teachers
+    FOREIGN KEY (item_id)
+    REFERENCES evaluation_items (item_id)
+    ON DELETE CASCADE;
+
+ALTER TABLE evaluation_item_teachers
+  ADD CONSTRAINT FK_teachers_TO_evaluation_item_teachers
+    FOREIGN KEY (teacher_id)
+    REFERENCES teachers (teachers_id)
+    ON DELETE CASCADE;
 
 ALTER TABLE scoring_rules
   ADD CONSTRAINT FK_evaluation_items_TO_scoring_rules
@@ -333,6 +379,20 @@ CREATE INDEX idx_merits_history
 -- 교사 대시보드 및 심사 대기 목록 조회 최적화 복합 인덱스 (SECURITY_AND_AUDIT.md 2.4)
 CREATE INDEX idx_submissions_teacher_filter
   ON submissions (is_deleted, status_code, created_at DESC, submission_id DESC);
+
+-- 감사 로그 정렬 최적화 복합 인덱스 (SECURITY_AND_AUDIT.md 2.16)
+CREATE INDEX idx_submissions_logs_sort
+  ON submissions_logs (created_at DESC, log_id DESC);
+
+CREATE INDEX idx_merits_log_sort
+  ON merits_log (created_at DESC, log_id DESC);
+
+-- 평가자 N명 매핑 테이블 teacher_id 조회 최적화 인덱스
+CREATE INDEX idx_cat_teacher_id
+  ON certification_area_teachers (teacher_id);
+
+CREATE INDEX idx_eit_teacher_id
+  ON evaluation_item_teachers (teacher_id);
 
 -- ============================================================================
 -- 초기 기초 데이터 시드 (OPS-01)

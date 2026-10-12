@@ -1,9 +1,9 @@
 # 🗄️ 마이스터 시스템 DB 스키마 변경 내역서 (Schema Changelog)
 
-> **문서 버전**: v1.3  
-> **기준 일자**: 2026-10-06  
+> **문서 버전**: v1.5  
+> **기준 일자**: 2026-10-12  
 > **대상 파일**: [databases.sql](databases.sql)  
-> **변경 목적**: 관리자 상벌점 부여 시 NULL 제약 완화, DECIMAL(5,2) 100점 확장, 이메일 컬럼 일치 확장, 기준 복제 중복 방지 제약
+> **변경 목적**: 평가자 지정 우선순위(1순위: 전담 교사 N명, 2순위: 교과, 3순위: 부서) 인가 체계 구축 및 N명 교사 매핑 테이블 신설
 
 ---
 
@@ -142,4 +142,66 @@ ALTER TABLE evaluation_items
 
 ALTER TABLE certification_areas
   MODIFY COLUMN name VARCHAR(60) NOT NULL COMMENT '인증 영역 (XSS 이스케이프 보존)';
+
+-- 5. [v1.4 신규] 교무분장(직책/부서) 확장, 심사 담당 부서/교과 지정 및 감사 로그 정렬 인덱스
+ALTER TABLE teachers
+  ADD COLUMN position VARCHAR(30) NULL DEFAULT '교과전담' COMMENT '직책 (정담임, 부담임, 임시담임, 학년부장, 부서부장, 교과전담 등)' AFTER subject,
+  ADD COLUMN department VARCHAR(40) NULL COMMENT '소속 부서 (마이스터부, 외국어교육부, 인문소양부, 학생생활안전부, 교무기획부 등)' AFTER position;
+
+ALTER TABLE evaluation_items
+  ADD COLUMN department VARCHAR(40) NULL COMMENT '심사 담당 부서/교과 (예: 영어, 외국어교육부, 마이스터부 등 - NULL이면 담임/학년부장 심사)' AFTER max_score;
+
+CREATE INDEX idx_submissions_logs_sort
+  ON submissions_logs (created_at DESC, log_id DESC);
+
+CREATE INDEX idx_merits_log_sort
+  ON merits_log (created_at DESC, log_id DESC);
+
+-- 6. [v1.5 신규] 평가자 지정 우선순위(전담 N명/교과/부서) 및 N명 교사 매핑 테이블 신설
+ALTER TABLE certification_areas
+  ADD COLUMN subject VARCHAR(40) NULL COMMENT '2순위: 평가 담당 교과' AFTER name,
+  ADD COLUMN department VARCHAR(40) NULL COMMENT '3순위: 평가 담당 부서' AFTER subject;
+
+ALTER TABLE evaluation_items
+  ADD COLUMN subject VARCHAR(40) NULL COMMENT '2순위: 평가 담당 교과 (NULL이면 상위 영역 상속)' AFTER max_score;
+
+CREATE TABLE certification_area_teachers (
+  area_id    INT NOT NULL COMMENT '인증 영역 ID',
+  teacher_id INT NOT NULL COMMENT '교사 고유 ID',
+  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (area_id, teacher_id),
+  CONSTRAINT fk_cat_area FOREIGN KEY (area_id) REFERENCES certification_areas(area_id) ON DELETE CASCADE,
+  CONSTRAINT fk_cat_teacher FOREIGN KEY (teacher_id) REFERENCES teachers(teachers_id) ON DELETE CASCADE
+) COMMENT '인증 영역별 전담 평가 교사 N:M 매핑 테이블';
+
+CREATE TABLE evaluation_item_teachers (
+  item_id    INT NOT NULL COMMENT '평가 항목 ID',
+  teacher_id INT NOT NULL COMMENT '교사 고유 ID',
+  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (item_id, teacher_id),
+  CONSTRAINT fk_eit_item FOREIGN KEY (item_id) REFERENCES evaluation_items(item_id) ON DELETE CASCADE,
+  CONSTRAINT fk_eit_teacher FOREIGN KEY (teacher_id) REFERENCES teachers(teachers_id) ON DELETE CASCADE
+) COMMENT '평가 항목별 전담 평가 교사 N:M 매핑 테이블';
+
+CREATE INDEX idx_cat_teacher_id
+  ON certification_area_teachers (teacher_id);
+
+CREATE INDEX idx_eit_teacher_id
+  ON evaluation_item_teachers (teacher_id);
 ```
+
+---
+
+## 📌 v1.5 변경 요약 (2026-10-12)
+
+| 테이블명 | 구분 | 컬럼 / 테이블명 | 타입 / 속성 | 변경 사유 및 요구사항 대응 |
+| :--- | :---: | :--- | :--- | :--- |
+| `certification_areas` | **컬럼 추가** | `subject` | `VARCHAR(40) NULL` | 2순위: 평가 담당 교과 지정 |
+| `certification_areas` | **컬럼 추가** | `department` | `VARCHAR(40) NULL` | 3순위: 평가 담당 부서 지정 |
+| `evaluation_items` | **컬럼 추가** | `subject` | `VARCHAR(40) NULL` | 2순위: 평가 담당 교과 (NULL이면 상위 영역 상속) |
+| `certification_area_teachers` | **테이블 신설** | `(area_id, teacher_id)` | `INT, INT, PK, FK` | 1순위: 인증 영역별 복수(N명) 전담 평가 교사 매핑 |
+| `evaluation_item_teachers` | **테이블 신설** | `(item_id, teacher_id)` | `INT, INT, PK, FK` | 1순위: 세부 평가 항목별 복수(N명) 전담 평가 교사 매핑 |
+| `certification_area_teachers` | **인덱스 추가** | `idx_cat_teacher_id` | `INDEX (teacher_id)` | 교사별 전담 인증 영역 역방향 조회 및 인가 성능 최적화 |
+| `evaluation_item_teachers` | **인덱스 추가** | `idx_eit_teacher_id` | `INDEX (teacher_id)` | 교사별 전담 평가 항목 역방향 조회 및 대시보드 인가 성능 최적화 |
+
+
