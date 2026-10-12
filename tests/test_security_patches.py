@@ -77,6 +77,28 @@ class MockRedis:
         self.ttls.pop(key, None)
         return val
 
+    async def eval(self, script, numkeys, *args):
+        key = args[0]
+        req_path = args[1] if len(args) > 1 else ""
+        raw = self.data.get(key)
+        if not raw:
+            return None
+        try:
+            data = json.loads(raw)
+        except Exception:
+            self.data.pop(key, None)
+            return None
+        expected = data.get("file_path", "").strip().lstrip("/\\")
+        if expected.startswith("uploads/"):
+            expected = expected[8:]
+        expected = os.path.normpath(expected).replace("\\", "/")
+        if expected == req_path:
+            self.data.pop(key, None)
+            self.ttls.pop(key, None)
+            return raw
+        else:
+            return "PATH_MISMATCH"
+
 
 class MockCursor:
     def __init__(self, conn):

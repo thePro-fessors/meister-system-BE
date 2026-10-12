@@ -151,19 +151,37 @@ class MockCursor:
         elif "SELECT LAST_INSERT_ID()" in sql_clean:
             self._current_result = [{"last_id": self.lastrowid}]
 
-        # 7. 파일 소유권 검증 조회 (submissions JOIN students)
+        # 7. 파일 소유권 검증 및 인가 조회 (submissions JOIN students)
         elif "FROM submissions s" in sql_clean and "JOIN students st" in sql_clean:
-            target_path = params[0]
             matched = []
-            for sub in self.conn.db_submissions:
-                if sub.get("file_path") == target_path and not sub.get("is_deleted"):
-                    student = next((s for s in self.conn.db_students if s["student_id"] == sub["student_id"]), None)
-                    if student:
+            if "s.submission_id = %s" in sql_clean:
+                target_sub_id = params[0]
+                for sub in self.conn.db_submissions:
+                    if sub.get("submission_id") == target_sub_id and not sub.get("is_deleted"):
+                        student = next((s for s in self.conn.db_students if s["student_id"] == sub["student_id"]), None)
                         matched.append({
                             "submission_id": sub["submission_id"],
                             "student_id": sub["student_id"],
-                            "uuid": student["uuid"],
+                            "student_uuid": student["uuid"] if student else None,
+                            "uuid": student["uuid"] if student else None,
+                            "year": 2026,
+                            "is_deleted": False,
+                            "status_code": sub.get("status_code", 1),
+                            "item_id": sub.get("item_id"),
                         })
+            else:
+                target_path = params[0]
+                for sub in self.conn.db_submissions:
+                    if sub.get("file_path") == target_path and not sub.get("is_deleted"):
+                        student = next((s for s in self.conn.db_students if s["student_id"] == sub["student_id"]), None)
+                        if student:
+                            matched.append({
+                                "submission_id": sub["submission_id"],
+                                "student_id": sub["student_id"],
+                                "student_uuid": student["uuid"],
+                                "uuid": student["uuid"],
+                                "year": 2026,
+                            })
             self._current_result = matched
 
     async def fetchone(self):
@@ -222,6 +240,7 @@ class MockConnection:
                 "area_grade": 1,
                 "area_name": "전공자격증",
                 "academic_year": 2026,
+                "year_is_activated": 1,
             },
             {
                 "item_id": 20,
@@ -236,6 +255,7 @@ class MockConnection:
                 "area_grade": 3,
                 "area_name": "전문기술역량",
                 "academic_year": 2026,
+                "year_is_activated": 1,
             },
             {
                 "item_id": 30,
@@ -250,6 +270,7 @@ class MockConnection:
                 "area_grade": 1,
                 "area_name": "교양",
                 "academic_year": 2026,
+                "year_is_activated": 1,
             },
             {
                 "item_id": 40,
@@ -264,6 +285,7 @@ class MockConnection:
                 "area_grade": 1,
                 "area_name": "인성역량",
                 "academic_year": 2026,
+                "year_is_activated": 1,
             },
         ]
 
