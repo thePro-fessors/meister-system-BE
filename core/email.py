@@ -225,7 +225,7 @@ async def send_otp_email(to_email: str, otp_code: str, user_name: str = "사용�
     if not validate_email_format(to_email):
         raise ValueError(f"유효하지 않은 이메일 형식입니다: {to_email}")
 
-    subject = f"[{SMTP_FROM_NAME}] 본인인증 번호 안내 ({otp_code})"
+    subject = f"[{SMTP_FROM_NAME}] 본인인증 번호 안내"
     html_content = _create_otp_html(otp_code, user_name)
 
     if EMAIL_PROVIDER == "console":

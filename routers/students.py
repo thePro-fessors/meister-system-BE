@@ -1314,7 +1314,7 @@ async def handle_get_points(
             student_id=target_student_id,
             conn=conn,
             year=year_val,
-            action="read",
+            action="read_points",
         )
         if auth_error:
             return auth_error
@@ -1378,7 +1378,7 @@ async def handle_get_points(
             "date": occ_str,
             "year": rec_year,
             "createdAt": created_str,
-            "teacherName": r["teacher_name"],
+            "teacherName": r.get("teacher_name"),
             "reflected": bool(r["is_reflected"]),
             "reflectedArea": r["related_area"],
         })

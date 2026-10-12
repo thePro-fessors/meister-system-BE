@@ -171,4 +171,5 @@ def calculate_student_certification(
         "certStatus": cert_status,
         "pendingCount": total_pending_count,
         "totalMeritScore": round_decimal(total_merit_score, 1),
+        "pointTotal": round_decimal(total_merit_score, 1),
     }

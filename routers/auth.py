@@ -1107,12 +1107,12 @@ async def patch_email(
 
             # 역할(role)에 따라 하위 테이블도 동기화
             user_role = user_data["role"]
-            if user_role == 0:  # 학생
+            if user_role in (0, "0", "student"):  # 학생
                 await cur.execute(
                     "UPDATE students SET email = %s WHERE uuid = %s AND is_deleted = FALSE",
                     (clean_mail, uuid)
                 )
-            elif user_role == 1:  # 교사
+            elif user_role in (1, "1", "teacher"):  # 교사
                 await cur.execute(
                     "UPDATE teachers SET email = %s WHERE uuid = %s AND is_deleted = FALSE",
                     (clean_mail, uuid)
