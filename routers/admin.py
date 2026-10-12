@@ -445,12 +445,11 @@ async def copy_year_criteria(
                     """,
                     (t_year_id, s_area["grade"], s_area["name"], s_area["max_score"]),
                 )
-                await cur.execute(
-                    "SELECT area_id FROM certification_areas WHERE year_id = %s AND grade = %s AND name = %s LIMIT 1",
-                    (t_year_id, s_area["grade"], s_area["name"]),
-                )
-                t_area_row = await cur.fetchone()
-                t_area_id = t_area_row["area_id"]
+                t_area_id = cur.lastrowid
+                if not t_area_id:
+                    await cur.execute("SELECT LAST_INSERT_ID() AS last_id")
+                    last_id_row = await cur.fetchone()
+                    t_area_id = last_id_row["last_id"] if isinstance(last_id_row, dict) else last_id_row[0]
                 copied_areas_count += 1
 
                 # 해당 영역의 항목 복제 (벌크 배치 최적화: SECURITY_AND_AUDIT.md 2.9)
