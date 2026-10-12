@@ -15,7 +15,7 @@ routers/teachers.py - 마이스터 역량인증제 교사용 API 라우터
 
 import logging
 from datetime import date, datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import APIRouter, Depends, Query, status
 from fastapi.responses import JSONResponse
@@ -31,6 +31,7 @@ from core.calculator import (
     round_decimal,
 )
 from core.academic import get_current_year, get_year_id_by_year
+from core.authorization import _expand_tokens
 from core.security import get_current_user
 from database import get_db
 from routers.students import SUBMISSION_STATUS_MAP
@@ -118,6 +119,93 @@ class TeacherStudentDetailResponse(BaseModel):
     student: Optional[Dict[str, Any]] = Field(None, description="학생 정보 객체 (호환용)")
 
 
+def _build_evaluator_hierarchy_sql_filter(
+    teacher_id: Optional[int],
+    teacher_subj: Optional[str],
+    teacher_dept: Optional[str],
+) -> Tuple[str, List[Any]]:
+    """
+    비담임/교과전담 교사의 대시보드 통계 및 최근 제출 목록 조회를 위한 1~3순위 및 상속 인가 필터 SQL 생성:
+    - 1순위: 전담 교사 개인 N명 지정 (item -> area 상속)
+    - 2순위: 담당 교과 일치 (item -> area 상속)
+    - 3순위: 소속 부서 일치 (item -> area 상속)
+    """
+    subj_tokens = _expand_tokens(None, teacher_subj) if teacher_subj else set()
+    dept_tokens = _expand_tokens(teacher_dept, None) if teacher_dept else set()
+
+    item_subj_clauses = []
+    item_subj_params: List[Any] = []
+    area_subj_clauses = []
+    area_subj_params: List[Any] = []
+    for tok in subj_tokens:
+        item_subj_clauses.append("(ei.subject = %s OR INSTR(ei.subject, %s) > 0 OR INSTR(%s, ei.subject) > 0)")
+        item_subj_params.extend([tok, tok, tok])
+        area_subj_clauses.append("(ca.subject = %s OR INSTR(ca.subject, %s) > 0 OR INSTR(%s, ca.subject) > 0)")
+        area_subj_params.extend([tok, tok, tok])
+
+    item_dept_clauses = []
+    item_dept_params: List[Any] = []
+    area_dept_clauses = []
+    area_dept_params: List[Any] = []
+    for tok in dept_tokens:
+        item_dept_clauses.append("(ei.department = %s OR INSTR(ei.department, %s) > 0 OR INSTR(%s, ei.department) > 0)")
+        item_dept_params.extend([tok, tok, tok])
+        area_dept_clauses.append("(ca.department = %s OR INSTR(ca.department, %s) > 0 OR INSTR(%s, ca.department) > 0)")
+        area_dept_params.extend([tok, tok, tok])
+
+    item_subj_sql = " OR ".join(item_subj_clauses) if item_subj_clauses else "1 = 0"
+    area_subj_sql = " OR ".join(area_subj_clauses) if area_subj_clauses else "1 = 0"
+    item_dept_sql = " OR ".join(item_dept_clauses) if item_dept_clauses else "1 = 0"
+    area_dept_sql = " OR ".join(area_dept_clauses) if area_dept_clauses else "1 = 0"
+
+    t_id_param = teacher_id if teacher_id is not None else -1
+
+    filter_sql = f"""
+        AND (
+            CASE
+                WHEN EXISTS (
+                    SELECT 1 FROM evaluation_item_teachers eit_chk
+                    JOIN teachers t_chk ON eit_chk.teacher_id = t_chk.teachers_id
+                    WHERE eit_chk.item_id = s.item_id AND t_chk.is_deleted = FALSE
+                )
+                THEN (CASE WHEN EXISTS (
+                    SELECT 1 FROM evaluation_item_teachers eit
+                    JOIN teachers t_eit ON eit.teacher_id = t_eit.teachers_id
+                    WHERE eit.item_id = s.item_id AND eit.teacher_id = %s AND t_eit.is_deleted = FALSE
+                ) THEN 1 ELSE 0 END)
+
+                WHEN ei.subject IS NOT NULL AND TRIM(ei.subject) != ''
+                THEN (CASE WHEN ({item_subj_sql}) THEN 1 ELSE 0 END)
+
+                WHEN ei.department IS NOT NULL AND TRIM(ei.department) != ''
+                THEN (CASE WHEN ({item_dept_sql}) THEN 1 ELSE 0 END)
+
+                WHEN EXISTS (
+                    SELECT 1 FROM certification_area_teachers cat_chk
+                    JOIN teachers t_chk2 ON cat_chk.teacher_id = t_chk2.teachers_id
+                    WHERE cat_chk.area_id = ca.area_id AND t_chk2.is_deleted = FALSE
+                )
+                THEN (CASE WHEN EXISTS (
+                    SELECT 1 FROM certification_area_teachers cat
+                    JOIN teachers t_cat ON cat.teacher_id = t_cat.teachers_id
+                    WHERE cat.area_id = ca.area_id AND cat.teacher_id = %s AND t_cat.is_deleted = FALSE
+                ) THEN 1 ELSE 0 END)
+
+                WHEN ca.subject IS NOT NULL AND TRIM(ca.subject) != ''
+                THEN (CASE WHEN ({area_subj_sql}) THEN 1 ELSE 0 END)
+
+                WHEN ca.department IS NOT NULL AND TRIM(ca.department) != ''
+                THEN (CASE WHEN ({area_dept_sql}) THEN 1 ELSE 0 END)
+
+                ELSE 0
+            END = 1
+        )
+    """
+
+    params = [t_id_param] + item_subj_params + item_dept_params + [t_id_param] + area_subj_params + area_dept_params
+    return filter_sql, params
+
+
 # ==============================================================================
 # 3.1 교사 대시보드 조회 API
 # ==============================================================================
@@ -167,7 +255,7 @@ async def get_teacher_dashboard(
     async with conn.cursor(cursor=DictCursor) as cur:
         await cur.execute(
             """
-            SELECT teachers_id, name, subject, grade, class, email
+            SELECT teachers_id, name, subject, grade, class, position, department, email
             FROM teachers
             WHERE uuid = %s AND is_deleted = FALSE
             LIMIT 1
@@ -193,16 +281,33 @@ async def get_teacher_dashboard(
     teacher_grade = teacher_row.get("grade") if teacher_row else None
     teacher_class = teacher_row.get("class") if teacher_row else None
     teacher_subject = teacher_row.get("subject") if teacher_row else None
+    teacher_position = teacher_row.get("position") if teacher_row else None
+    teacher_department = teacher_row.get("department") if teacher_row else None
+    teacher_id = teacher_row.get("teachers_id") if teacher_row else None
 
-    has_homeroom = (not is_admin) and (teacher_grade is not None and teacher_class is not None)
+    is_dept_head = (teacher_position == "부서부장") and (teacher_department in ("마이스터부", "교무기획부"))
+    is_grade_head = (teacher_position == "학년부장") and (teacher_grade is not None)
+    has_homeroom = (not is_admin) and (not is_dept_head) and (not is_grade_head) and (teacher_grade is not None and teacher_class is not None)
+    is_legacy_unrestricted = (
+        teacher_grade is None
+        and teacher_class is None
+        and not teacher_department
+        and not teacher_subject
+        and (not teacher_position or teacher_position != "교과전담")
+    )
 
-    if has_homeroom:
-        if teacher_subject:
-            scope_label = f"{teacher_grade}학년 {teacher_class}반 ({teacher_subject})"
-        else:
-            scope_label = f"{teacher_grade}학년 {teacher_class}반"
-    elif is_admin:
+    if is_admin:
         scope_label = "전체 학급 (관리자)"
+    elif is_grade_head:
+        scope_label = f"{teacher_grade}학년 학년부장" + (f" ({teacher_subject})" if teacher_subject else "")
+    elif has_homeroom:
+        pos_str = f" {teacher_position}" if (teacher_position and teacher_position != "교과전담") else ""
+        if teacher_subject:
+            scope_label = f"{teacher_grade}학년 {teacher_class}반{pos_str} ({teacher_subject})"
+        else:
+            scope_label = f"{teacher_grade}학년 {teacher_class}반{pos_str}"
+    elif teacher_department:
+        scope_label = f"{teacher_department}" + (f" ({teacher_subject})" if teacher_subject else "")
     elif teacher_subject:
         scope_label = f"{teacher_subject} 담당교사 (전체)"
     else:
@@ -227,6 +332,8 @@ async def get_teacher_dashboard(
                     "grade": teacher_grade,
                     "classNo": teacher_class,
                     "subject": teacher_subject,
+                    "position": teacher_position,
+                    "department": teacher_department,
                 },
                 "year": target_year,
                 "recentSubmissions": [],
@@ -254,6 +361,15 @@ async def get_teacher_dashboard(
     if has_homeroom:
         stats_sql += " AND sar.grade = %s AND sar.class = %s"
         stats_params.extend([teacher_grade, teacher_class])
+    elif is_grade_head:
+        stats_sql += " AND sar.grade = %s"
+        stats_params.append(teacher_grade)
+    elif not is_admin and not is_dept_head and not is_legacy_unrestricted:
+        hier_sql, hier_params = _build_evaluator_hierarchy_sql_filter(
+            teacher_id, teacher_subject, teacher_department
+        )
+        stats_sql += hier_sql
+        stats_params.extend(hier_params)
 
     async with conn.cursor(cursor=DictCursor) as cur:
         await cur.execute(stats_sql, tuple(stats_params))
@@ -274,6 +390,9 @@ async def get_teacher_dashboard(
     if has_homeroom:
         student_count_sql += " AND sar.grade = %s AND sar.class = %s"
         student_count_params.extend([teacher_grade, teacher_class])
+    elif is_grade_head:
+        student_count_sql += " AND sar.grade = %s"
+        student_count_params.append(teacher_grade)
 
     async with conn.cursor(cursor=DictCursor) as cur:
         await cur.execute(student_count_sql, tuple(student_count_params))
@@ -317,6 +436,15 @@ async def get_teacher_dashboard(
     if has_homeroom:
         recent_sql += " AND sar.grade = %s AND sar.class = %s"
         recent_params.extend([teacher_grade, teacher_class])
+    elif is_grade_head:
+        recent_sql += " AND sar.grade = %s"
+        recent_params.append(teacher_grade)
+    elif not is_admin and not is_dept_head and not is_legacy_unrestricted:
+        hier_sql, hier_params = _build_evaluator_hierarchy_sql_filter(
+            teacher_id, teacher_subject, teacher_department
+        )
+        recent_sql += hier_sql
+        recent_params.extend(hier_params)
 
     recent_sql += " ORDER BY s.created_at DESC, s.submission_id DESC LIMIT %s"
     recent_params.append(limit)
@@ -375,6 +503,8 @@ async def get_teacher_dashboard(
                 "grade": teacher_grade,
                 "classNo": teacher_class,
                 "subject": teacher_subject,
+                "position": teacher_position,
+                "department": teacher_department,
             },
             "year": target_year,
             "recentSubmissions": recent_submissions,
@@ -407,6 +537,8 @@ async def get_teacher_students(
     area: Optional[str] = Query(None, description="인증 영역 필터 (영역명 또는 areaId)"),
     status_filter: Optional[str] = Query(None, alias="status", description="인증 상태 또는 제출 상태 필터"),
     hasPoints: Optional[str] = Query(None, description="상벌점 보유 여부 필터 (true/false)"),
+    scope: Optional[str] = Query(None, description="조회 범위 (all, grade, homeroom)"),
+    all: Optional[bool] = Query(None, description="전체/타 학급 조회 허용 여부"),
     current_user: Dict[str, Any] = Depends(get_current_user),
     conn: Any = Depends(get_db),
 ):
@@ -419,7 +551,8 @@ async def get_teacher_students(
     1. 호출자 역할: 교사(teacher) 또는 관리자(admin)만 허용 (학생 접근 시 403 FORBIDDEN).
     2. 교사의 담당 학급(grade, class)이 배정된 경우, 클라이언트의 grade/class 쿼리 파라미터와 무관하게
        담당 학급으로 강제 격리(Scope Isolation)하여 타 학급 정보 조회를 원천 차단합니다.
-    3. 비담임 교과 교사 또는 관리자 계정은 grade, class 쿼리 파라미터를 통해 전체 학급을 필터링 및 조회할 수 있습니다.
+    3. 학년부장(position='학년부장')은 담당 학년 내 전체 반 학생 조회 가능.
+    4. 비담임 교과 교사 또는 관리자 계정은 grade, class 쿼리 파라미터를 통해 전체 학급을 필터링 및 조회할 수 있습니다.
     """
     user_role = current_user.get("role")
     user_uuid = current_user.get("uuid")
@@ -443,7 +576,7 @@ async def get_teacher_students(
     async with conn.cursor(cursor=DictCursor) as cur:
         await cur.execute(
             """
-            SELECT teachers_id, name, grade, class AS class_num, subject
+            SELECT teachers_id, name, grade, class AS class_num, class, subject, position, department
             FROM teachers
             WHERE uuid = %s AND is_deleted = FALSE
             LIMIT 1
@@ -468,7 +601,12 @@ async def get_teacher_students(
     if teacher_class is None and teacher_row:
         teacher_class = teacher_row.get("class")
 
-    has_homeroom = (not is_admin) and (teacher_grade is not None and teacher_class is not None)
+    teacher_position = (teacher_row.get("position") or "").strip() if teacher_row else ""
+    teacher_dept = (teacher_row.get("department") or "").strip() if teacher_row else ""
+
+    is_dept_head = teacher_position == "부서부장" and teacher_dept in ("마이스터부", "교무기획부")
+    is_grade_head = (teacher_position == "학년부장") and (teacher_grade is not None)
+    has_homeroom = (not is_admin) and (not is_dept_head) and (not is_grade_head) and (teacher_grade is not None and teacher_class is not None)
 
     # 3. 학년도 및 year_id 조회
     target_year = year if year is not None else await get_current_year()
@@ -482,11 +620,26 @@ async def get_teacher_students(
             error=None,
         ).model_dump()
 
-    # 4. 담임 권한 범위 강제 적용 및 필터 해석
+    # 4. 담임/학년부장 권한 범위 강제 적용 및 필터 해석
     req_class = classNo if classNo is not None else class_no
     req_number = studentNo if studentNo is not None else number
 
-    if has_homeroom:
+    allow_cross_class = is_admin or is_dept_head or (scope in ("all", "school")) or (all is True)
+
+    if is_grade_head and not allow_cross_class:
+        if grade is not None and grade != teacher_grade:
+            return JSONResponse(
+                status_code=status.HTTP_403_FORBIDDEN,
+                content=SrFormat(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    success=False,
+                    data=None,
+                    error=Error(code="FORBIDDEN", message=f"{teacher_grade}학년 학생의 데이터만 조회할 수 있습니다."),
+                ).model_dump(),
+            )
+        target_grade = teacher_grade
+        target_class = req_class
+    elif has_homeroom and not allow_cross_class:
         # 클라이언트가 본인 담임 학급 이외의 학년 또는 반을 지정하여 우회 조회를 시도하는 경우 403 Forbidden 차단
         if (grade is not None and grade != teacher_grade) or (req_class is not None and req_class != teacher_class):
             return JSONResponse(
@@ -780,7 +933,7 @@ async def get_teacher_student_detail(
     async with conn.cursor(cursor=DictCursor) as cur:
         await cur.execute(
             """
-            SELECT teachers_id, name, grade, class AS class_num, subject
+            SELECT teachers_id, name, grade, class AS class_num, class, subject, position, department
             FROM teachers
             WHERE uuid = %s AND is_deleted = FALSE
             LIMIT 1
@@ -805,8 +958,15 @@ async def get_teacher_student_detail(
         teacher_class = teacher_row.get("class_num")
         if teacher_class is None:
             teacher_class = teacher_row.get("class")
+        teacher_position = (teacher_row.get("position") or "").strip()
+        teacher_dept = (teacher_row.get("department") or "").strip()
+    else:
+        teacher_position = ""
+        teacher_dept = ""
 
-    has_homeroom = (not is_admin) and (teacher_grade is not None and teacher_class is not None)
+    is_dept_head = teacher_position == "부서부장" and teacher_dept in ("마이스터부", "교무기획부")
+    is_grade_head = (teacher_position == "학년부장") and (teacher_grade is not None)
+    has_homeroom = (not is_admin) and (not is_dept_head) and (not is_grade_head) and (teacher_grade is not None and teacher_class is not None)
 
     # 3. 대상 학생 존재 여부 확인
     async with conn.cursor(cursor=DictCursor) as cur:
@@ -874,8 +1034,19 @@ async def get_teacher_student_detail(
     st_class = academic_record["class_no"]
     st_number = academic_record["number"]
 
-    # 5. 담임 권한 범위 검증 (Scope Isolation & IDOR 방어)
-    if has_homeroom:
+    # 5. 담임/학년부장 권한 범위 검증 (Scope Isolation & IDOR 방어)
+    if is_grade_head:
+        if st_grade != teacher_grade:
+            return JSONResponse(
+                status_code=status.HTTP_403_FORBIDDEN,
+                content=SrFormat(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    success=False,
+                    data=None,
+                    error=Error(code="FORBIDDEN", message=f"{teacher_grade}학년 학생만 상세 조회할 수 있습니다."),
+                ).model_dump(),
+            )
+    elif has_homeroom:
         if st_grade != teacher_grade or st_class != teacher_class:
             return JSONResponse(
                 status_code=status.HTTP_403_FORBIDDEN,
