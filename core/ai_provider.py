@@ -57,6 +57,7 @@ def resolve_gemini_model_name(raw_model: Optional[str] = None) -> str:
     model = (raw_model or os.getenv("GEMINI_MODEL") or DEFAULT_GEMINI_MODEL).strip()
     normalized = model.lower().replace(" ", "-")
     alias_map = {
+        "gemini-3.8-flash": "gemini-3.8-flash",
         "gemini-3.5-flash-lite": "gemini-3.5-flash-lite",
         "3.5-flash-lite": "gemini-3.5-flash-lite",
         "gemini-3.5-flash": "gemini-3.5-flash",

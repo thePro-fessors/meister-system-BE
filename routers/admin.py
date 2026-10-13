@@ -449,13 +449,22 @@ async def copy_year_criteria(
                 if not t_area_id:
                     await cur.execute("SELECT LAST_INSERT_ID() AS last_id")
                     last_id_row = await cur.fetchone()
-                    t_area_id = last_id_row["last_id"] if isinstance(last_id_row, dict) else last_id_row[0]
+                    if last_id_row:
+                        t_area_id = last_id_row.get("last_id") if isinstance(last_id_row, dict) else last_id_row[0]
+                if not t_area_id:
+                    await cur.execute(
+                        "SELECT area_id FROM certification_areas WHERE year_id = %s AND grade = %s AND name = %s LIMIT 1",
+                        (t_year_id, s_area["grade"], s_area["name"]),
+                    )
+                    fb_row = await cur.fetchone()
+                    if fb_row:
+                        t_area_id = fb_row.get("area_id") if isinstance(fb_row, dict) else fb_row[0]
                 copied_areas_count += 1
 
-                # 해당 영역의 항목 복제 (벌크 배치 최적화: SECURITY_AND_AUDIT.md 2.9)
+                # 해당 영역의 항목 복제 (벌크 배치 최적화 및 subject, scoring_rules, teacher 보존: SECURITY_AND_AUDIT.md 3.15)
                 await cur.execute(
                     """
-                    SELECT name, department, max_score, scoring_type, target_grade, requires_evidence
+                    SELECT item_id, name, subject, department, max_score, scoring_type, target_grade, requires_evidence
                     FROM evaluation_items
                     WHERE area_id = %s AND is_active = TRUE
                     """,
@@ -464,30 +473,100 @@ async def copy_year_criteria(
                 source_items = await cur.fetchall()
 
                 if source_items:
-                    items_params = [
-                        (
-                            t_area_id,
-                            s_item["name"],
-                            s_item.get("department"),
-                            s_item["max_score"],
-                            s_item["scoring_type"],
-                            s_item["target_grade"],
-                            s_item["requires_evidence"],
+                    for s_item in source_items:
+                        await cur.execute(
+                            """
+                            INSERT INTO evaluation_items (
+                                area_id, name, department, max_score, scoring_type, target_grade, requires_evidence, subject, is_active
+                            )
+                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, TRUE)
+                            """,
+                            (
+                                t_area_id,
+                                s_item["name"],
+                                s_item.get("department"),
+                                s_item["max_score"],
+                                s_item["scoring_type"],
+                                s_item["target_grade"],
+                                s_item["requires_evidence"],
+                                s_item.get("subject"),
+                            ),
                         )
-                        for s_item in source_items
-                    ]
-                    insert_sql = """
-                        INSERT INTO evaluation_items (
-                            area_id, name, department, max_score, scoring_type, target_grade, requires_evidence, is_active
-                        )
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, TRUE)
-                    """
-                    if hasattr(cur, "executemany"):
-                        await cur.executemany(insert_sql, items_params)
-                    else:
-                        for p in items_params:
-                            await cur.execute(insert_sql, p)
-                    copied_items_count += len(source_items)
+                        new_item_id = cur.lastrowid
+                        if not new_item_id:
+                            await cur.execute("SELECT LAST_INSERT_ID() AS last_id")
+                            last_id_row = await cur.fetchone()
+                            if last_id_row:
+                                new_item_id = last_id_row.get("last_id") if isinstance(last_id_row, dict) else last_id_row[0]
+                        if not new_item_id and t_area_id:
+                            await cur.execute(
+                                "SELECT item_id FROM evaluation_items WHERE area_id = %s AND name = %s ORDER BY item_id DESC LIMIT 1",
+                                (t_area_id, s_item["name"]),
+                            )
+                            fb_item_row = await cur.fetchone()
+                            if fb_item_row:
+                                new_item_id = fb_item_row.get("item_id") if isinstance(fb_item_row, dict) else fb_item_row[0]
+                        copied_items_count += 1
+
+                        # 세부 점수 기준(scoring_rules) 테이블 복제 보존
+                        s_item_id = s_item.get("item_id") if isinstance(s_item, dict) else s_item[0]
+                        if s_item_id and new_item_id:
+                            await cur.execute(
+                                """
+                                SELECT condition_value, score
+                                FROM scoring_rules
+                                WHERE item_id = %s
+                                """,
+                                (s_item_id,),
+                            )
+                            s_rules = await cur.fetchall() or []
+                            valid_rules = []
+                            for r in s_rules:
+                                if isinstance(r, dict):
+                                    c_val = r.get("condition_value")
+                                    sc_val = r.get("score")
+                                elif isinstance(r, (list, tuple)) and len(r) >= 2:
+                                    c_val = r[0]
+                                    sc_val = r[1]
+                                else:
+                                    continue
+                                valid_rules.append((new_item_id, c_val, sc_val))
+
+                            if valid_rules:
+                                rules_sql = "INSERT INTO scoring_rules (item_id, condition_value, score) VALUES (%s, %s, %s)"
+                                if hasattr(cur, "executemany"):
+                                    await cur.executemany(rules_sql, valid_rules)
+                                else:
+                                    for rp in valid_rules:
+                                        await cur.execute(rules_sql, rp)
+
+                            # 1순위 평가 항목 전담 교사(evaluation_item_teachers) 재직 교사 대상 보존 복제
+                            try:
+                                await cur.execute(
+                                    """
+                                    SELECT eit.teacher_id
+                                    FROM evaluation_item_teachers eit
+                                    JOIN teachers t ON eit.teacher_id = t.teachers_id
+                                    WHERE eit.item_id = %s AND t.is_deleted = FALSE
+                                    """,
+                                    (s_item_id,),
+                                )
+                                s_teachers = await cur.fetchall() or []
+                                valid_tids = [
+                                    (t.get("teacher_id") if isinstance(t, dict) else t[0])
+                                    for t in s_teachers
+                                    if (t.get("teacher_id") if isinstance(t, dict) else t[0]) is not None
+                                ]
+                                if valid_tids:
+                                    t_params = [(new_item_id, tid) for tid in valid_tids]
+                                    t_sql = "INSERT INTO evaluation_item_teachers (item_id, teacher_id) VALUES (%s, %s)"
+                                    if hasattr(cur, "executemany"):
+                                        await cur.executemany(t_sql, t_params)
+                                    else:
+                                        for tp in t_params:
+                                            await cur.execute(t_sql, tp)
+                            except Exception as te_err:
+                                logger.warning(f"전담 교사 매핑 복제 생략: {te_err}")
 
         await conn.commit()
     except Exception:

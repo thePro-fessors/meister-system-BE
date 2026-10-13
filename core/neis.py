@@ -15,6 +15,7 @@ core/neis.py - NEIS(나이스) 교육정보 개방 포털 연동 및 학급 검�
 """
 
 import logging
+import os
 from typing import Any, Dict, List, Optional, Set, Tuple
 import httpx
 
@@ -28,7 +29,8 @@ NEIS_SCHOOL_NAME = "부산소프트웨어마이스터고등학교"
 
 NEIS_BASE_URL = "https://open.neis.go.kr/hub"
 
-# 학급 캐시 (메모리 캐싱: year -> Set[(grade, class_no)])
+# 학급 캐시 (메모리 캐싱: year -> Set[(grade, class_no)]) 및 메모리 보호 상한
+MAX_NEIS_CACHE_ENTRIES = 20
 _NEIS_CLASS_CACHE: Dict[int, Set[Tuple[int, int]]] = {}
 
 
@@ -82,13 +84,14 @@ async def get_school_info(
     """
     NEIS Open API를 통해 부산소프트웨어마이스터고등학교 기본 정보를 조회합니다.
     """
+    eff_key = (api_key or os.getenv("NEIS_API_KEY") or "").strip() or None
     params: Dict[str, Any] = {
         "Type": "json",
         "ATPT_OFCDC_SC_CODE": NEIS_OFFICE_CODE,
         "SD_SCHUL_CODE": NEIS_SCHOOL_CODE,
     }
-    if api_key:
-        params["KEY"] = api_key
+    if eff_key:
+        params["KEY"] = eff_key
 
     try:
         async with httpx.AsyncClient(timeout=timeout) as client:
@@ -114,6 +117,11 @@ async def get_classes_for_year(
     """
     NEIS Open API를 통해 특정 학년도 부산소프트웨어마이스터고등학교 개설 학급 목록을 조회합니다.
     """
+    if not (2000 <= year <= 2100):
+        logger.warning(f"유효 범위를 벗어난 NEIS 학년도 조회 시도: {year}")
+        return []
+
+    eff_key = (api_key or os.getenv("NEIS_API_KEY") or "").strip() or None
     params: Dict[str, Any] = {
         "Type": "json",
         "pSize": 100,
@@ -121,8 +129,8 @@ async def get_classes_for_year(
         "SD_SCHUL_CODE": NEIS_SCHOOL_CODE,
         "AY": str(year),
     }
-    if api_key:
-        params["KEY"] = api_key
+    if eff_key:
+        params["KEY"] = eff_key
 
     try:
         async with httpx.AsyncClient(timeout=timeout) as client:
@@ -144,12 +152,20 @@ async def get_classes_for_year(
                     except (ValueError, TypeError):
                         continue
                 if class_set:
+                    while len(_NEIS_CLASS_CACHE) >= MAX_NEIS_CACHE_ENTRIES and year not in _NEIS_CLASS_CACHE:
+                        oldest_k = next(iter(_NEIS_CLASS_CACHE))
+                        _NEIS_CLASS_CACHE.pop(oldest_k, None)
                     _NEIS_CLASS_CACHE[year] = class_set
                 return rows
     except Exception as e:
         logger.warning(f"NEIS classInfo request failed: {e}")
 
     return []
+
+
+def clear_neis_cache() -> None:
+    """NEIS 인메모리 학급 캐시 초기화 (테스트 및 갱신용)"""
+    _NEIS_CLASS_CACHE.clear()
 
 
 async def validate_class_against_neis(
@@ -162,6 +178,9 @@ async def validate_class_against_neis(
     해당 학년/반이 NEIS에 정규 편성된 학급인지 검증합니다.
     - NEIS 호출 실패 시 서비스 중단을 방지하기 위해 유효 범위(1~3학년, 1~4반) 기본 룰로 폴백합니다.
     """
+    if not (2000 <= year <= 2100):
+        return False, f"유효하지 않은 학사년도입니다 ({year})."
+
     # 1. 캐시 확인
     if year in _NEIS_CLASS_CACHE:
         is_valid = (grade, class_no) in _NEIS_CLASS_CACHE[year]

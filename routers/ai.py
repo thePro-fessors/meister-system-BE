@@ -375,38 +375,36 @@ async def get_ai_db(request: Request):
 
 def get_teacher_ai_config() -> tuple[str, str]:
     """
-    교사용 AI 전용 설정 반환.
+    교사용 AI 전용 설정 반환 (Multi-Provider: Gemini, OpenAI, Claude, Compatible).
     우선순위:
-    - API Key: TEACHER_AI_API_KEY > GEMINI_API_KEY > AI_API_KEY
-    - Model: GEMINI_TEACHER_MODEL > GEMINI_MODEL > DEFAULT_GEMINI_MODEL
+    - API Key: TEACHER_AI_API_KEY > Provider별 Key (OPENAI_API_KEY 등) > GEMINI_API_KEY > AI_API_KEY
+    - Model: TEACHER_AI_MODEL > Provider별 Model > GEMINI_TEACHER_MODEL > 기본 모델
     """
-    api_key = (
-        os.getenv("TEACHER_AI_API_KEY")
-        or os.getenv("GEMINI_API_KEY")
-        or os.getenv("AI_API_KEY")
-        or ""
-    ).strip()
-    raw_model = os.getenv("GEMINI_TEACHER_MODEL")
-    model = resolve_gemini_model(raw_model)
-    return api_key, model
+    cfg = resolve_ai_config("teacher")
+    eff_key = cfg.api_key or ("dummy-base-url" if cfg.base_url else "")
+    raw_model = os.getenv("TEACHER_AI_MODEL") or os.getenv("GEMINI_TEACHER_MODEL")
+    if cfg.provider == "gemini":
+        model = resolve_gemini_model(raw_model)
+    else:
+        model = cfg.model
+    return eff_key, model
 
 
 def get_admin_ai_config() -> tuple[str, str]:
     """
-    관리자용 AI 전용 설정 반환.
+    관리자용 AI 전용 설정 반환 (Multi-Provider: Gemini, OpenAI, Claude, Compatible).
     우선순위:
-    - API Key: ADMIN_AI_API_KEY > GEMINI_API_KEY > AI_API_KEY
-    - Model: GEMINI_ADMIN_MODEL > GEMINI_MODEL > DEFAULT_GEMINI_MODEL
+    - API Key: ADMIN_AI_API_KEY > Provider별 Key (OPENAI_API_KEY 등) > GEMINI_API_KEY > AI_API_KEY
+    - Model: ADMIN_AI_MODEL > Provider별 Model > GEMINI_ADMIN_MODEL > 기본 모델
     """
-    api_key = (
-        os.getenv("ADMIN_AI_API_KEY")
-        or os.getenv("GEMINI_API_KEY")
-        or os.getenv("AI_API_KEY")
-        or ""
-    ).strip()
-    raw_model = os.getenv("GEMINI_ADMIN_MODEL")
-    model = resolve_gemini_model(raw_model)
-    return api_key, model
+    cfg = resolve_ai_config("admin")
+    eff_key = cfg.api_key or ("dummy-base-url" if cfg.base_url else "")
+    raw_model = os.getenv("ADMIN_AI_MODEL") or os.getenv("GEMINI_ADMIN_MODEL")
+    if cfg.provider == "gemini":
+        model = resolve_gemini_model(raw_model)
+    else:
+        model = cfg.model
+    return eff_key, model
 
 
 async def call_gemini_api(
@@ -561,9 +559,10 @@ async def classify_submission(
 
     recommendations: List[Dict[str, Any]] = []
 
-    # 3. Gemini API 호출 시도 (API 키 존재 시)
-    gemini_key = (os.getenv("GEMINI_API_KEY") or os.getenv("AI_API_KEY") or "").strip()
-    if gemini_key and combined_clean:
+    # 3. LLM API 호출 시도 (Multi-Provider API 키/설정 존재 시)
+    student_ai_cfg = resolve_ai_config("student")
+    has_student_ai = bool(student_ai_cfg.api_key or student_ai_cfg.base_url)
+    if has_student_ai and combined_clean:
         candidate_context = ""
         if db_items:
             candidate_context = "\n[학교 실제 활성 평가 항목 목록]\n" + "\n".join(
@@ -1099,11 +1098,12 @@ async def student_chat(
 {area_lines_str}
 """
 
-    # 8. Gemini LLM 호출 준비 (System Prompt & Injection 방어)
-    gemini_key = (os.getenv("GEMINI_API_KEY") or os.getenv("AI_API_KEY") or "").strip()
+    # 8. Multi-Provider LLM 호출 준비 (System Prompt & Injection 방어)
+    student_ai_cfg = resolve_ai_config("student")
+    has_student_ai = bool(student_ai_cfg.api_key or student_ai_cfg.base_url)
     reply = ""
 
-    if gemini_key:
+    if has_student_ai:
         system_instruction = f"""너는 부산소프트웨어마이스터고등학교(BSSM) 역량인증제 학생 맞춤형 도우미 챗봇이다.
 항상 친절하고 정확하게 한국어로 존댓말을 사용하여 학생의 역량 달성을 격려하며 지도하라.
 

@@ -24,8 +24,8 @@ import openpyxl
 # 이메일 기본 정규식
 EMAIL_REGEX = re.compile(r"^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$")
 
-# 수식 인젝션 위험 접두어 패턴
-FORMULA_PREFIX_REGEX = re.compile(r"^[\s]*[=+\-@\t\r]")
+# 수식 인젝션 위험 접두어 패턴 (DDE 실행 기호 | 포함)
+FORMULA_PREFIX_REGEX = re.compile(r"^[\s]*[=+\-@|\t\r]")
 
 
 def sanitize_text(value: Any) -> str:
@@ -33,9 +33,9 @@ def sanitize_text(value: Any) -> str:
     if value is None:
         return ""
     text = str(value).strip()
-    # 수식 기호(=, +, -, @)로 시작하는 경우 수식 실행을 방지하기 위해 앞선 특수문자 제거
+    # 수식 기호(=, +, -, @, |)로 시작하는 경우 수식 실행을 방지하기 위해 앞선 특수문자 제거
     while text and FORMULA_PREFIX_REGEX.match(text):
-        text = text.lstrip("=+-@ \t\r\n")
+        text = text.lstrip("=+-@| \t\r\n")
     return text.strip()
 
 
