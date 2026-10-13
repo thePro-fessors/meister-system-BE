@@ -1870,31 +1870,76 @@ async def batch_register_students(
     try:
         await conn.autocommit(False)
         async with conn.cursor(cursor=DictCursor) as cur:
-            for st in final_to_insert:
-                # [보안 1.24] 교사 명단(teachers)에 이미 등록된 이메일인지 교차 검증 (Role Confusion 방지)
+            # [2.17 성능 최적화] 사전 벌크 조회: 기존 교사 이메일, 기존 학생 정보, 기존 학적 정보 1회 일괄 조회
+            all_emails = list({st["email"] for st in final_to_insert if st.get("email")})
+            existing_teacher_emails: Set[str] = set()
+            existing_students_map: Dict[str, Dict[str, Any]] = {}
+            existing_records_map: Dict[int, Dict[str, Any]] = {}
+
+            if all_emails:
+                # 1) 교사 명단 이메일 교차 중복 일괄 사전 검증 (Role Confusion 방지)
+                t_placeholders = ", ".join(["%s"] * len(all_emails))
                 await cur.execute(
-                    "SELECT teachers_id FROM teachers WHERE email = %s AND is_deleted = FALSE LIMIT 1",
-                    (st["email"],),
+                    f"SELECT email FROM teachers WHERE email IN ({t_placeholders}) AND is_deleted = FALSE",
+                    tuple(all_emails),
                 )
-                if await cur.fetchone():
+                t_rows = await cur.fetchall() or []
+                for tr in t_rows:
+                    em = tr["email"] if isinstance(tr, dict) else tr[0]
+                    if em:
+                        existing_teacher_emails.add(em)
+
+                # 2) 학생 테이블(students) 일괄 사전 조회
+                s_placeholders = ", ".join(["%s"] * len(all_emails))
+                await cur.execute(
+                    f"SELECT student_id, name, email, is_deleted FROM students WHERE email IN ({s_placeholders})",
+                    tuple(all_emails),
+                )
+                s_rows = await cur.fetchall() or []
+                for sr in s_rows:
+                    em = sr["email"] if isinstance(sr, dict) else sr[2]
+                    if em:
+                        existing_students_map[em] = sr
+
+                # 3) 기존 학생들의 학년도별 학적(student_academic_records) 일괄 사전 조회
+                ex_sids = [
+                    (sr["student_id"] if isinstance(sr, dict) else sr[0])
+                    for sr in existing_students_map.values()
+                ]
+                if ex_sids:
+                    sid_placeholders = ", ".join(["%s"] * len(ex_sids))
+                    await cur.execute(
+                        f"""
+                        SELECT record_id, student_id, grade, class, number
+                        FROM student_academic_records
+                        WHERE year_id = %s AND student_id IN ({sid_placeholders})
+                        """,
+                        (target_year_id, *ex_sids),
+                    )
+                    r_rows = await cur.fetchall() or []
+                    for rr in r_rows:
+                        sid = rr["student_id"] if isinstance(rr, dict) else rr[1]
+                        existing_records_map[sid] = rr
+
+            for st in final_to_insert:
+                st_email = st["email"]
+                # [보안 1.24] 교사 명단(teachers)에 이미 등록된 이메일인지 검증
+                if st_email in existing_teacher_emails:
                     parsing_errors.append({
                         "row": st.get("row_number", 0),
                         "name": st["name"],
-                        "reason": f"교사 명단에 이미 등록된 이메일({st['email']})이므로 학생으로 등록할 수 없습니다.",
+                        "reason": f"교사 명단에 이미 등록된 이메일({st_email})이므로 학생으로 등록할 수 없습니다.",
                     })
                     skipped_count += 1
                     continue
 
                 # 1) students 테이블 조회/생성
-                await cur.execute(
-                    "SELECT student_id, name, is_deleted FROM students WHERE email = %s LIMIT 1",
-                    (st["email"],),
-                )
-                ex_student = await cur.fetchone()
-
+                ex_student = existing_students_map.get(st_email)
                 if ex_student:
-                    student_id = ex_student["student_id"]
-                    if is_overwrite and ex_student["name"] != st["name"]:
+                    student_id = ex_student["student_id"] if isinstance(ex_student, dict) else ex_student[0]
+                    ex_name = ex_student["name"] if isinstance(ex_student, dict) else ex_student[1]
+                    is_del = ex_student.get("is_deleted") if isinstance(ex_student, dict) else (ex_student[3] if len(ex_student) > 3 else False)
+                    if is_overwrite and (ex_name != st["name"] or is_del):
                         await cur.execute(
                             "UPDATE students SET name = %s, is_deleted = FALSE WHERE student_id = %s",
                             (st["name"], student_id),
@@ -1902,26 +1947,25 @@ async def batch_register_students(
                 else:
                     await cur.execute(
                         "INSERT INTO students (name, email, status, is_deleted) VALUES (%s, %s, 0, FALSE)",
-                        (st["name"], st["email"]),
+                        (st["name"], st_email),
                     )
-                    await cur.execute("SELECT LAST_INSERT_ID() AS last_id")
-                    last_id_row = await cur.fetchone()
-                    student_id = last_id_row["last_id"] if isinstance(last_id_row, dict) else last_id_row[0]
+                    student_id = cur.lastrowid
+                    if not student_id:
+                        await cur.execute("SELECT LAST_INSERT_ID() AS last_id")
+                        last_id_row = await cur.fetchone()
+                        student_id = last_id_row["last_id"] if isinstance(last_id_row, dict) else last_id_row[0]
                     created_count += 1
+                    existing_students_map[st_email] = {
+                        "student_id": student_id,
+                        "name": st["name"],
+                        "email": st_email,
+                        "is_deleted": False,
+                    }
 
                 # 2) student_academic_records 테이블 조회/생성/갱신
-                await cur.execute(
-                    """
-                    SELECT record_id, grade, class, number
-                    FROM student_academic_records
-                    WHERE student_id = %s AND year_id = %s
-                    LIMIT 1
-                    """,
-                    (student_id, target_year_id),
-                )
-                ex_record = await cur.fetchone()
-
+                ex_record = existing_records_map.get(student_id)
                 if ex_record:
+                    rec_id = ex_record["record_id"] if isinstance(ex_record, dict) else ex_record[0]
                     if is_overwrite:
                         await cur.execute(
                             """
@@ -1929,7 +1973,7 @@ async def batch_register_students(
                             SET grade = %s, class = %s, number = %s
                             WHERE record_id = %s
                             """,
-                            (st["grade"], st["class_no"], st["student_no"], ex_record["record_id"]),
+                            (st["grade"], st["class_no"], st["student_no"], rec_id),
                         )
                         updated_count += 1
                     else:
@@ -1942,6 +1986,20 @@ async def batch_register_students(
                         """,
                         (student_id, target_year_id, st["grade"], st["class_no"], st["student_no"]),
                     )
+                    rec_id = cur.lastrowid
+                    if not rec_id:
+                        await cur.execute("SELECT LAST_INSERT_ID() AS last_id")
+                        last_id_row = await cur.fetchone()
+                        rec_id = last_id_row["last_id"] if isinstance(last_id_row, dict) else last_id_row[0]
+                    existing_records_map[student_id] = {
+                        "record_id": rec_id,
+                        "student_id": student_id,
+                        "grade": st["grade"],
+                        "class": st["class_no"],
+                        "number": st["student_no"],
+                    }
+                    if ex_student:
+                        updated_count += 1
 
         await conn.commit()
     except Exception:
@@ -2263,29 +2321,51 @@ async def batch_register_teachers(
     try:
         await conn.autocommit(False)
         async with conn.cursor(cursor=DictCursor) as cur:
-            for t in final_to_insert:
-                # [보안 1.24] 학생 명단(students)에 이미 등록된 이메일인지 교차 검증 (Role Confusion 방지)
+            # [2.17 성능 최적화] 사전 벌크 조회: 기존 학생 이메일, 기존 교사 정보 1회 일괄 조회
+            all_emails = list({t["email"] for t in final_to_insert if t.get("email")})
+            existing_student_emails: Set[str] = set()
+            existing_teachers_map: Dict[str, Dict[str, Any]] = {}
+
+            if all_emails:
+                # 1) 학생 명단(students) 이메일 교차 중복 일괄 사전 검증 (Role Confusion 방지)
+                s_placeholders = ", ".join(["%s"] * len(all_emails))
                 await cur.execute(
-                    "SELECT student_id FROM students WHERE email = %s AND is_deleted = FALSE LIMIT 1",
-                    (t["email"],),
+                    f"SELECT email FROM students WHERE email IN ({s_placeholders}) AND is_deleted = FALSE",
+                    tuple(all_emails),
                 )
-                if await cur.fetchone():
+                s_rows = await cur.fetchall() or []
+                for sr in s_rows:
+                    em = sr["email"] if isinstance(sr, dict) else sr[0]
+                    if em:
+                        existing_student_emails.add(em)
+
+                # 2) 교사 테이블(teachers) 일괄 사전 조회
+                t_placeholders = ", ".join(["%s"] * len(all_emails))
+                await cur.execute(
+                    f"SELECT teachers_id, name, subject, position, department, grade, class, email, is_deleted FROM teachers WHERE email IN ({t_placeholders})",
+                    tuple(all_emails),
+                )
+                t_rows = await cur.fetchall() or []
+                for tr in t_rows:
+                    em = tr["email"] if isinstance(tr, dict) else tr[7]
+                    if em:
+                        existing_teachers_map[em] = tr
+
+            for t in final_to_insert:
+                t_email = t["email"]
+                # [보안 1.24] 학생 명단(students)에 이미 등록된 이메일인지 검증
+                if t_email in existing_student_emails:
                     parsing_errors.append({
                         "row": t.get("row_number", 0),
                         "name": t["name"],
-                        "reason": f"학생 명단에 이미 등록된 이메일({t['email']})이므로 교사로 등록할 수 없습니다.",
+                        "reason": f"학생 명단에 이미 등록된 이메일({t_email})이므로 교사로 등록할 수 없습니다.",
                     })
                     skipped_count += 1
                     continue
 
-                await cur.execute(
-                    "SELECT teachers_id, name, subject, grade, class, is_deleted FROM teachers WHERE email = %s LIMIT 1",
-                    (t["email"],),
-                )
-                ex_teacher = await cur.fetchone()
-
+                ex_teacher = existing_teachers_map.get(t_email)
                 if ex_teacher:
-                    teachers_id = ex_teacher["teachers_id"]
+                    teachers_id = ex_teacher["teachers_id"] if isinstance(ex_teacher, dict) else ex_teacher[0]
                     if is_overwrite:
                         await cur.execute(
                             """
@@ -2310,9 +2390,25 @@ async def batch_register_teachers(
                         INSERT INTO teachers (name, subject, position, department, grade, class, email, is_deleted)
                         VALUES (%s, %s, %s, %s, %s, %s, %s, FALSE)
                         """,
-                        (t["name"], t["subject"], t.get("position", "교과전담"), t.get("department"), t["grade"], t["class_no"], t["email"]),
+                        (t["name"], t["subject"], t.get("position", "교과전담"), t.get("department"), t["grade"], t["class_no"], t_email),
                     )
+                    new_tid = cur.lastrowid
+                    if not new_tid:
+                        await cur.execute("SELECT LAST_INSERT_ID() AS last_id")
+                        last_id_row = await cur.fetchone()
+                        new_tid = last_id_row["last_id"] if isinstance(last_id_row, dict) else last_id_row[0]
                     created_count += 1
+                    existing_teachers_map[t_email] = {
+                        "teachers_id": new_tid,
+                        "email": t_email,
+                        "name": t["name"],
+                        "subject": t["subject"],
+                        "position": t.get("position", "교과전담"),
+                        "department": t.get("department"),
+                        "grade": t["grade"],
+                        "class": t["class_no"],
+                        "is_deleted": False,
+                    }
 
         await conn.commit()
     except Exception:

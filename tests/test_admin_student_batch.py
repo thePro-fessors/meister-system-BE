@@ -60,10 +60,26 @@ class BatchMockCursor:
             else:
                 self._current_result = list(self.conn.db_years)
 
+        # teachers 조회
+        elif "FROM teachers" in sql_clean:
+            teachers = getattr(self.conn, "db_teachers", [])
+            if "WHERE email IN" in sql_clean:
+                self._current_result = [t for t in teachers if t.get("email") in params and not t.get("is_deleted")]
+            elif "WHERE email = %s" in sql_clean:
+                target_email = params[0]
+                self._current_result = [t for t in teachers if t.get("email") == target_email and not t.get("is_deleted")]
+            else:
+                self._current_result = list(teachers)
+
         # students 조회
-        elif "SELECT student_id, name, is_deleted FROM students WHERE email = %s" in sql_clean:
-            target_email = params[0]
-            self._current_result = [s for s in self.conn.db_students if s["email"] == target_email]
+        elif "FROM students" in sql_clean and "SELECT" in sql_clean:
+            if "WHERE email IN" in sql_clean:
+                self._current_result = [s for s in self.conn.db_students if s.get("email") in params and not s.get("is_deleted")]
+            elif "WHERE email = %s" in sql_clean:
+                target_email = params[0]
+                self._current_result = [s for s in self.conn.db_students if s.get("email") == target_email and not s.get("is_deleted")]
+            else:
+                self._current_result = list(self.conn.db_students)
 
         # students 삽입
         elif "INSERT INTO students" in sql_clean:
@@ -79,11 +95,18 @@ class BatchMockCursor:
             self.lastrowid = new_id
 
         # student_academic_records 조회
-        elif "SELECT record_id, grade, class, number FROM student_academic_records" in sql_clean:
-            st_id, yr_id = params[0], params[1]
-            self._current_result = [
-                r for r in self.conn.db_records if r["student_id"] == st_id and r["year_id"] == yr_id
-            ]
+        elif "SELECT record_id" in sql_clean and "FROM student_academic_records" in sql_clean:
+            if "student_id IN" in sql_clean:
+                yr_id = params[0]
+                st_ids = set(params[1:])
+                self._current_result = [
+                    r for r in self.conn.db_records if r["year_id"] == yr_id and r["student_id"] in st_ids
+                ]
+            else:
+                st_id, yr_id = params[0], params[1]
+                self._current_result = [
+                    r for r in self.conn.db_records if r["student_id"] == st_id and r["year_id"] == yr_id
+                ]
 
         # student_academic_records 삽입
         elif "INSERT INTO student_academic_records" in sql_clean:

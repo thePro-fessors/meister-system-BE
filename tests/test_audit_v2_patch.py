@@ -66,6 +66,8 @@ class AuditV2MockCursor:
             elif "WHERE email = %s" in q:
                 em = params[0]
                 self._current_result = [t for t in self.conn.teachers if t.get("email") == em and not t.get("is_deleted")]
+            elif "WHERE email IN" in q:
+                self._current_result = [t for t in self.conn.teachers if t.get("email") in params and not t.get("is_deleted")]
             else:
                 self._current_result = list(self.conn.teachers)
 
@@ -73,6 +75,8 @@ class AuditV2MockCursor:
             if "WHERE email = %s" in q:
                 em = params[0]
                 self._current_result = [s for s in self.conn.students if s.get("email") == em and not s.get("is_deleted")]
+            elif "WHERE email IN" in q:
+                self._current_result = [s for s in self.conn.students if s.get("email") in params and not s.get("is_deleted")]
             elif "WHERE student_id = %s" in q:
                 sid = params[0]
                 self._current_result = [s for s in self.conn.students if s.get("student_id") == sid and not s.get("is_deleted")]
@@ -80,8 +84,12 @@ class AuditV2MockCursor:
                 self._current_result = list(self.conn.students)
 
         elif "FROM student_academic_records" in q:
-            sid = params[0]
-            self._current_result = [r for r in self.conn.records if r.get("student_id") == sid]
+            if "student_id IN" in q:
+                st_ids = set(params[1:])
+                self._current_result = [r for r in self.conn.records if r.get("student_id") in st_ids]
+            else:
+                sid = params[0]
+                self._current_result = [r for r in self.conn.records if r.get("student_id") == sid]
 
         elif "FROM submissions s" in q:
             sub_id = params[0]

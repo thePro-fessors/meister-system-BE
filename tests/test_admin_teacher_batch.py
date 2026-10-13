@@ -60,10 +60,26 @@ class TeacherBatchMockCursor:
             else:
                 self._current_result = list(self.conn.db_years)
 
+        # students 조회
+        elif "FROM students" in sql_clean:
+            students = getattr(self.conn, "db_students", [])
+            if "WHERE email IN" in sql_clean:
+                self._current_result = [s for s in students if s.get("email") in params and not s.get("is_deleted")]
+            elif "WHERE email = %s" in sql_clean:
+                target_email = params[0]
+                self._current_result = [s for s in students if s.get("email") == target_email and not s.get("is_deleted")]
+            else:
+                self._current_result = list(students)
+
         # teachers 조회
-        elif "SELECT teachers_id, name, subject, grade, class, is_deleted FROM teachers WHERE email = %s" in sql_clean:
-            target_email = params[0]
-            self._current_result = [t for t in self.conn.db_teachers if t["email"] == target_email]
+        elif "FROM teachers" in sql_clean and "SELECT" in sql_clean:
+            if "WHERE email IN" in sql_clean:
+                self._current_result = [t for t in self.conn.db_teachers if t.get("email") in params and not t.get("is_deleted")]
+            elif "WHERE email = %s" in sql_clean:
+                target_email = params[0]
+                self._current_result = [t for t in self.conn.db_teachers if t.get("email") == target_email and not t.get("is_deleted")]
+            else:
+                self._current_result = list(self.conn.db_teachers)
 
         # teachers 갱신
         elif "UPDATE teachers" in sql_clean:

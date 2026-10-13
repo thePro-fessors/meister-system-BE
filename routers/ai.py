@@ -827,12 +827,18 @@ async def student_chat(
                     (user_uuid,),
                 )
                 st_row = await cur.fetchone()
-                if not st_row and current_user.get("id"):
-                    await cur.execute(
-                        "SELECT student_id, name, email FROM students WHERE email = %s AND is_deleted = FALSE LIMIT 1",
-                        (f"{current_user['id']}@bssm.hs.kr",),
+                if not st_row:
+                    clean_id = str(current_user.get("id") or "").strip()
+                    email_cand = current_user.get("email") or (
+                        clean_id if "@" in clean_id
+                        else (f"{clean_id}@bssm.hs.kr" if clean_id else None)
                     )
-                    st_row = await cur.fetchone()
+                    if email_cand:
+                        await cur.execute(
+                            "SELECT student_id, name, email FROM students WHERE email = %s AND is_deleted = FALSE LIMIT 1",
+                            (email_cand,),
+                        )
+                        st_row = await cur.fetchone()
 
                 if st_row:
                     student_id = st_row["student_id"]
