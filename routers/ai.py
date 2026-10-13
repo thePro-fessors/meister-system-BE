@@ -32,6 +32,7 @@ import redis.asyncio as aioredis
 
 from core.academic import get_current_academic_year
 from core.calculator import calculate_student_certification
+from core.ai_provider import call_multi_provider_llm, resolve_ai_config, AIConfig, LLMResult
 from core.security import get_client_ip, get_current_user
 from database import get_db, get_redis
 from sr_format import Error, SrFormat
@@ -498,6 +499,22 @@ async def classify_submission(
     """
     client_ip = get_client_ip(request)
     user_uuid = current_user.get("uuid") or current_user.get("sub") or "anonymous"
+    user_role = current_user.get("role")
+
+    # [의심-12 결정 B] 관리자의 테스트 기능은 유지하나, 교사는 학생용 AI 자동분류 호출 불가
+    if user_role in ("teacher", "1", 1):
+        return JSONResponse(
+            status_code=status.HTTP_403_FORBIDDEN,
+            content=SrFormat(
+                status_code=status.HTTP_403_FORBIDDEN,
+                success=False,
+                data=None,
+                error=Error(
+                    code="FORBIDDEN_ROLE",
+                    message="교사는 학생용 AI 서비스를 호출할 수 없습니다.",
+                ),
+            ).model_dump(),
+        )
 
     # 1. IP 및 계정별 Rate Limiting (분당 30회)
     allowed_ip = await check_ai_rate_limit(redis, f"rate_limit:ai:classify:ip:{client_ip}", max_requests=30, window_seconds=60)
@@ -589,12 +606,15 @@ detail: {sanitized_detail}
 description: {sanitized_desc}
 </submission_input>"""
 
-        gemini_resp = await call_gemini_api(
+        llm_result = await call_multi_provider_llm(
             prompt=user_prompt,
             system_instruction=system_instruction,
             response_json=True,
             timeout_sec=5.0,
+            role="student",
+            gemini_caller=call_gemini_api,
         )
+        gemini_resp = llm_result.text
 
         if gemini_resp:
             try:
@@ -627,6 +647,10 @@ description: {sanitized_desc}
 
     # 4. Graceful Fallback: 키워드 규칙 기반 분석 (Gemini 미설정/실패/타임아웃 시)
     if not recommendations:
+        if "llm_result" in locals() and llm_result is not None:
+            llm_result.is_fallback = True
+            if not llm_result.fallback_reason:
+                llm_result.fallback_reason = "LLM 추천 항목 비어있음 또는 파싱 실패 (규칙 기반 폴백)"
         for area, meta in KEYWORD_AREA_MAP.items():
             kws = meta["keywords"]
             matched = [kw for kw in kws if kw in text_lower]
@@ -682,6 +706,18 @@ description: {sanitized_desc}
         for r in recommendations
     ]
 
+    meta_info = (
+        llm_result.to_metadata()
+        if ("llm_result" in locals() and llm_result is not None)
+        else {
+            "analysisSource": "rule_based_fallback",
+            "fallbackUsed": True,
+            "fallbackReason": "규칙 기반 기본 분류",
+            "model": "rule_based_engine",
+            "capabilityMode": "rule_based_engine",
+        }
+    )
+
     return SrFormat(
         status_code=200,
         success=True,
@@ -694,6 +730,7 @@ description: {sanitized_desc}
             "bestMatch": best_match,
             "recommendations": recommendations,
             "suggestions": suggestions,
+            **meta_info,
         },
     ).model_dump()
 
@@ -718,8 +755,8 @@ async def student_chat(
     user_name = current_user.get("name") or "학생"
     user_role = current_user.get("role")
 
-    # 1. RBAC 권한 검증: 학생 전용 서비스
-    if user_role not in ("student", "0", 0):
+    # 1. RBAC 권한 검증: [의심-12 결정 B] 관리자의 테스트 기능은 유지하나, 교사는 허용하지 않습니다.
+    if user_role in ("teacher", "1", 1):
         return JSONResponse(
             status_code=status.HTTP_403_FORBIDDEN,
             content=SrFormat(
@@ -728,7 +765,20 @@ async def student_chat(
                 data=None,
                 error=Error(
                     code="FORBIDDEN_ROLE",
-                    message="학생 전용 맞춤형 챗봇 서비스입니다.",
+                    message="교사는 학생용 AI 서비스를 호출할 수 없습니다.",
+                ),
+            ).model_dump(),
+        )
+    if user_role not in ("student", "0", 0, "admin", "2", 2):
+        return JSONResponse(
+            status_code=status.HTTP_403_FORBIDDEN,
+            content=SrFormat(
+                status_code=status.HTTP_403_FORBIDDEN,
+                success=False,
+                data=None,
+                error=Error(
+                    code="FORBIDDEN_ROLE",
+                    message="학생 및 관리자 전용 서비스입니다.",
                 ),
             ).model_dump(),
         )
@@ -1082,12 +1132,15 @@ async def student_chat(
 {sanitized_user_msg}
 """
 
-        gemini_reply = await call_gemini_api(
+        llm_result = await call_multi_provider_llm(
             prompt=prompt_body,
             system_instruction=system_instruction,
             response_json=False,
             timeout_sec=5.0,
+            role="student",
+            gemini_caller=call_gemini_api,
         )
+        gemini_reply = llm_result.text
         if gemini_reply:
             reply = sanitize_and_mask_text(gemini_reply.strip())
 
@@ -1173,6 +1226,18 @@ async def student_chat(
         "자격증 취득 증빙 제출 가이드",
     ]
 
+    meta_info = (
+        llm_result.to_metadata()
+        if ("llm_result" in locals() and llm_result is not None)
+        else {
+            "analysisSource": "rule_based_fallback",
+            "fallbackUsed": True,
+            "fallbackReason": "학생 도우미 규칙 기반 폴백",
+            "model": "rule_based_engine",
+            "capabilityMode": "rule_based_engine",
+        }
+    )
+
     return SrFormat(
         status_code=200,
         success=True,
@@ -1180,6 +1245,7 @@ async def student_chat(
             "reply": reply,
             "conversationId": conv_id,
             "suggestions": suggestions,
+            **meta_info,
         },
     ).model_dump()
 
@@ -1283,112 +1349,28 @@ async def teacher_review_draft(
                 ).model_dump(),
             )
 
-        # 교사 담당 학급 검증 (Tech_spec.md 5.2.1: 교사 담당 학급 검증 필수)
-        is_admin_user = user_role in ("admin", 2, "2")
-        if sub_row and not is_admin_user:
-            t_grade = None
-            t_class = None
-            t_position = ""
-            t_department = ""
-            t_id = None
-            try:
-                cur_kwargs = {"cursor": DictCursor} if DictCursor else {}
-                async with conn.cursor(**cur_kwargs) as cur:
-                    await cur.execute(
-                        "SELECT teachers_id, name, subject, position, department, grade, class FROM teachers WHERE uuid = %s AND is_deleted = FALSE LIMIT 1",
-                        (user_uuid,),
-                    )
-                    t_row = await cur.fetchone()
-                    if not t_row:
-                        email_cand = current_user.get("email") or (
-                            current_user["id"] if "@" in str(current_user.get("id", ""))
-                            else f"{current_user.get('id', '')}@bssm.hs.kr"
-                        )
-                        await cur.execute(
-                            "SELECT teachers_id, name, subject, position, department, grade, class FROM teachers WHERE email = %s AND is_deleted = FALSE LIMIT 1",
-                            (email_cand,),
-                        )
-                        t_row = await cur.fetchone()
-                    if t_row:
-                        t_id = t_row.get("teachers_id")
-                        t_grade = t_row.get("grade")
-                        t_class = t_row.get("class")
-                        t_position = (t_row.get("position") or "").strip()
-                        t_department = (t_row.get("department") or "").strip()
-            except Exception as te:
-                logger.warning(f"[TEACHER_REVIEW_AUTH_WARN] 교사 조회 경고: {te}")
-
-            is_dept_head_user = (t_position == "부서부장" and t_department in ("마이스터부", "교무기획부"))
-            if not is_dept_head_user:
-                target_st_id = sub_row.get("student_id")
-                st_grade = None
-                st_class = None
+        # 교사 심사 권한 검증 (의심-09: 실제 해당 제출물 승인/반려 권한 교사만 AI 심사 초안 생성 가능)
+        if sub_row:
+            from core.authorization import authorize_submission_access
+            auth_err = await authorize_submission_access(current_user, submission_id, conn, action="approve")
+            if auth_err:
                 try:
-                    cur_kwargs = {"cursor": DictCursor} if DictCursor else {}
-                    async with conn.cursor(**cur_kwargs) as cur:
-                        await cur.execute(
-                            "SELECT grade, class AS class_no FROM student_academic_records WHERE student_id = %s ORDER BY record_id DESC LIMIT 1",
-                            (target_st_id,),
-                        )
-                        st_acad = await cur.fetchone()
-                        if st_acad:
-                            st_grade = st_acad.get("grade")
-                            st_class = st_acad.get("class_no")
-                except Exception as se:
-                    logger.warning(f"[TEACHER_REVIEW_STUDENT_ACAD_WARN] 학생 학적 조회 경고: {se}")
-
-                is_item_evaluator = False
-                sub_item_id = sub_row.get("item_id")
-                sub_area_id = sub_row.get("area_id")
-                if t_id and (sub_item_id or sub_area_id):
-                    try:
-                        cur_kwargs = {"cursor": DictCursor} if DictCursor else {}
-                        async with conn.cursor(**cur_kwargs) as cur:
-                            if sub_item_id:
-                                await cur.execute(
-                                    "SELECT 1 FROM evaluation_item_teachers WHERE item_id = %s AND teacher_id = %s LIMIT 1",
-                                    (sub_item_id, t_id),
-                                )
-                                if await cur.fetchone():
-                                    is_item_evaluator = True
-                            if not is_item_evaluator and sub_area_id:
-                                await cur.execute(
-                                    "SELECT 1 FROM certification_area_teachers WHERE area_id = %s AND teacher_id = %s LIMIT 1",
-                                    (sub_area_id, t_id),
-                                )
-                                if await cur.fetchone():
-                                    is_item_evaluator = True
-                    except Exception:
-                        pass
-
-                if t_position == "학년부장" and t_grade is not None:
-                    if st_grade is not None and st_grade != t_grade and not is_item_evaluator:
+                    import json
+                    body = json.loads(auth_err.body)
+                    msg = body.get("error", {}).get("message", "")
+                    if "담당 학급" in msg or "타 학년" in msg:
                         return JSONResponse(
-                            status_code=status.HTTP_403_FORBIDDEN,
+                            status_code=403,
                             content=SrFormat(
-                                status_code=status.HTTP_403_FORBIDDEN,
+                                status_code=403,
                                 success=False,
                                 data=None,
-                                error=Error(
-                                    code="FORBIDDEN_CLASS_ACCESS",
-                                    message=f"{t_grade}학년 담당 학년부장으로 타 학년({st_grade}학년) 학생의 증빙자료를 심사할 수 없습니다 (학년 권한 격리).",
-                                ),
+                                error=Error(code="FORBIDDEN_CLASS_ACCESS", message=msg),
                             ).model_dump(),
                         )
-                elif t_grade is not None and t_class is not None:
-                    if (st_grade != t_grade or st_class != t_class) and not is_item_evaluator:
-                        return JSONResponse(
-                            status_code=status.HTTP_403_FORBIDDEN,
-                            content=SrFormat(
-                                status_code=status.HTTP_403_FORBIDDEN,
-                                success=False,
-                                data=None,
-                                error=Error(
-                                    code="FORBIDDEN_CLASS_ACCESS",
-                                    message=f"담당 학급({t_grade}학년 {t_class}반) 외 타 학급 학생의 증빙자료를 심사할 수 없습니다 (담임 권한 격리).",
-                                ),
-                            ).model_dump(),
-                        )
+                except Exception:
+                    pass
+                return auth_err
 
     # 4. 필드 병합 및 기본값 처리
     detail_val = req.detail if req.detail is not None else (sub_row.get("detail") if sub_row else "")
@@ -1489,14 +1471,17 @@ maxScore: {max_score}
 criteria: {criteria_val or '기본 배점 기준'}
 </submission_info>"""
 
-        gemini_resp = await call_gemini_api(
+        llm_result = await call_multi_provider_llm(
             prompt=user_prompt,
             system_instruction=system_instruction,
             response_json=True,
             timeout_sec=5.0,
-            model_override=teacher_model,
-            api_key_override=teacher_api_key,
+            role="teacher",
+            model=teacher_model,
+            api_key=teacher_api_key,
+            gemini_caller=call_gemini_api,
         )
+        gemini_resp = llm_result.text
 
         if gemini_resp:
             try:
@@ -1530,6 +1515,10 @@ criteria: {criteria_val or '기본 배점 기준'}
 
     # 6. Graceful Fallback: 규칙 기반 심사 보조 엔진 (Gemini 미설정/실패/타임아웃 시)
     if recommended_status is None:
+        if "llm_result" in locals() and llm_result is not None:
+            llm_result.is_fallback = True
+            if not llm_result.fallback_reason:
+                llm_result.fallback_reason = "LLM 심사 초안 생성 실패 (규칙 기반 초안으로 폴백)"
         text_lower = combined_clean.lower()
         is_too_short = len(combined_clean) < 5
         is_invalid_text = any(bad in text_lower for bad in ("없음", "모름", "asdf", "test", "테스트", "미제출", "미첨부"))
@@ -1564,6 +1553,18 @@ criteria: {criteria_val or '기본 배점 기준'}
     if not check_points:
         check_points = ["증빙 서류 진위 확인", "최대 배점 초과 여부 확인"]
 
+    meta_info = (
+        llm_result.to_metadata()
+        if ("llm_result" in locals() and llm_result is not None)
+        else {
+            "analysisSource": "rule_based_fallback",
+            "fallbackUsed": True,
+            "fallbackReason": "심사 초안 규칙 기반 폴백",
+            "model": "rule_based_engine",
+            "capabilityMode": "rule_based_engine",
+        }
+    )
+
     return SrFormat(
         status_code=200,
         success=True,
@@ -1580,6 +1581,7 @@ criteria: {criteria_val or '기본 배점 기준'}
             "checkPoints": check_points,
             "confidence": confidence,
             "criteria": criteria_val,
+            **meta_info,
         },
     ).model_dump()
 
@@ -2133,14 +2135,17 @@ async def teacher_chat(
 [교사 최신 질문]
 {sanitized_teacher_msg}
 """
-        gemini_reply = await call_gemini_api(
+        llm_result = await call_multi_provider_llm(
             prompt=prompt_body,
             system_instruction=system_instruction,
             response_json=False,
             timeout_sec=5.0,
-            model_override=teacher_model,
-            api_key_override=teacher_api_key,
+            role="teacher",
+            model=teacher_model,
+            api_key=teacher_api_key,
+            gemini_caller=call_gemini_api,
         )
+        gemini_reply = llm_result.text
         if gemini_reply:
             reply = sanitize_and_mask_text(gemini_reply.strip())
 
@@ -2219,6 +2224,18 @@ async def teacher_chat(
         "외국어 능력 평균 점수 알려줘",
     ]
 
+    meta_info = (
+        llm_result.to_metadata()
+        if ("llm_result" in locals() and llm_result is not None)
+        else {
+            "analysisSource": "rule_based_fallback",
+            "fallbackUsed": True,
+            "fallbackReason": "교사 학급 지도 규칙 기반 폴백",
+            "model": "rule_based_engine",
+            "capabilityMode": "rule_based_engine",
+        }
+    )
+
     return SrFormat(
         status_code=200,
         success=True,
@@ -2232,6 +2249,7 @@ async def teacher_chat(
             },
             "targetStudents": at_risk_students[:10],
             "suggestions": suggestions,
+            **meta_info,
         },
     ).model_dump()
 
@@ -2568,14 +2586,17 @@ async def admin_summary_report(
             "위 실제 통계 데이터를 기반으로 학교 보고용 총괄 리포트(summaryReport), 핵심 인사이트(keyInsights), 개선 권고사항(recommendations)을 생성해 주세요."
         )
 
-        raw_llm = await call_gemini_api(
+        llm_result = await call_multi_provider_llm(
             prompt=user_prompt,
             system_instruction=sys_prompt,
             response_json=True,
             timeout_sec=5.0,
-            model_override=model,
-            api_key_override=api_key,
+            role="admin",
+            model=model,
+            api_key=api_key,
+            gemini_caller=call_gemini_api,
         )
+        raw_llm = llm_result.text
         if raw_llm:
             parsed = extract_json_from_llm(raw_llm)
             if isinstance(parsed, dict) and ("summaryReport" in parsed or "reportMarkdown" in parsed):
@@ -2591,6 +2612,10 @@ async def admin_summary_report(
         key_insights = llm_report.get("keyInsights") or []
         recommendations = llm_report.get("recommendations") or []
     else:
+        if "llm_result" in locals() and llm_result is not None:
+            llm_result.is_fallback = True
+            if not llm_result.fallback_reason:
+                llm_result.fallback_reason = "LLM 총괄 리포트 생성 실패 (규칙 기반 리포트로 폴백)"
         report_markdown = (
             f"# {target_year}학년도 마이스터 역량인증제 전교생 인증 현황 총괄 리포트\n\n"
             f"## 1. 전교생 인증 총괄 요약\n"
@@ -2647,6 +2672,18 @@ async def admin_summary_report(
         f"{pending_submissions}건의 심사 대기 처리가 요구됩니다."
     )
 
+    meta_info = (
+        llm_result.to_metadata()
+        if ("llm_result" in locals() and llm_result is not None)
+        else {
+            "analysisSource": "rule_based_fallback",
+            "fallbackUsed": True,
+            "fallbackReason": "관리자 총괄 리포트 규칙 기반 폴백",
+            "model": "rule_based_engine",
+            "capabilityMode": "rule_based_engine",
+        }
+    )
+
     return SrFormat(
         status_code=200,
         success=True,
@@ -2693,6 +2730,7 @@ async def admin_summary_report(
             "report": report_markdown,
             "keyInsights": key_insights,
             "recommendations": recommendations,
+            **meta_info,
         },
     ).model_dump()
 
@@ -3186,14 +3224,17 @@ async def admin_audit_anomalies(
             "위 이상치 목록을 감사 분석하여 공식 감사 소견 및 권고사항을 작성해 주세요."
         )
 
-        raw_llm = await call_gemini_api(
+        llm_result = await call_multi_provider_llm(
             prompt=user_audit_prompt,
             system_instruction=sys_audit_prompt,
             response_json=True,
             timeout_sec=5.0,
-            model_override=model,
-            api_key_override=api_key,
+            role="admin",
+            model=model,
+            api_key=api_key,
+            gemini_caller=call_gemini_api,
         )
+        raw_llm = llm_result.text
         if raw_llm:
             parsed = extract_json_from_llm(raw_llm)
             if isinstance(parsed, dict) and ("summary" in parsed or "auditAnalysis" in parsed):
@@ -3205,6 +3246,10 @@ async def admin_audit_anomalies(
         audit_analysis = llm_audit.get("auditAnalysis") or ""
         audit_recommendations = llm_audit.get("recommendations") or []
     else:
+        if "llm_result" in locals() and llm_result is not None:
+            llm_result.is_fallback = True
+            if not llm_result.fallback_reason:
+                llm_result.fallback_reason = "LLM 감사 분석 실패 (규칙 기반 소견으로 폴백)"
         if not anomalies_to_return:
             audit_summary = f"{target_year}학년도 감사 결과 부정 의심 제출 및 이상 징후가 감지되지 않았습니다. (위험 수준: NORMAL)"
             audit_analysis = (
@@ -3254,6 +3299,18 @@ async def admin_audit_anomalies(
                 "단기간 집중 상벌점 부여 사안은 생활지도 규정 준수 여부를 감사하십시오.",
             ]
 
+    meta_info = (
+        llm_result.to_metadata()
+        if ("llm_result" in locals() and llm_result is not None)
+        else {
+            "analysisSource": "rule_based_fallback",
+            "fallbackUsed": True,
+            "fallbackReason": "관리자 부정 의심 감사 규칙 기반 폴백",
+            "model": "rule_based_engine",
+            "capabilityMode": "rule_based_engine",
+        }
+    )
+
     return SrFormat(
         status_code=200,
         success=True,
@@ -3268,5 +3325,6 @@ async def admin_audit_anomalies(
             "auditAnalysis": audit_analysis,
             "summary": audit_summary,
             "recommendations": audit_recommendations,
+            **meta_info,
         },
     ).model_dump()
