@@ -292,10 +292,13 @@ async def update_point(
             ).model_dump(),
         )
 
-    from core.authorization import authorize_student_access
+    from core.authorization import authorize_point_mutation, authorize_student_access
     auth_err = await authorize_student_access(current_user, existing["student_id"], conn, action="manage_points")
     if auth_err:
         return auth_err
+    mut_err = await authorize_point_mutation(current_user, existing, conn, action="modify")
+    if mut_err:
+        return mut_err
 
     user_uuid = current_user.get("uuid") or current_user.get("sub")
 
@@ -441,10 +444,13 @@ async def delete_point(
             ).model_dump(),
         )
 
-    from core.authorization import authorize_student_access
+    from core.authorization import authorize_point_mutation, authorize_student_access
     auth_err = await authorize_student_access(current_user, existing["student_id"], conn, action="manage_points")
     if auth_err:
         return auth_err
+    mut_err = await authorize_point_mutation(current_user, existing, conn, action="delete")
+    if mut_err:
+        return mut_err
 
     user_uuid = current_user.get("uuid") or current_user.get("sub")
     import html

@@ -535,14 +535,17 @@ async def delete_submission(
             ).model_dump(),
         )
 
-    if row["status_code"] == 3:
+    is_admin = user_role in ("admin", "2", 2)
+
+    # 의심-10 결정 A: 관리자는 승인 완료건을 포함한 모든 삭제(Soft Delete) 가능, 학생은 미승인건만 삭제 가능
+    if not is_admin and row["status_code"] == 3:
         return JSONResponse(
             status_code=400,
             content=SrFormat(
                 status_code=400,
                 success=False,
                 data=None,
-                error=Error(code="CANNOT_DELETE_APPROVED", message="이미 승인 완료된 증빙자료는 삭제할 수 없습니다."),
+                error=Error(code="CANNOT_DELETE_APPROVED", message="이미 승인 완료된 증빙자료는 학생이 삭제할 수 없습니다. 잘못 승인된 경우 반려로 상태를 변경하십시오."),
             ).model_dump(),
         )
 
@@ -551,16 +554,27 @@ async def delete_submission(
     try:
         await conn.autocommit(False)
         async with conn.cursor() as cur:
-            await cur.execute(
-                """
-                UPDATE submissions 
-                SET is_deleted = TRUE, updated_at = NOW() 
-                WHERE submission_id = %s 
-                  AND status_code != 3 
-                  AND is_deleted = FALSE
-                """,
-                (submission_id,),
-            )
+            if is_admin:
+                await cur.execute(
+                    """
+                    UPDATE submissions 
+                    SET is_deleted = TRUE, updated_at = NOW() 
+                    WHERE submission_id = %s 
+                      AND is_deleted = FALSE
+                    """,
+                    (submission_id,),
+                )
+            else:
+                await cur.execute(
+                    """
+                    UPDATE submissions 
+                    SET is_deleted = TRUE, updated_at = NOW() 
+                    WHERE submission_id = %s 
+                      AND status_code != 3 
+                      AND is_deleted = FALSE
+                    """,
+                    (submission_id,),
+                )
             row_cnt = getattr(cur, "rowcount", 1)
             if row_cnt == 0:
                 await conn.rollback()

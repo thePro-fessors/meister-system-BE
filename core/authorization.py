@@ -169,6 +169,7 @@ async def authorize_student_access(
         t_class = t_row.get("class")
         t_position = (t_row.get("position") or "").strip()
         t_department = (t_row.get("department") or "").strip()
+        t_subject = (t_row.get("subject") or "").strip()
 
         # [정책 1] 상벌점 관리(manage_points 및 read_points):
         # 교무분장 체계: 직책(position) 또는 부서(department)가 부여된 교사(또는 비담임 교과교사)는 전교생 상벌점 관리 허용
@@ -198,30 +199,34 @@ async def authorize_student_access(
 
         # [정책 4] 담임교사(정담임, 부담임, 임시담임): 담당 학급 학생 접근 허용
         if t_grade is not None and t_class is not None:
-            academic_record = await get_student_academic_record(student_id, conn, year)
-            if not academic_record:
-                return JSONResponse(
-                    status_code=404,
-                    content=SrFormat(
+            # 교과/부서가 배정된 교사인 경우 담당 과제 조회를 위해 타 학급 열람 허용 (의심-02, 의심-03)
+            if action == "read" and (t_subject or t_department or t_position == "부서부장"):
+                pass
+            else:
+                academic_record = await get_student_academic_record(student_id, conn, year)
+                if not academic_record:
+                    return JSONResponse(
                         status_code=404,
-                        success=False,
-                        data=None,
-                        error=Error(code="USER_NOT_FOUND", message="해당 학년도의 학생 학적 정보를 찾을 수 없습니다."),
-                    ).model_dump(),
-                )
+                        content=SrFormat(
+                            status_code=404,
+                            success=False,
+                            data=None,
+                            error=Error(code="USER_NOT_FOUND", message="해당 학년도의 학생 학적 정보를 찾을 수 없습니다."),
+                        ).model_dump(),
+                    )
 
-            st_grade = academic_record.get("grade")
-            st_class = academic_record.get("class_no")
-            if st_grade != t_grade or st_class != t_class:
-                return JSONResponse(
-                    status_code=403,
-                    content=SrFormat(
+                st_grade = academic_record.get("grade")
+                st_class = academic_record.get("class_no")
+                if st_grade != t_grade or st_class != t_class:
+                    return JSONResponse(
                         status_code=403,
-                        success=False,
-                        data=None,
-                        error=Error(code="FORBIDDEN", message="담당 학급 학생의 데이터만 접근할 수 있습니다."),
-                    ).model_dump(),
-                )
+                        content=SrFormat(
+                            status_code=403,
+                            success=False,
+                            data=None,
+                            error=Error(code="FORBIDDEN", message="담당 학급 학생의 데이터만 접근할 수 있습니다."),
+                        ).model_dump(),
+                    )
 
         return None
 
@@ -233,6 +238,90 @@ async def authorize_student_access(
             success=False,
             data=None,
             error=Error(code="FORBIDDEN", message="유효하지 않은 권한 역할입니다."),
+        ).model_dump(),
+    )
+
+
+async def authorize_point_mutation(
+    actor: Dict[str, Any],
+    point_row: Dict[str, Any],
+    conn: Any,
+    action: str = "modify",
+) -> Optional[JSONResponse]:
+    """
+    상벌점 수정(PATCH) 및 삭제(DELETE) 권한 검증 (의심-04 결정 반영):
+    - [본인이 부여한 건 + 담임교사 + 학년부장 + 학생생활안전부 + 총괄부서장 + 관리자]만 허용.
+    """
+    actor_role = actor.get("role")
+    actor_uuid = actor.get("uuid") or actor.get("sub")
+    is_admin = actor_role in ("admin", 2, "2")
+    if is_admin:
+        return None
+
+    is_teacher = actor_role in ("teacher", 1, "1")
+    if not is_teacher:
+        return JSONResponse(
+            status_code=403,
+            content=SrFormat(
+                status_code=403,
+                success=False,
+                data=None,
+                error=Error(code="FORBIDDEN", message="상벌점 수정/삭제 권한이 없습니다."),
+            ).model_dump(),
+        )
+
+    async with conn.cursor(cursor=DictCursor) as cur:
+        await cur.execute(
+            "SELECT teachers_id, grade, class, position, department FROM teachers WHERE uuid = %s AND is_deleted = FALSE LIMIT 1",
+            (actor_uuid,),
+        )
+        t_row = await cur.fetchone()
+        if not t_row or "teachers_id" not in t_row:
+            return None
+
+    t_id = t_row.get("teachers_id")
+    t_grade = t_row.get("grade")
+    t_class = t_row.get("class")
+    t_position = (t_row.get("position") or "").strip()
+    t_department = (t_row.get("department") or "").strip()
+
+    # 1. 본인이 부여한 건 허용
+    if point_row.get("teachers_id") and point_row.get("teachers_id") == t_id:
+        return None
+
+    # 2. 총괄 부서장(마이스터부, 교무기획부) 허용
+    if t_position == "부서부장" and t_department in ("마이스터부", "교무기획부"):
+        return None
+
+    # 3. 학생생활안전부 소속 교사 허용
+    if t_department == "학생생활안전부":
+        return None
+
+    # 4. 대상 학생의 학적 확인 (담임 / 학년부장 검증용)
+    student_id = point_row.get("student_id")
+    if student_id:
+        academic_record = await get_student_academic_record(student_id, conn)
+        if academic_record:
+            st_grade = academic_record.get("grade")
+            st_class = academic_record.get("class_no")
+            # 4-1. 학년부장 (해당 학년)
+            if t_position == "학년부장" and t_grade is not None and t_grade == st_grade:
+                return None
+            # 4-2. 담임교사 (해당 학급)
+            if t_grade is not None and t_class is not None and t_grade == st_grade and t_class == st_class:
+                return None
+
+    act_name = "삭제" if action == "delete" else "수정"
+    return JSONResponse(
+        status_code=403,
+        content=SrFormat(
+            status_code=403,
+            success=False,
+            data=None,
+            error=Error(
+                code="FORBIDDEN",
+                message=f"상벌점 {act_name} 권한이 없습니다. (본인이 부여한 건, 담임교사, 학년부장, 학생생활안전부 교사, 관리자만 {act_name} 가능)",
+            ),
         ).model_dump(),
     )
 
@@ -478,16 +567,17 @@ async def authorize_submission_access(
 
     is_admin = actor_role in ("admin", 2, "2")
     if is_admin:
-        if action in ("student_submit", "student_resubmit", "student_delete"):
+        if action in ("student_submit", "student_resubmit"):
             return JSONResponse(
                 status_code=403,
                 content=SrFormat(
                     status_code=403,
                     success=False,
                     data=None,
-                    error=Error(code="FORBIDDEN", message="관리자는 학생 본인 제출/삭제 작업을 직접 수행할 수 없습니다."),
+                    error=Error(code="FORBIDDEN", message="관리자는 학생 본인 제출 작업을 직접 수행할 수 없습니다."),
                 ).model_dump(),
             )
+        # 관리자는 승인 완료건을 포함한 제출물 삭제(Soft Delete) 허용 (의심-10 결정 A)
         return None
 
     is_teacher = actor_role in ("teacher", 1, "1")
@@ -499,9 +589,13 @@ async def authorize_submission_access(
                     status_code=403,
                     success=False,
                     data=None,
-                    error=Error(code="FORBIDDEN", message="교사는 학생 본인 제출/삭제 작업을 직접 수행할 수 없습니다."),
+                    error=Error(code="FORBIDDEN", message="교사는 학생 본인 제출/삭제 작업을 직접 수행할 수 없습니다. 잘못 승인한 경우 반려로 상태를 변경하십시오."),
                 ).model_dump(),
             )
+
+        # [의심-02 결정 B] 모든 교사에게 전교생 증빙자료 및 다운로드 티켓 '열람(Read)' 허용
+        if action == "read":
+            return None
 
         async with conn.cursor(cursor=DictCursor) as cur:
             await cur.execute(
@@ -538,27 +632,14 @@ async def authorize_submission_access(
         sub_item_name = sub_row.get("item_name")
         sub_area_name = sub_row.get("area_name")
 
-        # [교사 1] 총괄 부서장(부서부장 + 마이스터부/교무기획부): 전교생 모든 항목 심사 및 열람 허용
+        # [교사 1] 총괄 부서장(부서부장 + 마이스터부/교무기획부): 전교생 모든 항목 심사 허용
         if t_position == "부서부장" and t_department in ("마이스터부", "교무기획부"):
             return None
 
-        # [교사 2] 학년부장: 담당 학년 전체 학생 심사 및 열람 허용 (+ 타 학년이라도 1~3순위 규칙 일치 시 허용)
-        if t_position == "학년부장" and t_grade is not None:
-            academic_record = await get_student_academic_record(target_student_id, conn, sub_year)
-            if academic_record and academic_record.get("grade") == t_grade:
-                return None
-            eval_allowed, eval_msg = evaluate_evaluator_access(
-                teacher_id=t_id,
-                teacher_dept=t_department,
-                teacher_subj=t_subject,
-                assigned_teacher_ids=target_teacher_ids,
-                target_subject=target_subject,
-                target_department=target_department,
-                item_name=sub_item_name,
-                area_name=sub_area_name,
-                is_legacy_unrestricted=is_legacy_unrestricted,
-            )
-            if eval_allowed:
+        # [의심-01 결정 B] 1순위: 전담 교사 N명 지정 과제 (유형 A)
+        # - 오직 해당 전담 교사들만 심사 가능 (담임교사, 학년부장이어도 심사 불가)
+        if target_teacher_ids:
+            if t_id in target_teacher_ids:
                 return None
             return JSONResponse(
                 status_code=403,
@@ -566,29 +647,17 @@ async def authorize_submission_access(
                     status_code=403,
                     success=False,
                     data=None,
-                    error=Error(code="FORBIDDEN", message=f"{t_grade}학년 학생의 과제 또는 지정된 심사 권한(전담/교과/부서)이 있는 과제만 심사할 수 있습니다. ({eval_msg})"),
+                    error=Error(code="FORBIDDEN", message="1순위: 지정된 전담 교사만 심사할 수 있습니다."),
                 ).model_dump(),
             )
 
-        # [교사 3] 담임교사 (정담임, 부담임, 임시담임 등 학급 배정 교사):
-        # - 본인 학급 학생: 모든 과제 심사 및 열람 허용
-        # - 타 학급 학생: 1~3순위 규칙 매칭 시에만 심사/열람 허용
-        if t_grade is not None and t_class is not None:
-            academic_record = await get_student_academic_record(target_student_id, conn, sub_year)
-            if academic_record and academic_record.get("grade") == t_grade and academic_record.get("class_no") == t_class:
-                return None
-            eval_allowed, eval_msg = evaluate_evaluator_access(
-                teacher_id=t_id,
-                teacher_dept=t_department,
-                teacher_subj=t_subject,
-                assigned_teacher_ids=target_teacher_ids,
-                target_subject=target_subject,
-                target_department=target_department,
-                item_name=sub_item_name,
-                area_name=sub_area_name,
-                is_legacy_unrestricted=is_legacy_unrestricted,
-            )
-            if eval_allowed:
+        # [의심-01 결정 B] 2순위: 담당 교과(subject) 지정 과제 (유형 B)
+        # - 오직 해당 교과 담당 교사만 심사 가능 (타 교과 담임교사, 학년부장 심사 불가)
+        if target_subject and target_subject.strip():
+            t_tokens = _expand_tokens(None, t_subject)
+            s_tokens = _expand_tokens(None, target_subject.strip())
+            s_raw = target_subject.strip()
+            if (t_tokens & s_tokens) or (t_subject and (t_subject in s_raw or s_raw in t_subject)) or any(tok in s_raw or s_raw in tok for tok in t_tokens if len(tok) >= 2):
                 return None
             return JSONResponse(
                 status_code=403,
@@ -596,31 +665,91 @@ async def authorize_submission_access(
                     status_code=403,
                     success=False,
                     data=None,
-                    error=Error(code="FORBIDDEN", message=f"담당 학급 외 학생의 과제는 지정된 심사 권한(전담/교과/부서)이 있는 과제만 심사할 수 있습니다. ({eval_msg})"),
+                    error=Error(code="FORBIDDEN", message=f"2순위: {s_raw} 담당 교사만 심사할 수 있습니다."),
                 ).model_dump(),
             )
 
-        # [교사 4] 그 외 교사 (교과전담, 일반 부서 교사 등):
-        eval_allowed, eval_msg = evaluate_evaluator_access(
-            teacher_id=t_id,
-            teacher_dept=t_department,
-            teacher_subj=t_subject,
-            assigned_teacher_ids=target_teacher_ids,
-            target_subject=target_subject,
-            target_department=target_department,
-            item_name=sub_item_name,
-            area_name=sub_area_name,
-            is_legacy_unrestricted=is_legacy_unrestricted,
-        )
-        if eval_allowed:
+        # [의심-06 결정 B] 3순위: 담당 부서(department) 지정 과제 (유형 B)
+        # - 해당 소속 부서 교사 또는 해당 부서 부서장(position='부서부장') 심사 가능
+        if target_department and target_department.strip():
+            d_raw = target_department.strip()
+            t_tokens = _expand_tokens(t_department, None)
+            d_tokens = _expand_tokens(d_raw, None)
+            if (t_tokens & d_tokens) or (t_department and (t_department in d_raw or d_raw in t_department)) or any(tok in d_raw or d_raw in tok for tok in t_tokens if len(tok) >= 2):
+                return None
+            # 교무기획부/마이스터부 소속 학년부장이 담당 학년 과제 심사 시 허용
+            if t_position == "학년부장" and t_department in ("교무기획부", "마이스터부") and t_grade is not None:
+                academic_record = await get_student_academic_record(target_student_id, conn, sub_year)
+                if academic_record and academic_record.get("grade") == t_grade:
+                    return None
+            msg = f"{t_grade}학년 학생의 과제 또는 지정된 심사 권한(전담/교과/부서)이 있는 과제만 심사할 수 있습니다." if (t_position == "학년부장" and t_grade is not None) else f"3순위: {d_raw} 소속 교사만 심사할 수 있습니다."
+            return JSONResponse(
+                status_code=403,
+                content=SrFormat(
+                    status_code=403,
+                    success=False,
+                    data=None,
+                    error=Error(code="FORBIDDEN", message=msg),
+                ).model_dump(),
+            )
+
+        # 교사의 소속 부서 또는 담당 교과가 항목/영역명(예: 외국어교육부 <-> 외국어능력)과 일치하는 경우 허용
+        if (t_department or t_subject) and _is_department_or_subject_matched(t_department, t_subject, target_department, sub_item_name, sub_area_name):
             return None
+
+        # [의심-07 결정 B] 1~3순위 명시 설정이 없는 일반 공통 과제 (유형 C)
+        # - 오직 [해당 학생의 담임교사 + 학년부장 + 총괄부서장 + 관리자]만 심사 허용
+        academic_record = await get_student_academic_record(target_student_id, conn, sub_year)
+        st_grade = academic_record.get("grade") if academic_record else None
+        st_class = academic_record.get("class_no") if academic_record else None
+
+        # 담임교사 (우리 반)
+        if t_grade is not None and t_class is not None and t_grade == st_grade and t_class == st_class:
+            return None
+
+        # 학년부장 (우리 학년)
+        if t_position == "학년부장" and t_grade is not None and t_grade == st_grade:
+            return None
+
+        # 레거시 무제한 교과교사 폴백
+        if is_legacy_unrestricted:
+            return None
+
+        if t_position == "학년부장" and t_grade is not None and st_grade is not None and t_grade != st_grade:
+            return JSONResponse(
+                status_code=403,
+                content=SrFormat(
+                    status_code=403,
+                    success=False,
+                    data=None,
+                    error=Error(
+                        code="FORBIDDEN",
+                        message=f"{t_grade}학년 담당 학년부장으로 타 학년({st_grade}학년) 학생의 증빙자료를 심사할 수 없습니다 (학년 권한 격리).",
+                    ),
+                ).model_dump(),
+            )
+
+        if t_grade is not None and t_class is not None:
+            return JSONResponse(
+                status_code=403,
+                content=SrFormat(
+                    status_code=403,
+                    success=False,
+                    data=None,
+                    error=Error(
+                        code="FORBIDDEN",
+                        message=f"담당 학급({t_grade}학년 {t_class}반) 외 타 학급 학생의 증빙자료를 심사할 수 없습니다 (담임 권한 격리).",
+                    ),
+                ).model_dump(),
+            )
+
         return JSONResponse(
             status_code=403,
             content=SrFormat(
                 status_code=403,
                 success=False,
                 data=None,
-                error=Error(code="FORBIDDEN", message=f"해당 과제의 심사 권한이 없습니다. {eval_msg}"),
+                error=Error(code="FORBIDDEN", message="전담교사 및 담당부서가 미지정된 일반 과제는 해당 학생의 담임교사 및 학년부장만 심사할 수 있습니다."),
             ).model_dump(),
         )
 

@@ -1157,9 +1157,14 @@ async def handle_get_submissions(
                 s.submission_id,
                 s.student_id,
                 ay.year,
+                ca.area_id,
                 ca.name AS area_name,
                 s.item_id,
                 ei.name AS item_name,
+                ei.subject AS item_subject,
+                ei.department AS item_department,
+                ca.subject AS area_subject,
+                ca.department AS area_department,
                 s.detail,
                 s.activity_date,
                 s.description,
@@ -1192,6 +1197,80 @@ async def handle_get_submissions(
 
         await cur.execute(full_query, tuple(params))
         rows = await cur.fetchall()
+
+        # [의심-03 결정 B] 비담임/타반 교사가 조회 시 본인이 심사 권한을 가진 평가항목 제출물만 필터링하되 0건이어도 빈 배열[](200 OK) 반환
+        user_role = current_user.get("role")
+        if user_role in ("teacher", "1", 1):
+            user_uuid = current_user.get("uuid")
+            await cur.execute(
+                "SELECT teachers_id, grade, class, position, department, subject FROM teachers WHERE uuid = %s AND is_deleted = FALSE LIMIT 1",
+                (user_uuid,),
+            )
+            t_row = await cur.fetchone()
+
+            if t_row:
+                t_id = t_row.get("teachers_id")
+                t_grade = t_row.get("grade")
+                t_class = t_row.get("class")
+                t_pos = (t_row.get("position") or "").strip()
+                t_dept = (t_row.get("department") or "").strip()
+                t_subj = (t_row.get("subject") or "").strip()
+
+                is_total_dept = (t_pos == "부서부장" and t_dept in ("마이스터부", "교무기획부"))
+
+                await cur.execute(
+                    "SELECT grade, class AS class_no FROM student_academic_records WHERE student_id = %s ORDER BY record_id DESC LIMIT 1",
+                    (target_student_id,),
+                )
+                st_acad = await cur.fetchone()
+                st_grade = st_acad.get("grade") if st_acad else None
+                st_class = st_acad.get("class_no") if st_acad else None
+
+                is_own_homeroom = (t_grade is not None and t_class is not None and t_grade == st_grade and t_class == st_class)
+                is_own_grade_head = (t_pos == "학년부장" and t_grade is not None and t_grade == st_grade)
+                is_legacy_unrestricted = (
+                    t_grade is None
+                    and t_class is None
+                    and not t_dept
+                    and not t_subj
+                    and (not t_pos or t_pos != "교과전담")
+                )
+
+                if not (is_total_dept or is_own_homeroom or is_own_grade_head or is_legacy_unrestricted):
+                    await cur.execute(
+                        "SELECT item_id FROM evaluation_item_teachers WHERE teacher_id = %s",
+                        (t_id,),
+                    )
+                    eit_rows = await cur.fetchall() or []
+                    assigned_item_ids = {(r.get("item_id") if isinstance(r, dict) else r[0]) for r in eit_rows if (r.get("item_id") if isinstance(r, dict) else r[0]) is not None}
+
+                    await cur.execute(
+                        "SELECT area_id FROM certification_area_teachers WHERE teacher_id = %s",
+                        (t_id,),
+                    )
+                    cat_rows = await cur.fetchall() or []
+                    assigned_area_ids = {(r.get("area_id") if isinstance(r, dict) else r[0]) for r in cat_rows if (r.get("area_id") if isinstance(r, dict) else r[0]) is not None}
+
+                    from core.authorization import _expand_tokens
+                    t_tokens = _expand_tokens(t_dept, t_subj)
+
+                    filtered_rows = []
+                    for r in rows:
+                        r_item_id = r.get("item_id")
+                        r_area_id = r.get("area_id")
+                        r_subj = r.get("item_subject") or r.get("area_subject") or ""
+                        r_dept = r.get("item_department") or r.get("area_department") or ""
+
+                        if r_item_id in assigned_item_ids or r_area_id in assigned_area_ids:
+                            filtered_rows.append(r)
+                        elif t_subj and r_subj and (t_subj in r_subj or r_subj in t_subj):
+                            filtered_rows.append(r)
+                        elif t_tokens:
+                            r_tokens = _expand_tokens(r_dept, r_subj)
+                            if t_tokens & r_tokens:
+                                filtered_rows.append(r)
+
+                    rows = filtered_rows
 
     # 3. FE 스펙(TODO 2.3 / Tech_spec 2.3) 규격 변환
     results: list[dict[str, Any]] = []
