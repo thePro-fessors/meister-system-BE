@@ -1,0 +1,32 @@
+# Git & IDE
+.git
+.gitignore
+.idea
+.vscode
+*.swp
+*.swo
+
+# Python cache & venv
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.venv/
+.env
+.env.*
+!.env.example
+
+# Testing & Coverage
+tests/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Logs & Docs
+*.log
+TODO.md
+SECURITY_AND_AUDIT.md
+*.tmp
+
+# Uploads directory (handled by persistent docker volumes)
+uploads/
