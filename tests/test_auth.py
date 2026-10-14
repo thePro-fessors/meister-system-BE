@@ -337,5 +337,18 @@ class TestAuthAPI(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(res.headers.get("X-XSS-Protection"), "1; mode=block")
         self.assertEqual(res.headers.get("Referrer-Policy"), "strict-origin-when-cross-origin")
         self.assertEqual(res.headers.get("Cache-Control"), "no-store")
-        self.assertEqual(res.headers.get("Strict-Transport-Security"), "max-age=31536000; includeSubDomains")
+        # HTTP 요청: 로컬/IP 차단 방지를 위해 HSTS 미포함
+        self.assertNotIn("Strict-Transport-Security", res.headers)
         self.assertEqual(res.headers.get("Content-Security-Policy"), "default-src 'self'; frame-ancestors 'none'; object-src 'none';")
+
+        # HTTPS 요청: X-Forwarded-Proto 또는 HTTPS scheme 시 HSTS 정상 주입
+        res_https = self.client.get("/api/auth/me", headers={"X-Forwarded-Proto": "https"})
+        self.assertEqual(res_https.headers.get("Strict-Transport-Security"), "max-age=31536000; includeSubDomains")
+
+        # 다중 리버스 프록시 경유 체인 (https, http): 클라이언트 최초 프로토콜이 https일 때 HSTS 주입
+        res_multi_https = self.client.get("/api/auth/me", headers={"X-Forwarded-Proto": "https, http"})
+        self.assertEqual(res_multi_https.headers.get("Strict-Transport-Security"), "max-age=31536000; includeSubDomains")
+
+        # 다중 리버스 프록시 경유 체인 (http, https): 클라이언트 최초 프로토콜이 http일 때 HSTS 미주입
+        res_multi_http = self.client.get("/api/auth/me", headers={"X-Forwarded-Proto": "http, https"})
+        self.assertNotIn("Strict-Transport-Security", res_multi_http.headers)

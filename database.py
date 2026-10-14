@@ -48,9 +48,21 @@ async def init_db_pool():
     global pool
     # 프로덕션 환경 Fail-Fast 검증 (SECURITY_AND_AUDIT.md 1.6)
     is_prod = os.getenv("ENVIRONMENT") == "production" or os.getenv("PROD") == "true"
-    if is_prod and not DB_CONFIG.get("password"):
+    password = os.getenv("DATABASE_PASSWORD") or DB_CONFIG.get("password")
+    if is_prod and not password:
         raise RuntimeError("[FATAL] 프로덕션 환경에서는 DATABASE_PASSWORD 환경변수가 반드시 설정되어야 합니다.")
-    pool = await asyncmy.create_pool(**DB_CONFIG, minsize=DB_POOL_MIN, maxsize=DB_POOL_MAX)
+    
+    # 런타임 환경변수 동적 동기화
+    DB_CONFIG["host"] = os.getenv("DATABASE_HOST") or DB_CONFIG.get("host", "localhost")
+    DB_CONFIG["port"] = int(os.getenv("DATABASE_PORT") or DB_CONFIG.get("port", 3306))
+    DB_CONFIG["user"] = os.getenv("DATABASE_USER") or DB_CONFIG.get("user", "root")
+    DB_CONFIG["password"] = password
+    DB_CONFIG["database"] = os.getenv("DATABASE_NAME") or DB_CONFIG.get("database", "swMeister")
+    DB_CONFIG["charset"] = os.getenv("DATABASE_CHARSET") or DB_CONFIG.get("charset", "utf8mb4")
+
+    pool_min = int(os.getenv("DATABASE_POOL_MIN") or DB_POOL_MIN)
+    pool_max = int(os.getenv("DATABASE_POOL_MAX") or DB_POOL_MAX)
+    pool = await asyncmy.create_pool(**DB_CONFIG, minsize=pool_min, maxsize=pool_max)
 
 async def close_db_pool():
     global pool
@@ -82,10 +94,11 @@ async def init_redis_pool():
         has_auth = "@" in redis_url and ":" in redis_url.split("@")[0]
         if not has_auth and not os.getenv("REDIS_PASSWORD"):
             raise RuntimeError("[FATAL] 프로덕션 환경에서는 REDIS_PASSWORD 또는 인증 정보가 포함된 REDIS_URL이 필수입니다.")
+    pool_max = int(os.getenv("REDIS_POOL_MAX") or REDIS_POOL_MAX)
     redis_pool = aioredis.ConnectionPool.from_url(
         redis_url,
         decode_responses=True,
-        max_connections=REDIS_POOL_MAX
+        max_connections=pool_max
     )
     redis_client = aioredis.Redis(connection_pool=redis_pool)
 

@@ -108,8 +108,15 @@ async def add_security_headers(request: Request, call_next):
     response.headers["X-XSS-Protection"] = "1; mode=block"
     response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
     response.headers["Cache-Control"] = "no-store"
-    response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
-    response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+    # HTTPS 요청일 때만 HSTS(Strict-Transport-Security) 헤더 주입 (로컬 HTTP / 사설 IP 접속 브라우저 차단 방지)
+    proto_header = request.headers.get("x-forwarded-proto", "")
+    proto_first = proto_header.split(",")[0].strip().lower() if proto_header else ""
+    is_https = (
+        request.url.scheme == "https"
+        or proto_first == "https"
+    )
+    if is_https:
+        response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
     response.headers["Content-Security-Policy"] = "default-src 'self'; frame-ancestors 'none'; object-src 'none';"
     return response
 
@@ -136,6 +143,12 @@ app.include_router(admin_router)
 
 # AI 서비스 라우터 등록 (/api/ai - 5.1~5.3 및 FE Copilot 연동)
 app.include_router(ai_router)
+
+# 🩺 컨테이너 및 리버스 프록시(Nginx) 헬스체크 엔드포인트
+@app.get("/health", summary="시스템 헬스체크")
+async def health_check():
+    return {"status": "ok", "service": "meister-backend"}
+
 
 # 📁 [보안 3.1] 증빙자료 파일 안전 조회 및 다운로드 (RBAC 및 학생 소유권 인가 검증)
 # 기존 단순 StaticFiles 마운트의 무인가 개인정보 탈취(IDOR) 취약점을 해소
