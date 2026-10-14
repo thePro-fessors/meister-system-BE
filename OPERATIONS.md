@@ -1,19 +1,20 @@
 # 🚀 마이스터 역량인증제 백엔드 서버 운영 및 초기 기동 가이드 (OPERATIONS GUIDE)
 
-> **문서 버전**: v1.0  
-> **최종 갱신 일자**: 2026-10-07  
+> **문서 버전**: v1.4  
+> **최종 갱신 일자**: 2026-10-14  
 > **대상 시스템**: 부산소프트웨어마이스터고등학교 마이스터 역량인증제 시스템 (`meister-backend`)  
-> **핵심 스택**: Python 3.12+, FastAPI, asyncmy (MySQL 8.0+), Redis 7.0+, Uvicorn/Gunicorn  
+> **핵심 스택**: Python 3.12+, FastAPI, asyncmy (MySQL 8.0+), Redis 7.0+, Uvicorn/Gunicorn, Nginx, Docker Compose  
+> **검증 상태**: 30개 모듈(기본 기능 25개 + 심층 감사/보안 5개) 360개 전수 단위/통합 테스트 100% 통과 (`Ran 360 tests in ~5.8s - OK`)
 
 ---
 
 ## 📌 목차
 1. [시스템 아키텍처 개요](#1-시스템-아키텍처-개요)
 2. [초기 환경 구축 및 의존성 설치 (Cold Start)](#2-초기-환경-구축-및-의존성-설치-cold-start)
-3. [환경변수(.env) 설정 명세표 및 보안 가이드](#3-환경변수env-설정-명세표-및-보안-가이드)
+3. [환경변수(.env) 설정 명세표 및 Multi-Provider AI 가이드](#3-환경변수env-설정-명세표-및-multi-provider-ai-가이드)
 4. [데이터베이스(MySQL) 구축 및 DDL 마이그레이션 절차](#4-데이터베이스mysql-구축-및-ddl-마이그레이션-절차)
 5. [Redis 스토어 설정 및 캐시 관리](#5-redis-스토어-설정-및-캐시-관리)
-6. [서버 기동 및 프로덕션 프로세스 관리](#6-서버-기동-및-프로덕션-프로세스-관리)
+6. [서버 기동 및 프로덕션 컨테이너(Docker Compose) 관리](#6-서버-기동-및-프로덕션-컨테이너docker-compose-관리)
 7. [리버스 프록시(Nginx / Cloudflare) 연동 설정](#7-리버스-프록시nginx--cloudflare-연동-설정)
 8. [정기 유지보수 및 연례 학사 운영 태스크](#8-정기-유지보수-및-연례-학사-운영-태스크)
 9. [모니터링 및 트러블슈팅 가이드](#9-모니터링-및-트러블슈팅-가이드)
@@ -24,10 +25,11 @@
 
 본 시스템은 학생의 마이스터 역량인증제 활동 증빙 제출/심사, 교사의 승인/반려/상벌점 부여, 관리자의 학년도 및 평가 기준 관리와 통계를 지원하는 비동기 RESTful API 백엔드입니다.
 
-- **웹 프레임워크**: FastAPI (ASGI 기반 고성능 비동기 처리)
-- **주 데이터베이스**: MySQL 8.0+ (`asyncmy` 비동기 커넥션 풀)
+- **웹 프레임워크**: FastAPI (ASGI 기반 고성능 비동기 처리, Python 3.12-slim)
+- **주 데이터베이스**: MySQL 8.0+ (`asyncmy` 비동기 커넥션 풀, 커넥션 풀 튜닝)
 - **캐시 및 분산락**: Redis 7.0+ (`redis.asyncio`, OTP 검증, 브루트포스 차단, 업로드 티켓, 동시성 분산 락)
-- **보안/인가 계층**: JWT (HMAC-SHA256), 단일 소비 일회용 티켓, 경로 바인딩 단기 서명, RBAC 중앙 인가(`core/authorization.py`)
+- **보안/인가 계층**: JWT (HMAC-SHA256), 단일 소비 일회용 티켓(GETDEL), 교무분장 12대 사용자 결정 RBAC 중앙 인가(`core/authorization.py`)
+- **Multi-Provider AI**: Google Gemini, OpenAI, Anthropic Claude, OpenAI 호환 커스텀 엔드포인트(Groq/vLLM/Ollama) 지원 및 5초 타임아웃 Graceful Fallback
 - **파일 스토리지**: 로컬 디스크 격리 저장 (`UUIDv4.hex`, 14종 바이너리 매직바이트 검증, 비동기 디렉터리 순회 GC)
 
 ---
@@ -57,21 +59,23 @@ pip install -e .
 
 ---
 
-## 3. 환경변수(.env) 설정 명세표 및 보안 가이드
+## 3. 환경변수(.env) 설정 명세표 및 Multi-Provider AI 가이드
 
 서버 루트 디렉터리의 `.env` 파일에 다음 환경변수를 반드시 정의해야 합니다. `DATABASE_PASSWORD` 등 핵심 보안 변수 누락 시 서버 부팅이 즉시 중단(Fail-Fast)됩니다.
 
+### 3.1 핵심 인프라 및 보안 환경변수
+
 | 환경변수명 | 필수 여부 | 기본값 | 설명 및 권장 설정 |
 |:---|:---:|:---:|:---|
-| `DATABASE_HOST` | 선택 | `127.0.0.1` | MySQL 데이터베이스 호스트 주소 |
+| `DATABASE_HOST` | 선택 | `127.0.0.1` | MySQL 데이터베이스 호스트 주소 (Docker 사용 시 `mysql`) |
 | `DATABASE_PORT` | 선택 | `3306` | MySQL 포트 번호 |
-| `DATABASE_USER` | 선택 | `meister` | MySQL 접속 계정명 |
+| `DATABASE_USER` | 선택 | `root` | MySQL 접속 계정명 |
 | `DATABASE_PASSWORD` | **필수** | (없음) | **MySQL 패스워드 (미설정 시 Fail-Fast 부팅 중단)** |
-| `DATABASE_NAME` | 선택 | `meister` | 데이터베이스 스키마명 |
+| `DATABASE_NAME` | 선택 | `swMeister` | 데이터베이스 스키마명 |
 | `DATABASE_POOL_MIN` | 선택 | `5` | `asyncmy` 비동기 커넥션 풀 최소 연결 수 |
 | `DATABASE_POOL_MAX` | 선택 | `30` | `asyncmy` 비동기 커넥션 풀 최대 연결 수 (동시 트래픽 대응) |
 | `REDIS_URL` | 권장 | (없음) | Redis 연결 URI (`redis://:password@host:port/0`) |
-| `REDIS_HOST` | 선택 | `localhost` | `REDIS_URL` 미지정 시 사용될 호스트 |
+| `REDIS_HOST` | 선택 | `localhost` | `REDIS_URL` 미지정 시 사용될 호스트 (Docker 시 `redis`) |
 | `REDIS_PORT` | 선택 | `6379` | `REDIS_URL` 미지정 시 사용될 포트 |
 | `REDIS_PASSWORD` | 선택 | (없음) | Redis 인증 비밀번호 |
 | `REDIS_POOL_MAX` | 선택 | `50` | Redis 커넥션 풀 최대 크기 |
@@ -80,16 +84,42 @@ pip install -e .
 | `ACCESS_TOKEN_EXPIRE_MINUTES`| 선택 | `240` | 액세스 토큰 유효시간 (분 단위, 기본 4시간) |
 | `REFRESH_TOKEN_EXPIRE_DAYS` | 선택 | `7` | 리프레시 토큰 유효기간 (일 단위, 기본 7일) |
 | `SINGLE_USE_TICKET_SECRET` | 선택 | `JWT_SECRET_KEY` | 일회용 다운로드 티켓 HMAC 서명 시크릿 |
-| `TRUSTED_PROXIES` | **운영필수** | `127.0.0.1` | 리버스 프록시 IP 목록 (쉼표 구분, 예: `10.0.0.1,172.16.0.0/12`) |
-| `CORS_ORIGINS` | 선택 | `http://localhost:3000,...` | 허용 오리진 (운영 배포 시 특정 도메인으로 엄격 제한) |
-| `UPLOAD_DIR` | 선택 | `uploads` | 증빙자료 업로드 저장 디렉터리 경로 |
-| `MAX_FILE_SIZE_MB` | 선택 | `20` | 단일 파일 최대 업로드 용량 제한 (MB 단위) |
-| `EMAIL_PROVIDER` | 선택 | `smtp` | 이메일 발송 방식 (`smtp` 또는 `mock`) |
+| `TRUSTED_PROXIES` | **운영필수** | `127.0.0.1` | 리버스 프록시 IP 목록 (쉼표 구분, 예: `127.0.0.1,nginx,172.16.0.0/12`) |
+| `CORS_ORIGINS` | 선택 | `http://localhost:3000,...` | 허용 오리진 (운영 배포 시 학교 공식 도메인으로 엄격 제한) |
+| `UPLOAD_DIR` | 선택 | `uploads` | 증빙자료 업로드 저장 디렉터리 경로 (Docker 컨테이너 시 `/app/uploads`) |
+| `MAX_FILE_SIZE_MB` | 선택 | `50` | 단일 파일 최대 업로드 용량 제한 (MB 단위, 기본 50MB) |
+| `EMAIL_PROVIDER` | 선택 | `smtp` | 이메일 발송 방식 (`smtp`, `brevo`, 또는 `mock`) |
 | `SMTP_HOST` | 선택 | `smtp.gmail.com` | SMTP 메일 서버 호스트 |
 | `SMTP_PORT` | 선택 | `587` | SMTP 포트 (TLS: 587, SSL: 465) |
 | `SMTP_USER` | 선택 | (없음) | SMTP 인증 이메일 계정 |
 | `SMTP_PASSWORD` | 선택 | (없음) | SMTP 계정 앱 비밀번호 (Google 2단계 앱 패스워드) |
 | `SMTP_FROM_NAME` | 선택 | `부산소프트웨어마이스터고등학교` | 발신자 표시 이름 |
+| `NEIS_API_KEY` | 선택 | (없음) | 교육정보 개방포털 공공 NEIS API 키 (미지정 시 모의 검증 폴백) |
+
+### 3.2 Multi-Provider AI 서비스 환경변수
+
+본 백엔드는 단일 AI 서비스 장애 시 학사 업무 마비를 방지하기 위해 계층 분리 및 Multi-Provider(Gemini, OpenAI, Claude, Local LLM) 설정을 완벽 지원합니다.
+
+| 환경변수명 | 필수 여부 | 기본값 | 설명 및 호환 규격 |
+|:---|:---:|:---:|:---|
+| `AI_PROVIDER` | 선택 | `gemini` | 주 AI 공급자 (`gemini`, `openai`, `claude`, `compatible`) |
+| `AI_API_KEY` | 권장 | (없음) | 전역 기본 AI API Key (Gemini 등 통합 키 호환) |
+| `GEMINI_API_KEY` | 선택 | (없음) | Google Gemini 전용 API Key (`AI_API_KEY` 대체 가능) |
+| `GEMINI_MODEL` | 선택 | `gemini-3.8-flash` | Gemini 기본 모델 식별자 (최신 `gemini-3.8-flash` 권장) |
+| `TEACHER_AI_API_KEY` | 선택 | (없음) | **교사용 전용 격리 API Key** (미지정 시 전역 키 상속) |
+| `GEMINI_TEACHER_MODEL`| 선택 | `gemini-3.8-flash` | 교사용 전용 Gemini 모델 |
+| `ADMIN_AI_API_KEY` | 선택 | (없음) | **관리자용 전용 격리 API Key** (미지정 시 전역 키 상속) |
+| `GEMINI_ADMIN_MODEL` | 선택 | `gemini-3.8-flash` | 관리자용 전용 Gemini 모델 |
+| `OPENAI_API_KEY` | 선택 | (없음) | OpenAI API Key (`AI_PROVIDER=openai` 설정 시 사용) |
+| `OPENAI_MODEL` | 선택 | `gpt-4o-mini` | OpenAI 기본 모델 식별자 |
+| `ANTHROPIC_API_KEY` | 선택 | (없음) | Anthropic Claude API Key (`AI_PROVIDER=claude` 설정 시 사용) |
+| `CLAUDE_MODEL` | 선택 | `claude-3-5-sonnet-20241022`| Claude 기본 모델 식별자 |
+| `AI_BASE_URL` | 선택 | (없음) | **OpenAI 호환 커스텀 Base URL** (Groq, vLLM, Ollama, DeepSeek 등) |
+| `COMPATIBLE_AI_API_KEY`| 선택 | `dummy-key` | OpenAI 호환 엔드포인트용 API Key (로컬 vLLM 등은 더미 허용) |
+| `COMPATIBLE_AI_MODEL` | 선택 | `gpt-4o-mini` | OpenAI 호환 엔드포인트 대상 모델명 |
+
+> [!TIP] **AI Graceful Fallback 아키텍처**
+> 모든 AI 엔드포인트는 호출 타임아웃(5.0초) 또는 Quota 초과(HTTP 429), API 장애 발생 시 서버 에러(500)를 던지지 않고 **내장 규칙 기반 엔진(`rule_based_fallback`)**으로 100% 자동 전환됩니다. 프론트엔드 응답의 `fallbackUsed: true` 및 `analysisSource: "rule_based_fallback"` 메타데이터로 이를 확인할 수 있습니다.
 
 > [!CAUTION]
 > 운영 환경에서는 `CORS_ORIGINS`에 `*` 와일드카드를 사용하지 마십시오. 와일드카드 지정 시 `allow_credentials`가 보안 정책상 자동으로 `False`로 강제 다운그레이드됩니다.
@@ -147,10 +177,52 @@ CREATE INDEX idx_submissions_teacher_filter
   ON submissions (is_deleted, status_code, created_at DESC, submission_id DESC);
 ```
 
-### 4.3 초기 학년도 및 관리자 계정 셋업
-1. 시스템 기동 전 관리자 계정이 `users` 테이블에 최소 1개 이상 존재해야 합니다 (`role = 2`).
-2. 학사력(3월 1일 기준)에 맞는 당해 연도가 `academic_years` 테이블에 등록되고 `is_activated = TRUE` 상태여야 합니다.
-   - 예: 2026년 3월 기준 $\rightarrow$ `INSERT INTO academic_years (year, is_activated) VALUES (2026, TRUE);`
+#### 4.3 신규 평가자 매핑 및 교무분장 컬럼 확장 (v1.4 마이그레이션)
+교무분장 12대 사용자 결정사항 및 평가자 계층 상속(1~3순위)을 지원하기 위해 다음 DDL 패치가 적용되어야 합니다:
+
+```sql
+-- [v1.4 마이그레이션 스크립트]
+-- 1. 평가 영역/항목별 교과 및 소속 부서 컬럼 추가
+ALTER TABLE certification_areas
+  ADD COLUMN grade TINYINT NOT NULL DEFAULT 1 COMMENT '대상 학년 (1, 2, 3)',
+  ADD COLUMN subject VARCHAR(40) NULL COMMENT '2순위: 평가 담당 교과',
+  ADD COLUMN department VARCHAR(40) NULL COMMENT '3순위: 평가 담당 부서';
+
+ALTER TABLE evaluation_items
+  ADD COLUMN target_grade TINYINT NULL DEFAULT 0 COMMENT '대상 학년',
+  ADD COLUMN subject VARCHAR(40) NULL COMMENT '2순위: 평가 담당 교과',
+  ADD COLUMN department VARCHAR(40) NULL COMMENT '3순위: 평가 담당 부서';
+
+-- 2. 1순위 전담 평가 교사 N:M 매핑 테이블 생성
+CREATE TABLE IF NOT EXISTS certification_area_teachers (
+  area_id    INT      NOT NULL COMMENT '인증 영역 ID',
+  teacher_id INT      NOT NULL COMMENT '교사 고유 ID',
+  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (area_id, teacher_id),
+  CONSTRAINT FK_cat_area FOREIGN KEY (area_id) REFERENCES certification_areas (area_id) ON DELETE CASCADE,
+  CONSTRAINT FK_cat_teacher FOREIGN KEY (teacher_id) REFERENCES teachers (teachers_id) ON DELETE CASCADE
+) COMMENT '인증 영역별 전담 평가 교사 N:M 매핑 테이블';
+
+CREATE TABLE IF NOT EXISTS evaluation_item_teachers (
+  item_id    INT      NOT NULL COMMENT '평가 항목 ID',
+  teacher_id INT      NOT NULL COMMENT '교사 고유 ID',
+  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (item_id, teacher_id),
+  CONSTRAINT FK_eit_item FOREIGN KEY (item_id) REFERENCES evaluation_items (item_id) ON DELETE CASCADE,
+  CONSTRAINT FK_eit_teacher FOREIGN KEY (teacher_id) REFERENCES teachers (teachers_id) ON DELETE CASCADE
+) COMMENT '평가 항목별 전담 평가 교사 N:M 매핑 테이블';
+```
+
+### 4.4 초기 학년도 및 관리자 계정 시드 주입 (Seed Script)
+신규 인스턴스 구축 시 루트의 `scripts/seed_initial_data.py`를 실행하여 최초 관리자 계정, 당해 학년도(`2026`, 활성), 5대 기본 인증 영역 및 평가 항목 데이터를 원클릭으로 자동 주입합니다:
+
+```bash
+# 기본 시드 데이터 주입 (최초 관리자 admin + 2026 활성 학년도 + 5대 영역)
+python scripts/seed_initial_data.py
+
+# 테스트 및 스테이징용 샘플 교사/학생 데이터까지 함께 주입 시
+python scripts/seed_initial_data.py --with-sample-data
+```
 
 ---
 
@@ -160,7 +232,7 @@ CREATE INDEX idx_submissions_teacher_filter
 
 - **OTP 발송 및 인증**: `otp:{email}` (TTL 5분), `otp:attempts:{email}` (최대 5회 초과 시 차단)
 - **로그인 브루트포스 차단**: `login:fail:{ip}` (분당 20회 초과 시 429), `login:lock:{user_id}` (5회 연속 실패 시 10분 잠금)
-- **일회용 파일 다운로드 티켓**: `ticket:{ticket_uuid}` (TTL 60초, 단 1회 읽기 후 원자적 삭제)
+- **일회용 파일 다운로드 티켓**: `ticket:{ticket_uuid}` (TTL 60초, 단 1회 읽기 후 원자적 삭제 `GETDEL`)
 - **동시 제출 방어 분산 락**: `lock:submission:{student_id}:{item_id}` (TTL 10초)
 
 ```bash
@@ -174,16 +246,39 @@ redis-cli info memory
 
 ---
 
-## 6. 서버 기동 및 프로덕션 프로세스 관리
+## 6. 서버 기동 및 프로덕션 컨테이너(Docker Compose) 관리
 
-### 6.1 개발 및 로컬 테스트 기동
+### 6.1 Docker Compose 기반 프로덕션 기동 (권장)
+운영 환경에서는 Docker Compose를 통해 4대 핵심 서비스(Backend, MySQL 8.0, Redis 7, Nginx)를 일괄 관리합니다.
+
+```bash
+# 1. 컨테이너 빌드 및 백그라운드 기동
+docker compose up -d --build
+
+# 2. 전체 컨테이너 상태 및 헬스체크 확인 (ALL healthy 확인)
+docker compose ps
+
+# 3. 신규 DB 초기 시드 주입 (최초 1회 실행)
+docker compose exec backend python scripts/seed_initial_data.py --with-sample-data
+
+# 4. 실시간 로그 모니터링
+docker compose logs -f backend
+```
+
+#### 헬스체크 확인:
+```bash
+curl -f http://localhost/health
+# 정상 응답: {"status": "ok"}
+```
+
+### 6.2 로컬 가상환경 직접 기동 (개발용)
 ```bash
 # 자동 리로드 활성화
 uvicorn main:app --reload --host 0.0.0.0 --port 8000
 ```
 
-### 6.2 프로덕션 배포 기동 (Gunicorn + UvicornWorker)
-프로덕션 환경에서는 멀티 코어 CPU를 효율적으로 활용하기 위해 Gunicorn 마스터 프로세스 아래 Uvicorn 비동기 워커를 구동합니다. 권장 워커 수: `(2 x CPU_CORES) + 1`
+### 6.3 Standalone 프로덕션 배포 기동 (Gunicorn + UvicornWorker)
+컨테이너 외부에서 직접 프로세스를 띄울 경우: 권장 워커 수 `(2 x CPU_CORES) + 1`
 
 ```bash
 # Gunicorn 멀티 워커 구동 (워커 4개 기준 예시)
@@ -198,7 +293,7 @@ gunicorn main:app \
   --keep-alive 5
 ```
 
-### 6.3 Systemd 서비스 등록 예시 (`/etc/systemd/system/meister.service`)
+### 6.4 Systemd 서비스 등록 예시 (`/etc/systemd/system/meister.service`)
 ```ini
 [Unit]
 Description=Meister Backend FastAPI Service
@@ -217,13 +312,6 @@ LimitNOFILE=65535
 
 [Install]
 WantedBy=multi-user.target
-```
-
-```bash
-# 서비스 활성화 및 시작
-sudo systemctl daemon-reload
-sudo systemctl enable --now meister
-sudo systemctl status meister
 ```
 
 ---
@@ -247,8 +335,8 @@ server {
     ssl_certificate /etc/letsencrypt/live/api.meister.school.kr/fullchain.pem;
     ssl_certificate_key /etc/letsencrypt/live/api.meister.school.kr/privkey.pem;
 
-    # 파일 업로드 용량 제한 (백엔드 MAX_FILE_SIZE_MB 이상으로 설정)
-    client_max_body_size 30M;
+    # 파일 업로드 용량 제한 (백엔드 MAX_FILE_SIZE_MB 이상으로 설정: 50MB)
+    client_max_body_size 50M;
 
     location / {
         proxy_pass http://127.0.0.1:8000;
@@ -318,9 +406,15 @@ server {
 - 바이너리 첫 2KB의 매직바이트 시그니처가 정확히 일치해야 승인됩니다.
 
 ### 9.4 단위/회귀 테스트 전체 검증
-운영 패치 배포 전 항상 전체 157종 회귀 테스트를 통과하는지 확인하십시오.
+운영 패치 배포 전 항상 전체 30개 모듈(기본 기능 25개 + 심층 감사/보안 5개) 360개 전수 단위/통합 회귀 테스트를 통과하는지 확인하십시오.
 
 ```bash
+# 로컬 가상환경에서 실행
 ./.venv/bin/python -m unittest discover tests
-# 결과: Ran 157 tests in ~0.4s - OK
+
+# 결과:
+# ----------------------------------------------------------------------
+# Ran 360 tests in ~5.8s
+# 
+# OK
 ```
