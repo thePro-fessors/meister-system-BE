@@ -26,7 +26,7 @@ class TestAIMultiProviderUnit(unittest.IsolatedAsyncioTestCase):
         with patch.dict(os.environ, {}, clear=True):
             cfg = resolve_ai_config("teacher")
             self.assertEqual(cfg.provider, "gemini")
-            self.assertIn("gemini-2.5-flash", cfg.model)
+            self.assertIn("gemini-3.8-flash", cfg.model)
 
     def test_resolve_ai_config_role_separation(self):
         """역할별 AI 설정 분리 검증 (ADMIN_AI_* vs TEACHER_AI_*)"""

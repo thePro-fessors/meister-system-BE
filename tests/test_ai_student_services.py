@@ -248,7 +248,8 @@ class TestStudentAIServices(unittest.TestCase):
     # 1. 모델 명칭 정규화 및 보안 유틸리티 검증
     # =========================================================================
     def test_gemini_model_normalization(self):
-        """사용자가 지정한 Gemini 3.5 Flash Lite 정식 모델 매핑 검증"""
+        self.assertEqual(resolve_gemini_model("gemini-3.8-flash"), "gemini-3.8-flash")
+        self.assertEqual(resolve_gemini_model("3.8-flash"), "gemini-3.8-flash")
         self.assertEqual(resolve_gemini_model("Gemini 3.5-Flash-lite"), "gemini-3.5-flash-lite")
         self.assertEqual(resolve_gemini_model("3.5-flash-lite"), "gemini-3.5-flash-lite")
         self.assertEqual(resolve_gemini_model("gemini-2.0-flash-lite"), "gemini-2.0-flash-lite")

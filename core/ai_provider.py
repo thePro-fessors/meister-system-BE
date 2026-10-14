@@ -30,7 +30,7 @@ AIProviderType = Literal["gemini", "openai", "claude", "openai_compatible"]
 # ==============================================================================
 # 기본 모델 및 프로바이더 기본값
 # ==============================================================================
-DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
+DEFAULT_GEMINI_MODEL = "gemini-3.8-flash"
 DEFAULT_OPENAI_MODEL = "gpt-4o-mini"
 DEFAULT_CLAUDE_MODEL = "claude-3-5-sonnet-20241022"
 DEFAULT_COMPATIBLE_MODEL = "gpt-4o-mini"
@@ -58,6 +58,7 @@ def resolve_gemini_model_name(raw_model: Optional[str] = None) -> str:
     normalized = model.lower().replace(" ", "-")
     alias_map = {
         "gemini-3.8-flash": "gemini-3.8-flash",
+        "3.8-flash": "gemini-3.8-flash",
         "gemini-3.5-flash-lite": "gemini-3.5-flash-lite",
         "3.5-flash-lite": "gemini-3.5-flash-lite",
         "gemini-3.5-flash": "gemini-3.5-flash",

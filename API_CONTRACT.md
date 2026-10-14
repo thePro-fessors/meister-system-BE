@@ -573,7 +573,7 @@
 본 시스템은 **Google Gemini**, **OpenAI**, **Anthropic Claude**, 및 **OpenAI 호환 Custom Endpoint (Groq, vLLM, Ollama, DeepSeek 등)** 멀티 프로바이더를 전면 지원합니다.
 
 #### 지원 프로바이더 및 환경 변수 우선순위
-1. **Google Gemini**: `GEMINI_API_KEY`, `GEMINI_MODEL` (기본값: `gemini-2.5-flash`)
+1. **Google Gemini**: `GEMINI_API_KEY`, `GEMINI_MODEL` (기본값: `gemini-3.8-flash`)
 2. **OpenAI**: `OPENAI_API_KEY`, `OPENAI_MODEL` (기본값: `gpt-4o-mini`)
 3. **Anthropic Claude**: `ANTHROPIC_API_KEY`, `CLAUDE_MODEL` (기본값: `claude-3-5-sonnet-20241022`)
 4. **OpenAI-Compatible Custom Endpoint**: `AI_BASE_URL` (또는 `OPENAI_BASE_URL`), `AI_API_KEY`, `AI_MODEL` (Groq, vLLM, Ollama, DeepSeek)
@@ -586,7 +586,7 @@
   "analysisSource": "gemini",
   "fallbackUsed": false,
   "fallbackReason": null,
-  "model": "gemini-2.5-flash",
+  "model": "gemini-3.8-flash",
   "capabilityMode": "live_llm"
 }
 ```
@@ -620,7 +620,7 @@
       "reason": "TOPCIT 정기평가 성적 증명 활동으로 전공 영역의 TOPCIT 항목에 부합합니다.",
       "analysisSource": "gemini",
       "fallbackUsed": false,
-      "model": "gemini-2.5-flash"
+      "model": "gemini-3.8-flash"
     },
     "error": null
   }
