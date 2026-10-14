@@ -56,14 +56,13 @@ async def seed_data(admin_id: str, admin_pass: str, target_year: int, with_sampl
             password=db_password,
             database=db_name,
             autocommit=False,
-            cursorclass=DictCursor,
         )
     except Exception as e:
         print(f"[FAIL] 데이터베이스 연결 실패: {e}")
         return False
 
     try:
-        async with conn.cursor() as cur:
+        async with conn.cursor(cursor=DictCursor) as cur:
             print("\n[1/4] 학년도(academic_years) 확인 및 생성...")
             await cur.execute("SELECT year_id, is_activated FROM academic_years WHERE year = %s", (target_year,))
             year_row = await cur.fetchone()
@@ -86,7 +85,7 @@ async def seed_data(admin_id: str, admin_pass: str, target_year: int, with_sampl
                     print(f"  [=] 이미 {target_year} 학년도가 활성 상태입니다 (year_id: {year_id})")
 
             print("\n[2/4] 관리자(admin) 계정 확인 및 생성...")
-            await cur.execute("SELECT users_id, id, role FROM users WHERE id = %s OR role = 2 LIMIT 1", (admin_id,))
+            await cur.execute("SELECT uuid, id, role FROM users WHERE id = %s OR role = 2 LIMIT 1", (admin_id,))
             admin_user = await cur.fetchone()
             if not admin_user:
                 admin_uuid = str(uuid.uuid4())

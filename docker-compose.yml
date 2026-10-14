@@ -61,6 +61,7 @@ services:
   # 3. FastAPI Backend Service (Python 3.12-slim)
   # ----------------------------------------------------------------------------
   backend:
+    image: meister-backend:latest
     build:
       context: .
       dockerfile: Dockerfile
