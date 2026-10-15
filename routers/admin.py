@@ -71,11 +71,17 @@ class CreateYearRequest(BaseModel):
     year: int
     is_activated: Optional[bool] = None
     isActivated: Optional[bool] = None
+    active: Optional[bool] = None
+
+    model_config = {"populate_by_name": True}
 
 
 class PatchYearRequest(BaseModel):
     is_activated: Optional[bool] = None
     isActivated: Optional[bool] = None
+    active: Optional[bool] = None
+
+    model_config = {"populate_by_name": True}
 
 
 class PatchAreaRequest(BaseModel):
@@ -224,7 +230,7 @@ async def create_year(
             ).model_dump(),
         )
 
-    is_act = req.is_activated if req.is_activated is not None else (req.isActivated or False)
+    is_act = req.is_activated if req.is_activated is not None else (req.isActivated if req.isActivated is not None else (req.active if req.active is not None else False))
 
     try:
         await conn.autocommit(False)
@@ -293,7 +299,7 @@ async def toggle_year_active(
             ).model_dump(),
         )
 
-    is_act = req.is_activated if req.is_activated is not None else (req.isActivated if req.isActivated is not None else True)
+    is_act = req.is_activated if req.is_activated is not None else (req.isActivated if req.isActivated is not None else (req.active if req.active is not None else True))
 
     try:
         await conn.autocommit(False)
@@ -1538,6 +1544,142 @@ async def get_admin_overview(
         )
         area_distribution = await cur.fetchall()
 
+        # 4. 학생별 인증 상태 집계 (statusCounts)
+        await cur.execute(
+            """
+            SELECT st.student_id, sar.grade
+            FROM students st
+            JOIN student_academic_records sar ON st.student_id = sar.student_id
+            WHERE sar.year_id = %s AND st.is_deleted = FALSE
+            """,
+            (year_id,),
+        )
+        students = await cur.fetchall() or []
+
+        await cur.execute(
+            """
+            SELECT ca.area_id, ca.grade, ca.name AS area_name, ca.max_score AS area_max_score,
+                   ei.item_id, ei.name AS item_name, ei.max_score AS item_max_score, ei.scoring_type, ei.is_active
+            FROM certification_areas ca
+            LEFT JOIN evaluation_items ei ON ca.area_id = ei.area_id
+            WHERE ca.year_id = %s
+            ORDER BY ca.grade ASC, ca.area_id ASC, ei.item_id ASC
+            """,
+            (year_id,),
+        )
+        criteria_rows = await cur.fetchall() or []
+
+        cert_counts = {"인증 가능": 0, "검토중": 0, "보완 필요": 0, "미달성": 0}
+        try:
+            areas_by_grade: Dict[int, Dict[int, Dict[str, Any]]] = {}
+            for row in criteria_rows:
+                if not isinstance(row, dict):
+                    continue
+                g = row.get("grade", 1)
+                aid = row.get("area_id") or row.get("id")
+                if aid is None:
+                    continue
+                a_name = row.get("area_name") or row.get("name") or ""
+                a_max = float(row.get("area_max_score") or row.get("max_score") or 0)
+                if g not in areas_by_grade:
+                    areas_by_grade[g] = {}
+                if aid not in areas_by_grade[g]:
+                    areas_by_grade[g][aid] = {
+                        "area_id": aid,
+                        "id": aid,
+                        "area": a_name,
+                        "name": a_name,
+                        "max_score": a_max,
+                        "maxScore": a_max,
+                        "items": [],
+                    }
+                if row.get("item_id"):
+                    areas_by_grade[g][aid]["items"].append({
+                        "item_id": row["item_id"],
+                        "id": row["item_id"],
+                        "name": row.get("item_name") or row.get("name") or "",
+                        "item_max_score": float(row.get("item_max_score") or row.get("max_score") or 0),
+                        "maxScore": float(row.get("item_max_score") or row.get("max_score") or 0),
+                        "scoring_type": row.get("scoring_type"),
+                        "scoringType": row.get("scoring_type"),
+                        "is_active": bool(row.get("is_active", True)),
+                        "isActive": bool(row.get("is_active", True)),
+                    })
+
+            areas_list_by_grade = {g: list(a_dict.values()) for g, a_dict in areas_by_grade.items()}
+
+            await cur.execute(
+                """
+                SELECT s.submission_id, s.student_id, s.item_id, s.status_code, s.granted_score,
+                       ei.area_id
+                FROM submissions s
+                JOIN evaluation_items ei ON s.item_id = ei.item_id
+                JOIN certification_areas ca ON ei.area_id = ca.area_id
+                WHERE ca.year_id = %s AND s.is_deleted = FALSE
+                """,
+                (year_id,),
+            )
+            all_submissions = await cur.fetchall() or []
+
+            start_date_str = f"{target_year}-03-01"
+            end_date_str = f"{target_year + 1}-03-01"
+            await cur.execute(
+                """
+                SELECT merits_point_id, student_id, type, points, related_area
+                FROM merits
+                WHERE is_reflected = TRUE AND is_deleted = FALSE
+                  AND (occurred_at IS NULL OR (occurred_at >= %s AND occurred_at < %s))
+                """,
+                (start_date_str, end_date_str),
+            )
+            all_merits = await cur.fetchall() or []
+
+            subs_by_student: Dict[int, List[Dict[str, Any]]] = {}
+            for s in all_submissions:
+                if isinstance(s, dict) and "student_id" in s:
+                    subs_by_student.setdefault(s["student_id"], []).append(s)
+
+            merits_by_student: Dict[int, List[Dict[str, Any]]] = {}
+            for m in all_merits:
+                if isinstance(m, dict) and "student_id" in m:
+                    merits_by_student.setdefault(m["student_id"], []).append(m)
+
+            if students:
+                for st in students:
+                    sid = st.get("student_id") if isinstance(st, dict) else st[0]
+                    st_grade = st.get("grade", 1) if isinstance(st, dict) else 1
+                    st_areas = areas_list_by_grade.get(st_grade, [])
+                    calc = calculate_student_certification(st_areas, subs_by_student.get(sid, []), merits_by_student.get(sid, []))
+                    st_status = calc.get("certStatus", "미달성")
+                    cert_counts[st_status] = cert_counts.get(st_status, 0) + 1
+            elif total_students > 0:
+                pending_total = (sub_stats.get("submitted_count", 0) or 0) + (sub_stats.get("reviewing_count", 0) or 0)
+                if pending_total > 0:
+                    cert_counts["검토중"] = min(total_students, pending_total)
+                rem = max(0, total_students - cert_counts["검토중"])
+                cert_counts["미달성"] = rem
+        except Exception:
+            pending_total = (sub_stats.get("submitted_count", 0) or 0) + (sub_stats.get("reviewing_count", 0) or 0)
+            if pending_total > 0:
+                cert_counts["검토중"] = min(total_students, pending_total)
+            rem = max(0, total_students - cert_counts["검토중"])
+            cert_counts["미달성"] = rem
+
+        status_counts = {
+            "certified": cert_counts.get("인증 가능", 0),
+            "supplement": cert_counts.get("보완 필요", 0),
+            "reviewing": cert_counts.get("검토중", 0),
+            "uncertified": cert_counts.get("미달성", 0),
+        }
+
+        sub_counts_dict = {
+            "total": sub_stats.get("total_submissions", 0),
+            "pending": (sub_stats.get("submitted_count", 0) or 0) + (sub_stats.get("reviewing_count", 0) or 0),
+            "approved": sub_stats.get("approved_count", 0) or 0,
+            "rejected": sub_stats.get("rejected_count", 0) or 0,
+            "resubmitRequested": sub_stats.get("resubmit_count", 0) or 0,
+        }
+
     return SrFormat(
         status_code=200,
         success=True,
@@ -1545,13 +1687,9 @@ async def get_admin_overview(
             "year": target_year,
             "yearId": year_id,
             "totalStudents": total_students,
-            "submissions": {
-                "total": sub_stats.get("total_submissions", 0),
-                "pending": (sub_stats.get("submitted_count", 0) or 0) + (sub_stats.get("reviewing_count", 0) or 0),
-                "approved": sub_stats.get("approved_count", 0) or 0,
-                "rejected": sub_stats.get("rejected_count", 0) or 0,
-                "resubmitRequested": sub_stats.get("resubmit_count", 0) or 0,
-            },
+            "statusCounts": status_counts,
+            "submissions": sub_counts_dict,
+            "submissionCounts": sub_counts_dict,
             "areaDistribution": area_distribution,
         },
     ).model_dump()
@@ -2015,8 +2153,12 @@ async def batch_register_students(
             "year": target_year,
             "yearId": target_year_id,
             "totalProcessed": len(final_to_insert) + len(parsing_errors),
+            "total_count": len(final_to_insert) + len(parsing_errors),
             "successCount": len(final_to_insert),
+            "success_count": len(final_to_insert),
             "failedCount": len(parsing_errors),
+            "failed_count": len(parsing_errors),
+            "imported_count": created_count + updated_count,
             "createdStudentsCount": created_count,
             "updatedRecordsCount": updated_count,
             "skippedRecordsCount": skipped_count,
@@ -2423,8 +2565,12 @@ async def batch_register_teachers(
         data={
             "year": target_year,
             "totalProcessed": len(final_to_insert) + len(parsing_errors),
+            "total_count": len(final_to_insert) + len(parsing_errors),
             "successCount": len(final_to_insert),
+            "success_count": len(final_to_insert),
             "failedCount": len(parsing_errors),
+            "failed_count": len(parsing_errors),
+            "total_teachers": created_count + updated_count,
             "createdTeachersCount": created_count,
             "updatedTeachersCount": updated_count,
             "skippedTeachersCount": skipped_count,
@@ -2753,6 +2899,11 @@ async def get_system_audit_logs(
             },
             "reason": r.get("reason"),
             "createdAt": c_at_str,
+            "log_id": r["original_log_id"],
+            "user_id": r.get("modifier_uuid") or (r.get("modifier_name") or "알 수 없음"),
+            "action": r["action_type"],
+            "created_at": c_at_str,
+            "details": r.get("reason") or "",
         }
         formatted_items.append(log_item)
 
@@ -2761,6 +2912,7 @@ async def get_system_audit_logs(
         success=True,
         data={
             "logs": formatted_items,
+            "total": total_count,
             "pagination": {
                 "totalCount": total_count,
                 "page": page,
@@ -3187,6 +3339,8 @@ async def recalculate_student_certifications(
         return admin_err
 
     payload = req or RecalculateBatchRequest()
+    import time
+    start_time = time.perf_counter()
     target_year = payload.year
     filter_grade = payload.grade
     filter_student_id = payload.studentId or payload.student_id
@@ -3432,6 +3586,7 @@ async def recalculate_student_certifications(
 
         total_st_cnt = len(students)
         avg_score = round(total_scores_sum / total_st_cnt, 1) if total_st_cnt > 0 else 0.0
+        duration_ms = round((time.perf_counter() - start_time) * 1000, 2)
 
         return SrFormat(
             status_code=200,
@@ -3440,6 +3595,9 @@ async def recalculate_student_certifications(
                 "targetYear": target_year,
                 "yearId": year_id,
                 "totalProcessedStudents": total_st_cnt,
+                "processed_students": total_st_cnt,
+                "recalculated_scores": total_st_cnt,
+                "duration_ms": duration_ms,
                 "averageTotalScore": avg_score,
                 "certStatusCounts": cert_status_counts,
                 "gradeCounts": grade_counts,

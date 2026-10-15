@@ -350,6 +350,7 @@ async def get_certification_status(
         "certStatus": calc_res["certStatus"],
         "pendingCount": calc_res["pendingCount"],
         "totalMeritScore": calc_res["totalMeritScore"],
+        "pointTotal": calc_res.get("pointTotal", calc_res.get("totalMeritScore", 0.0)),
     }
 
     return SrFormat(

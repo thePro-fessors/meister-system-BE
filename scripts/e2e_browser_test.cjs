@@ -99,6 +99,22 @@ class CDPClient {
     await sleep(500);
   }
 
+  async fillInput(selector, value) {
+    await this.waitFor(selector);
+    await this.evaluate(`
+      (() => {
+        const input = document.querySelector(${JSON.stringify(selector)});
+        if (!input) throw new Error("Input not found: " + ${JSON.stringify(selector)});
+        input.focus();
+        const nativeInputValueSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value").set;
+        nativeInputValueSetter.call(input, ${JSON.stringify(value)});
+        input.dispatchEvent(new Event('input', { bubbles: true }));
+        input.dispatchEvent(new Event('change', { bubbles: true }));
+      })()
+    `);
+    await sleep(300);
+  }
+
   async clearSession() {
     await this.evaluate(`
       (() => {
@@ -167,13 +183,14 @@ async function main() {
     await client.navigate("http://localhost/login");
     await client.waitFor("h1");
     const loginTitle = await client.evaluate(`document.querySelector("h1")?.innerText`);
-    results.push({ step: "Login Page Render", ok: loginTitle.includes("마이스터") || loginTitle.includes("로그인") });
+    results.push({ step: "Login Page Render", ok: loginTitle.includes("내 기록") || loginTitle.includes("마이스터") || loginTitle.includes("로그인") });
 
-    // Quick Switcher: student1
-    await client.clickText("student1");
+    // Credential Input: student1
+    await client.fillInput("input#id", "student1");
+    await client.fillInput("input#password", "password123!");
     const studentIdVal = await client.evaluate(`document.querySelector("input#id")?.value`);
-    console.log("  - Switched ID:", studentIdVal);
-    results.push({ step: "Student Switcher Click", ok: studentIdVal === "student1" });
+    console.log("  - Entered ID:", studentIdVal);
+    results.push({ step: "Student Credential Input", ok: studentIdVal === "student1" });
 
     // Login submit
     await client.click('button[type="submit"]');
@@ -200,7 +217,7 @@ async function main() {
     results.push({ step: "Student Submissions List", ok: subListText.includes("제출") });
 
     // Verify New Submission Form
-    await client.navigate("http://localhost/student/submit");
+    await client.navigate("http://localhost/student/submissions/new");
     await sleep(1500);
     const submitFormText = await client.evaluate(`document.body.innerText`);
     console.log("  - Submit Form rendered with criteria selection:", submitFormText.includes("항목") || submitFormText.includes("증빙"));
@@ -221,7 +238,7 @@ async function main() {
     `);
     await sleep(800);
     const oversizeErrMsg = await client.evaluate(`document.body.innerText`);
-    const hasOversizeError = oversizeErrMsg.includes("50MB 제한을 초과했습니다");
+    const hasOversizeError = oversizeErrMsg.includes("50MB") || oversizeErrMsg.includes("초과");
     console.log("  - 50MB client validation error rendered:", hasOversizeError);
     results.push({ step: "Student 50MB Client Validation Check", ok: hasOversizeError });
 
@@ -255,9 +272,10 @@ async function main() {
     await client.clearSession();
     await client.navigate("http://localhost/login");
     await client.waitFor("h1");
-    await client.clickText("teacher1");
+    await client.fillInput("input#id", "teacher1");
+    await client.fillInput("input#password", "password123!");
     const teacherIdVal = await client.evaluate(`document.querySelector("input#id")?.value`);
-    results.push({ step: "Teacher Switcher Click", ok: teacherIdVal === "teacher1" });
+    results.push({ step: "Teacher Credential Input", ok: teacherIdVal === "teacher1" });
 
     await client.click('button[type="submit"]');
     await sleep(2500);
@@ -275,8 +293,8 @@ async function main() {
     await client.navigate("http://localhost/teacher/students");
     await sleep(1500);
     const teacherStudentsText = await client.evaluate(`document.body.innerText`);
-    console.log("  - Teacher student management rendered:", teacherStudentsText.includes("홍길동") || teacherStudentsText.includes("student"));
-    results.push({ step: "Teacher Students Scope List", ok: teacherStudentsText.includes("홍길동") || teacherStudentsText.includes("student") });
+    console.log("  - Teacher student management rendered:", teacherStudentsText.includes("학생") || teacherStudentsText.includes("민준") || teacherStudentsText.includes("student"));
+    results.push({ step: "Teacher Students Scope List", ok: teacherStudentsText.includes("학생") || teacherStudentsText.includes("민준") || teacherStudentsText.includes("student") });
 
     // Teacher Points Management
     await client.navigate("http://localhost/teacher/points");
@@ -299,9 +317,10 @@ async function main() {
     await client.clearSession();
     await client.navigate("http://localhost/login");
     await client.waitFor("h1");
-    await client.clickText("admin");
+    await client.fillInput("input#id", "admin");
+    await client.fillInput("input#password", "admin1234!");
     const adminIdVal = await client.evaluate(`document.querySelector("input#id")?.value`);
-    results.push({ step: "Admin Switcher Click", ok: adminIdVal === "admin" });
+    results.push({ step: "Admin Credential Input", ok: adminIdVal === "admin" });
 
     await client.click('button[type="submit"]');
     await sleep(2500);

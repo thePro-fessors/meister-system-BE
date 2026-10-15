@@ -90,8 +90,11 @@ async def verify_password(plain_password: str, hashed_password: str) -> bool:
 # ==============================================================================
 
 class LoginRequest(BaseModel):
-    username: str
+    username: Optional[str] = None
+    id: Optional[str] = None
     password: str
+
+    model_config = {"populate_by_name": True}
 
 
 class SendOtpRequest(BaseModel):
@@ -181,6 +184,22 @@ async def login(
     - [보안] IP별 분당 20회 요청 제한 (DoS 방어, Nginx/프록시 호환)
     """
     client_ip = get_client_ip(request)
+
+    login_id = (req.username or req.id or "").strip()
+    if not login_id:
+        return JSONResponse(
+            status_code=400,
+            content=SrFormat(
+                status_code=400,
+                success=False,
+                data=None,
+                error=Error(
+                    code="VALIDATION_ERROR",
+                    message="아이디(username 또는 id)를 입력해주세요.",
+                ),
+            ).model_dump(),
+        )
+    req.username = login_id
 
     # ── [보안 1.1] IP별 분당 20회 요청 제한 (DoS 방어) ──
     ip_limit_key = f"ip_limit:login:{client_ip}"

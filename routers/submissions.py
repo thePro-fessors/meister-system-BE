@@ -378,6 +378,7 @@ async def resubmit_evidence(
         if new_disk_path and old_file_path and old_file_path != new_file_path:
             cleanup_old_file_on_resubmit(old_file_path)
 
+        now_iso = datetime.now().isoformat()
         return SrFormat(
             status_code=200,
             success=True,
@@ -388,6 +389,8 @@ async def resubmit_evidence(
                 "filePath": new_file_path,
                 "linkUrl": target_link,
                 "description": new_desc,
+                "submittedAt": now_iso,
+                "resubmittedAt": now_iso,
             },
         ).model_dump()
     finally:
@@ -950,6 +953,7 @@ async def approve_submission(
             "grantedScore": score,
             "teacherComment": comment,
             "reviewerId": reviewer_id,
+            "reviewedAt": datetime.now().isoformat(),
             "studentTotals": student_totals,
         },
     ).model_dump()

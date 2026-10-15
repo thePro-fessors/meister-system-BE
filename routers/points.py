@@ -6,6 +6,7 @@ routers/points.py - 마이스터 역량인증제 상벌점 내역 조회 API 라
 - TODO.md 2.5 (내 상벌점 내역 조회 API: GET /api/points)
 """
 
+from datetime import datetime
 from typing import Any, Dict, Optional, Union
 
 from fastapi import APIRouter, Depends, Query
@@ -435,6 +436,38 @@ async def update_point(
                 """,
                 (point_id, user_uuid, old_points, new_points, new_reason),
             )
+
+            edit_history = []
+            if hasattr(cur, "fetchall"):
+                try:
+                    await cur.execute(
+                        """
+                        SELECT modifier_uuid, modify_reason, created_at
+                        FROM merits_log
+                        WHERE merits_point_id = %s AND action_type = 'UPDATE'
+                        ORDER BY created_at ASC, log_id ASC
+                        """,
+                        (point_id,),
+                    )
+                    history_rows = await cur.fetchall() or []
+                    for h in history_rows:
+                        if isinstance(h, dict):
+                            c_at = h.get("created_at")
+                            edit_history.append({
+                                "editorId": h.get("modifier_uuid", ""),
+                                "reason": h.get("modify_reason") or "",
+                                "at": c_at.isoformat() if hasattr(c_at, "isoformat") else str(c_at or ""),
+                            })
+                except Exception:
+                    pass
+
+            if not edit_history:
+                edit_history = [{
+                    "editorId": user_uuid or "",
+                    "reason": new_reason or "",
+                    "at": datetime.now().isoformat(),
+                }]
+
         await conn.commit()
     except Exception:
         await conn.rollback()
@@ -452,6 +485,7 @@ async def update_point(
             "points": new_points,
             "reason": new_reason,
             "occurredAt": str(new_occ) if new_occ else None,
+            "editHistory": edit_history,
         },
     ).model_dump()
 

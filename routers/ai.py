@@ -3328,6 +3328,16 @@ async def admin_audit_anomalies(
             "flaggedItems": anomalies_to_return,
             "totalAnomalies": len(unique_anomalies),
             "filteredCount": len(anomalies_to_return),
+            "anomaly_count": len(unique_anomalies),
+            "high_risk_submissions": [
+                {
+                    "submission_id": a.get("submissionId") or a.get("targetId") or 0,
+                    "student_name": a.get("studentName", ""),
+                    "reason": a.get("reason", ""),
+                    "risk_score": int(a.get("riskScore", 0) * 100) if a.get("riskScore", 0) <= 1.0 else int(a.get("riskScore", 0)),
+                }
+                for a in anomalies_to_return
+            ],
             "riskScore": overall_risk_score,
             "riskLevel": risk_level,
             "auditAnalysis": audit_analysis,
