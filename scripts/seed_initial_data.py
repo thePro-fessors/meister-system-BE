@@ -40,7 +40,14 @@ def hash_password(password: str) -> str:
     return bcrypt.hashpw(password.encode("utf-8"), salt).decode("utf-8")
 
 
-async def seed_data(admin_id: str, admin_pass: str, target_year: int, with_sample: bool):
+async def seed_data(
+    admin_id: str,
+    admin_pass: str,
+    target_year: int,
+    with_sample: bool,
+    teacher_pass: str = "password123!",
+    student_pass: str = "password123!",
+):
     db_host = os.getenv("DATABASE_HOST", "localhost")
     db_port = int(os.getenv("DATABASE_PORT", "3306"))
     db_user = os.getenv("DATABASE_USER", "root")
@@ -99,7 +106,12 @@ async def seed_data(admin_id: str, admin_pass: str, target_year: int, with_sampl
                 )
                 print(f"  [+] 관리자 계정 생성 완료: ID='{admin_id}', Role=2 (UUID: {admin_uuid})")
             else:
-                print(f"  [=] 기존 관리자 계정 존재 확인: ID='{admin_user['id']}', Role={admin_user['role']}")
+                hashed_pw = hash_password(admin_pass)
+                await cur.execute(
+                    "UPDATE users SET password = %s WHERE id = %s",
+                    (hashed_pw, admin_user["id"]),
+                )
+                print(f"  [*] 관리자 계정 비밀번호 갱신: ID='{admin_user['id']}', Role={admin_user['role']}")
 
             print("\n[3/4] 5대 마이스터 역량 인증 영역 및 기본 평가 기준 주입...")
             areas_spec = [
@@ -217,57 +229,154 @@ async def seed_data(admin_id: str, admin_pass: str, target_year: int, with_sampl
 
             # 4. 샘플 교사/학생 데이터 주입 (선택)
             if with_sample:
-                print("\n[4/4] 테스트용 샘플 교사 및 학생 데이터 주입 (--with-sample-data)...")
-                # 1) 교사 등록
-                sample_teacher_email = "teacher1@bssm.hs.kr"
-                await cur.execute("SELECT teachers_id FROM teachers WHERE email = %s", (sample_teacher_email,))
-                if not await cur.fetchone():
-                    t_uuid = str(uuid.uuid4())
-                    await cur.execute(
-                        """
-                        INSERT INTO users (id, password, role, uuid)
-                        VALUES (%s, %s, 1, %s)
-                        """,
-                        ("teacher1", hash_password("Teacher1234!"), t_uuid),
-                    )
-                    await cur.execute(
-                        """
-                        INSERT INTO teachers (name, subject, position, department, grade, class, email, uuid)
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-                        """,
-                        ("김선생", "전공", "1학년부장", "마이스터부", 1, 1, sample_teacher_email, t_uuid),
-                    )
-                    print(f"  [+] 샘플 교사 생성: ID='teacher1', 이메일='{sample_teacher_email}', 1학년 1반 담임")
+                print("\n[4/4] 테스트용 교사 3명(교감, 학년부장, 담임) 및 학생 16명(1반 8명, 2반 8명) 주입...")
+                
+                # 1) 교사 등록: 교감, 학년부장, 담임 (+ 2반 담임 보조)
+                sample_teachers = [
+                    {
+                        "id": "vp",
+                        "name": "박교감",
+                        "subject": "공통",
+                        "position": "교감",
+                        "department": "교무기획부",
+                        "grade": None,
+                        "class": None,
+                        "email": "vp@bssm.hs.kr",
+                    },
+                    {
+                        "id": "head1",
+                        "name": "김부장",
+                        "subject": "전공",
+                        "position": "학년부장",
+                        "department": "마이스터부",
+                        "grade": 1,
+                        "class": None,
+                        "email": "head1@bssm.hs.kr",
+                    },
+                    {
+                        "id": "teacher1",
+                        "name": "이담임",
+                        "subject": "전공",
+                        "position": "담임",
+                        "department": "마이스터부",
+                        "grade": 1,
+                        "class": 1,
+                        "email": "teacher1@bssm.hs.kr",
+                    },
+                    {
+                        "id": "teacher2",
+                        "name": "최담임",
+                        "subject": "보통",
+                        "position": "담임",
+                        "department": "교육정보부",
+                        "grade": 1,
+                        "class": 2,
+                        "email": "teacher2@bssm.hs.kr",
+                    },
+                ]
 
-                # 2) 학생 등록
-                sample_student_email = "student1@bssm.hs.kr"
-                await cur.execute("SELECT student_id FROM students WHERE email = %s", (sample_student_email,))
-                ex_st = await cur.fetchone()
-                if not ex_st:
-                    s_uuid = str(uuid.uuid4())
-                    await cur.execute(
-                        """
-                        INSERT INTO users (id, password, role, uuid)
-                        VALUES (%s, %s, 0, %s)
-                        """,
-                        ("student1", hash_password("Student1234!"), s_uuid),
-                    )
-                    await cur.execute(
-                        """
-                        INSERT INTO students (name, email, uuid)
-                        VALUES (%s, %s, %s)
-                        """,
-                        ("홍길동", sample_student_email, s_uuid),
-                    )
-                    st_id = cur.lastrowid
-                    await cur.execute(
-                        """
-                        INSERT INTO student_academic_records (student_id, year_id, grade, class, number)
-                        VALUES (%s, %s, 1, 1, 1)
-                        """,
-                        (st_id, year_id),
-                    )
-                    print(f"  [+] 샘플 학생 생성: ID='student1', 이메일='{sample_student_email}', 1학년 1반 1번")
+                for t in sample_teachers:
+                    await cur.execute("SELECT teachers_id FROM teachers WHERE email = %s", (t["email"],))
+                    row = await cur.fetchone()
+                    if not row:
+                        t_uuid = str(uuid.uuid4())
+                        await cur.execute(
+                            """
+                            INSERT INTO users (id, password, role, uuid)
+                            VALUES (%s, %s, 1, %s)
+                            ON DUPLICATE KEY UPDATE password = VALUES(password)
+                            """,
+                            (t["id"], hash_password(teacher_pass), t_uuid),
+                        )
+                        await cur.execute(
+                            """
+                            INSERT INTO teachers (name, subject, position, department, grade, class, email, uuid)
+                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                            """,
+                            (t["name"], t["subject"], t["position"], t["department"], t["grade"], t["class"], t["email"], t_uuid),
+                        )
+                        print(f"  [+] 교사 생성: ID='{t['id']}', 성명='{t['name']}', 직책='{t['position']}', 담당='{t['grade'] or '전'}학년 {t['class'] or '전'}반'")
+                    else:
+                        await cur.execute(
+                            "UPDATE users SET password = %s WHERE id = %s",
+                            (hash_password(teacher_pass), t["id"]),
+                        )
+                        await cur.execute(
+                            """
+                            UPDATE teachers 
+                            SET name = %s, subject = %s, position = %s, department = %s, grade = %s, class = %s
+                            WHERE email = %s
+                            """,
+                            (t["name"], t["subject"], t["position"], t["department"], t["grade"], t["class"], t["email"]),
+                        )
+                        print(f"  [*] 교사 갱신: ID='{t['id']}', 성명='{t['name']}' ({t['position']})")
+
+                # 2) 학생 16명 등록 (1학년 1반 8명, 1학년 2반 8명)
+                sample_students = [
+                    # 1학년 1반 (8명)
+                    {"id": "student1", "name": "홍길동", "grade": 1, "class": 1, "number": 1, "email": "student1@bssm.hs.kr"},
+                    {"id": "student2", "name": "강민준", "grade": 1, "class": 1, "number": 2, "email": "student2@bssm.hs.kr"},
+                    {"id": "student3", "name": "김서연", "grade": 1, "class": 1, "number": 3, "email": "student3@bssm.hs.kr"},
+                    {"id": "student4", "name": "박도윤", "grade": 1, "class": 1, "number": 4, "email": "student4@bssm.hs.kr"},
+                    {"id": "student5", "name": "이지우", "grade": 1, "class": 1, "number": 5, "email": "student5@bssm.hs.kr"},
+                    {"id": "student6", "name": "정시우", "grade": 1, "class": 1, "number": 6, "email": "student6@bssm.hs.kr"},
+                    {"id": "student7", "name": "최하은", "grade": 1, "class": 1, "number": 7, "email": "student7@bssm.hs.kr"},
+                    {"id": "student8", "name": "한지호", "grade": 1, "class": 1, "number": 8, "email": "student8@bssm.hs.kr"},
+                    # 1학년 2반 (8명)
+                    {"id": "student9", "name": "윤도현", "grade": 1, "class": 2, "number": 1, "email": "student9@bssm.hs.kr"},
+                    {"id": "student10", "name": "장민서", "grade": 1, "class": 2, "number": 2, "email": "student10@bssm.hs.kr"},
+                    {"id": "student11", "name": "임예준", "grade": 1, "class": 2, "number": 3, "email": "student11@bssm.hs.kr"},
+                    {"id": "student12", "name": "오서윤", "grade": 1, "class": 2, "number": 4, "email": "student12@bssm.hs.kr"},
+                    {"id": "student13", "name": "서건우", "grade": 1, "class": 2, "number": 5, "email": "student13@bssm.hs.kr"},
+                    {"id": "student14", "name": "신채원", "grade": 1, "class": 2, "number": 6, "email": "student14@bssm.hs.kr"},
+                    {"id": "student15", "name": "권유준", "grade": 1, "class": 2, "number": 7, "email": "student15@bssm.hs.kr"},
+                    {"id": "student16", "name": "황서진", "grade": 1, "class": 2, "number": 8, "email": "student16@bssm.hs.kr"},
+                ]
+
+                for s in sample_students:
+                    await cur.execute("SELECT student_id FROM students WHERE email = %s", (s["email"],))
+                    st_row = await cur.fetchone()
+                    if not st_row:
+                        s_uuid = str(uuid.uuid4())
+                        await cur.execute(
+                            """
+                            INSERT INTO users (id, password, role, uuid)
+                            VALUES (%s, %s, 0, %s)
+                            ON DUPLICATE KEY UPDATE password = VALUES(password)
+                            """,
+                            (s["id"], hash_password(student_pass), s_uuid),
+                        )
+                        await cur.execute(
+                            """
+                            INSERT INTO students (name, email, uuid)
+                            VALUES (%s, %s, %s)
+                            """,
+                            (s["name"], s["email"], s_uuid),
+                        )
+                        st_id = cur.lastrowid
+                        await cur.execute(
+                            """
+                            INSERT INTO student_academic_records (student_id, year_id, grade, class, number)
+                            VALUES (%s, %s, %s, %s, %s)
+                            """,
+                            (st_id, year_id, s["grade"], s["class"], s["number"]),
+                        )
+                        print(f"  [+] 학생 생성: ID='{s['id']}', 성명='{s['name']}', 학적='{s['grade']}학년 {s['class']}반 {s['number']}번'")
+                    else:
+                        st_id = st_row["student_id"]
+                        await cur.execute(
+                            "UPDATE users SET password = %s WHERE id = %s",
+                            (hash_password(student_pass), s["id"]),
+                        )
+                        await cur.execute(
+                            """
+                            UPDATE student_academic_records 
+                            SET grade = %s, class = %s, number = %s
+                            WHERE student_id = %s AND year_id = %s
+                            """,
+                            (s["grade"], s["class"], s["number"], st_id, year_id),
+                        )
+                        print(f"  [*] 학생 갱신: ID='{s['id']}', 성명='{s['name']}' ({s['grade']}학년 {s['class']}반 {s['number']}번)")
             else:
                 print("\n[4/4] 샘플 데이터 주입 건너뜀 (필요 시 --with-sample-data 옵션 사용)")
 
@@ -289,11 +398,13 @@ def main():
     parser = argparse.ArgumentParser(description="마이스터역량인증제 초기 데이터 시드 주입")
     parser.add_argument("--admin-id", default=os.getenv("ADMIN_ID", "admin"), help="최초 관리자 아이디 (기본: admin)")
     parser.add_argument("--admin-pass", default=os.getenv("ADMIN_PASSWORD", "admin1234!"), help="최초 관리자 비밀번호")
+    parser.add_argument("--teacher-pass", default=os.getenv("TEACHER_PASSWORD", "password123!"), help="샘플 교사 비밀번호")
+    parser.add_argument("--student-pass", default=os.getenv("STUDENT_PASSWORD", "password123!"), help="샘플 학생 비밀번호")
     parser.add_argument("--year", type=int, default=2026, help="최초 활성화 학년도 (기본: 2026)")
     parser.add_argument("--with-sample-data", action="store_true", help="테스트용 교사/학생 계정 추가 생성 여부")
     args = parser.parse_args()
 
-    success = asyncio.run(seed_data(args.admin_id, args.admin_pass, args.year, args.with_sample_data))
+    success = asyncio.run(seed_data(args.admin_id, args.admin_pass, args.year, args.with_sample_data, args.teacher_pass, args.student_pass))
     sys.exit(0 if success else 1)
 
 

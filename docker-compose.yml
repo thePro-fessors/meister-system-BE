@@ -122,19 +122,28 @@ services:
       - meister_network
 
   # ----------------------------------------------------------------------------
-  # 5. Next.js Frontend Service (FE 배포 시 아래 주석을 해제하여 사용)
+  # 5. Next.js Frontend Service
   # ----------------------------------------------------------------------------
-  # frontend:
-  #   build:
-  #     context: ../meister-frontend  # FE 레포지토리 경로
-  #     dockerfile: Dockerfile
-  #   container_name: meister_frontend
-  #   restart: unless-stopped
-  #   environment:
-  #     NODE_ENV: production
-  #     NEXT_PUBLIC_API_URL: /api  # Nginx 프록시를 통해 동일 출처로 호출
-  #   networks:
-  #     - meister_network
+  frontend:
+    image: meister-frontend:latest
+    build:
+      context: ./fe
+      dockerfile: Dockerfile
+    container_name: meister_frontend
+    restart: unless-stopped
+    environment:
+      - NODE_ENV=production
+      - PORT=3000
+      - BACKEND_URL=http://backend:8000
+    expose:
+      - "3000"
+    networks:
+      - meister_network
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "20m"
+        max-file: "5"
 
 volumes:
   mysql_data:
