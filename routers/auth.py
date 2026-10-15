@@ -7,6 +7,7 @@ routers/auth.py - 인증(Authentication) 및 계정 관리 관련 API 라우터
 - TODO.md 1.1, 1.2 (로그인, 로그아웃, 내 정보 조회, 교내 이메일 OTP, 회원가입, 이메일 변경)
 """
 
+import os
 import re
 import uuid
 from typing import Optional, Any
@@ -24,7 +25,7 @@ except (ImportError, ModuleNotFoundError):
     asyncmy = _AsyncmyStub()  # type: ignore
     DictCursor = Any  # type: ignore
 from fastapi import APIRouter, Query, HTTPException, Depends, BackgroundTasks, Request
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from fastapi.responses import JSONResponse
 import bcrypt
 import redis.asyncio as aioredis
@@ -100,6 +101,9 @@ class SendOtpRequest(BaseModel):
     is_it_student: bool = False
     email: str
     purpose: str = "register"  # "register" 또는 "change_email"
+    admin_code: Optional[str] = Field(default=None, alias="adminCode")
+
+    model_config = {"populate_by_name": True}
 
 
 class VerifyOtpRequest(BaseModel):
@@ -112,8 +116,11 @@ class RegisterRequest(BaseModel):
     email: str
     password: str
     id: str
-    register_token: str
+    register_token: Optional[str] = Field(default=None, alias="registerToken")
     role: Optional[int] = None  # 클라이언트가 임의로 보내더라도 서버 판별값으로 덮어씌워 원천 무시됨
+    admin_code: Optional[str] = Field(default=None, alias="adminCode")
+
+    model_config = {"populate_by_name": True}
 
 
 class PatchEmailRequest(BaseModel):
@@ -299,9 +306,9 @@ async def login(
     teacher_class = user.get("teacher_class")
 
     user_name = student_name if user["role"] == 0 and student_name else (
-        teacher_name if user["role"] == 1 and teacher_name else user["id"]
+        teacher_name if (user["role"] in (1, 2)) and teacher_name else user["id"]
     )
-    homeroom_str = f"{teacher_grade}-{teacher_class}" if user["role"] == 1 and teacher_grade and teacher_class else None
+    homeroom_str = f"{teacher_grade}-{teacher_class}" if (user["role"] in (1, 2)) and teacher_grade and teacher_class else None
 
     token = create_access_token(
         data={
@@ -327,7 +334,7 @@ async def login(
                 "grade": student_grade if user["role"] == 0 else None,
                 "classNo": student_class if user["role"] == 0 else None,
                 "number": student_number if user["role"] == 0 else None,
-                "teacherId": teacher_id_val if user["role"] == 1 else None,
+                "teacherId": teacher_id_val if (user["role"] in (1, 2)) else None,
                 "homeroom": homeroom_str,
             }
         }
@@ -428,7 +435,7 @@ async def get_my_info(
             """
             await cur.execute(sql_cmd, (year_id, user_uuid))
             students = await cur.fetchone()
-    elif user["role"] == 1:
+    elif user["role"] == 1 or user["role"] == 2:
         async with conn.cursor(cursor=DictCursor) as cur:
             sql_cmd = """
                 SELECT * FROM teachers
@@ -542,8 +549,49 @@ async def send_otp(
 
     await redis.setex(f"email_cooldown:{clean_mail}", 60, f"{datetime.now()}")
 
-    # 목적별 분기 처리 (AUTH-01: 회원가입 vs 이메일 변경 OTP 분리)
-    if req.purpose == "change_email":
+    # 목적별 분기 처리 (AUTH-01: 회원가입 vs 이메일 변경 OTP 분리 및 관리자 가입 코드 지원)
+    expected_admin_code = os.getenv("ADMIN_REGISTRATION_CODE", "MEISTER_ADMIN_2026!")
+
+    if req.admin_code is not None and req.admin_code.strip():
+        if not secrets.compare_digest(req.admin_code.strip(), expected_admin_code):
+            return JSONResponse(
+                status_code=403,
+                content=SrFormat(
+                    status_code=403,
+                    success=False,
+                    data=None,
+                    error=Error(
+                        code="FORBIDDEN",
+                        message="관리자 가입 보안 코드가 올바르지 않습니다."
+                    )
+                ).model_dump()
+            )
+
+        # 이미 users 테이블에 존재하는 이메일인지 중복 검사 (중복 시 409 DUPLICATE_EMAIL)
+        async with conn.cursor(cursor=DictCursor) as cur:
+            await cur.execute("SELECT uuid FROM users WHERE email = %s AND is_deleted = FALSE LIMIT 1", (clean_mail,))
+            ex_u = await cur.fetchone()
+
+        if ex_u:
+            return JSONResponse(
+                status_code=409,
+                content=SrFormat(
+                    status_code=409,
+                    success=False,
+                    data=None,
+                    error=Error(
+                        code="DUPLICATE_EMAIL",
+                        message="이미 가입된 관리자 또는 사용자 이메일입니다."
+                    )
+                ).model_dump()
+            )
+
+        user_name = "관리자"
+        otp_key = f"otp:{clean_mail}"
+        # Redis에 관리자 가입 의도 플래그 기록 (5분 유효)
+        await redis.setex(f"otp:admin_reg:{clean_mail}", 300, "1")
+
+    elif req.purpose == "change_email":
         async with conn.cursor(cursor=DictCursor) as cur:
             await cur.execute("SELECT uuid FROM users WHERE email = %s AND is_deleted = FALSE LIMIT 1", (clean_mail,))
             ex_u = await cur.fetchone()
@@ -567,6 +615,8 @@ async def send_otp(
         user_name = "사용자"
         otp_key = f"otp:change_email:{clean_mail}"
     else:
+        # 일반 신규 가입 (학생 / 교사)
+        await redis.delete(f"otp:admin_reg:{clean_mail}")
         # 사전 등록 명단 일치 여부 확인 (신규 가입)
         if not req.is_it_student:
             async with conn.cursor(cursor=DictCursor) as cur:
@@ -771,6 +821,8 @@ async def verify_otp(req: VerifyOtpRequest, redis: aioredis.Redis = Depends(get_
             }
         ).model_dump()
     else:
+        if await redis.get(f"otp:admin_reg:{clean_mail}"):
+            await redis.setex(f"otp:admin_reg:{clean_mail}", 600, "1")
         await redis.setex(f"register_token:{clean_mail}", 600, token_val)
         return SrFormat(
             status_code=200,
@@ -844,36 +896,81 @@ async def register_user(
             ).model_dump()
         )
 
-    # 서버 기반 권한(Role) 확정 판별 (권한 상승 위조 원천 방어)
+    # 관리자 가입 판별 (보안 코드 직접 제시 또는 Redis OTP 검증 플래그 확인)
+    expected_admin_code = os.getenv("ADMIN_REGISTRATION_CODE", "MEISTER_ADMIN_2026!")
+    is_admin = False
+
+    admin_flag = await redis.get(f"otp:admin_reg:{clean_mail}")
+    if admin_flag:
+        is_admin = True
+
+    if req.admin_code is not None and req.admin_code.strip():
+        if not secrets.compare_digest(req.admin_code.strip(), expected_admin_code):
+            return JSONResponse(
+                status_code=403,
+                content=SrFormat(
+                    status_code=403,
+                    success=False,
+                    data=None,
+                    error=Error(
+                        code="FORBIDDEN",
+                        message="관리자 가입 보안 코드가 올바르지 않습니다."
+                    )
+                ).model_dump()
+            )
+        is_admin = True
+
     determined_role = None
     target_table = None
 
-    async with conn.cursor(cursor=DictCursor) as cur:
-        # 학생 사전 등록 명단 확인
-        await cur.execute("SELECT student_id, uuid FROM students WHERE email = %s AND is_deleted = FALSE LIMIT 1", (clean_mail,))
-        student_row = await cur.fetchone()
-        if student_row:
-            if student_row.get("uuid") is not None:
+    if is_admin:
+        determined_role = 2
+        async with conn.cursor(cursor=DictCursor) as cur:
+            # 이메일 중복 검사
+            await cur.execute("SELECT uuid FROM users WHERE email = %s AND is_deleted = FALSE LIMIT 1", (clean_mail,))
+            if await cur.fetchone():
                 return JSONResponse(
-                    status_code=403,
+                    status_code=409,
                     content=SrFormat(
-                        status_code=403,
+                        status_code=409,
                         success=False,
                         data=None,
                         error=Error(
-                            code="FORBIDDEN",
-                            message="이미 가입된 사용자입니다."
+                            code="DUPLICATE_EMAIL",
+                            message="이미 가입된 이메일 주소입니다."
                         )
                     ).model_dump()
                 )
-            determined_role = 0
-            target_table = "students"
-        else:
-            # 교사 사전 등록 명단 확인
-            await cur.execute("SELECT teachers_id, uuid FROM teachers WHERE email = %s AND is_deleted = FALSE LIMIT 1", (clean_mail,))
+
+            # 아이디 중복 검사
+            await cur.execute("SELECT uuid FROM users WHERE id = %s LIMIT 1", (req.id,))
+            if await cur.fetchone():
+                return JSONResponse(
+                    status_code=409,
+                    content=SrFormat(
+                        status_code=409,
+                        success=False,
+                        data=None,
+                        error=Error(
+                            code="DUPLICATE_ID",
+                            message="이미 사용 중인 아이디입니다."
+                        )
+                    ).model_dump()
+                )
+
+            # 교사 테이블에 동일 이메일이 존재하는지 확인 (있으면 uuid 연동)
+            await cur.execute("SELECT teachers_id FROM teachers WHERE email = %s AND is_deleted = FALSE LIMIT 1", (clean_mail,))
             teacher_row = await cur.fetchone()
             if teacher_row:
-                if teacher_row.get("uuid") is not None:
+                target_table = "teachers"
+    else:
+        # 학생 / 교사 서버 기반 권한(Role) 확정 판별 (권한 상승 위조 원천 방어)
+        async with conn.cursor(cursor=DictCursor) as cur:
+            # 학생 사전 등록 명단 확인
+            await cur.execute("SELECT student_id, uuid FROM students WHERE email = %s AND is_deleted = FALSE LIMIT 1", (clean_mail,))
+            student_row = await cur.fetchone()
+            if student_row:
+                if student_row.get("uuid") is not None:
                     return JSONResponse(
                         status_code=403,
                         content=SrFormat(
@@ -886,37 +983,73 @@ async def register_user(
                             )
                         ).model_dump()
                     )
-                determined_role = 1
-                target_table = "teachers"
+                determined_role = 0
+                target_table = "students"
             else:
-                return JSONResponse(
-                    status_code=404,
-                    content=SrFormat(
+                # 교사 사전 등록 명단 확인
+                await cur.execute("SELECT teachers_id, uuid FROM teachers WHERE email = %s AND is_deleted = FALSE LIMIT 1", (clean_mail,))
+                teacher_row = await cur.fetchone()
+                if teacher_row:
+                    if teacher_row.get("uuid") is not None:
+                        return JSONResponse(
+                            status_code=403,
+                            content=SrFormat(
+                                status_code=403,
+                                success=False,
+                                data=None,
+                                error=Error(
+                                    code="FORBIDDEN",
+                                    message="이미 가입된 사용자입니다."
+                                )
+                            ).model_dump()
+                        )
+                    determined_role = 1
+                    target_table = "teachers"
+                else:
+                    return JSONResponse(
                         status_code=404,
+                        content=SrFormat(
+                            status_code=404,
+                            success=False,
+                            data=None,
+                            error=Error(
+                                code="NOT_FOUND",
+                                message="사전 등록된 학생 또는 교사 명단에서 이메일을 찾을 수 없습니다."
+                            )
+                        ).model_dump()
+                    )
+
+            # 이메일 중복 검사
+            await cur.execute("SELECT uuid FROM users WHERE email = %s AND is_deleted = FALSE LIMIT 1", (clean_mail,))
+            if await cur.fetchone():
+                return JSONResponse(
+                    status_code=409,
+                    content=SrFormat(
+                        status_code=409,
                         success=False,
                         data=None,
                         error=Error(
-                            code="NOT_FOUND",
-                            message="사전 등록된 학생 또는 교사 명단에서 이메일을 찾을 수 없습니다."
+                            code="DUPLICATE_EMAIL",
+                            message="이미 가입된 이메일 주소입니다."
                         )
                     ).model_dump()
                 )
 
-        # 아이디 중복 검사
-        await cur.execute("SELECT uuid FROM users WHERE id = %s LIMIT 1", (req.id,))
-        if await cur.fetchone():
-            return JSONResponse(
-                status_code=409,
-                content=SrFormat(
+            # 아이디 중복 검사
+            await cur.execute("SELECT uuid FROM users WHERE id = %s LIMIT 1", (req.id,))
+            if await cur.fetchone():
+                return JSONResponse(
                     status_code=409,
-                    success=False,
-                    data=None,
-                    error=Error(
-                        code="DUPLICATE_ID",
-                        message="이미 사용 중인 아이디입니다."
-                    )
-                ).model_dump()
-            )
+                    content=SrFormat(
+                        status_code=409,
+                        success=False,
+                        data=None,
+                        error=Error(
+                            code="DUPLICATE_ID",
+                            message="이미 사용 중인 아이디입니다."
+                        )
+                    ).model_dump()
+                )
 
     user_uuid = str(uuid.uuid4())
     user_pw = hash_password(req.password)
@@ -931,29 +1064,31 @@ async def register_user(
             """
             await cur.execute(sql_cmd, (user_uuid, req.id, user_pw, clean_mail, determined_role))
 
-            sql_cmd = f"""
-                UPDATE {target_table} SET uuid = %s
-                WHERE email = %s AND uuid IS NULL AND is_deleted = FALSE
-            """
-            await cur.execute(sql_cmd, (user_uuid, clean_mail))
+            if target_table:
+                sql_cmd = f"""
+                    UPDATE {target_table} SET uuid = %s
+                    WHERE email = %s AND uuid IS NULL AND is_deleted = FALSE
+                """
+                await cur.execute(sql_cmd, (user_uuid, clean_mail))
 
-            # [보안 1.5] Race Condition 방어: 동시 요청으로 이미 UUID가 할당된 경우 롤백
-            if cur.rowcount != 1:
-                await conn.rollback()
-                return JSONResponse(
-                    status_code=409,
-                    content=SrFormat(
+                # [보안 1.5] Race Condition 방어: 학생/교사 가입 시 동시 요청으로 이미 UUID가 할당된 경우 롤백
+                if not is_admin and cur.rowcount != 1:
+                    await conn.rollback()
+                    return JSONResponse(
                         status_code=409,
-                        success=False,
-                        data=None,
-                        error=Error(
-                            code="CONFLICT",
-                            message="이미 가입 처리가 완료된 계정입니다."
-                        )
-                    ).model_dump()
-                )
+                        content=SrFormat(
+                            status_code=409,
+                            success=False,
+                            data=None,
+                            error=Error(
+                                code="CONFLICT",
+                                message="이미 가입 처리가 완료된 계정입니다."
+                            )
+                        ).model_dump()
+                    )
 
         await conn.commit()
+        await redis.delete(f"otp:admin_reg:{clean_mail}")
     except Exception as e:
         await conn.rollback()
         return JSONResponse(
@@ -971,6 +1106,8 @@ async def register_user(
     finally:
         await conn.autocommit(True)
 
+    role_str = "admin" if determined_role == 2 else ("teacher" if determined_role == 1 else "student")
+
     return SrFormat(
         status_code=200,
         success=True,
@@ -979,7 +1116,7 @@ async def register_user(
             "uuid": user_uuid,
             "id": req.id,
             "email": clean_mail,
-            "role": "student" if determined_role == 0 else "teacher"
+            "role": role_str
         }
     ).model_dump()
 
