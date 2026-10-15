@@ -153,6 +153,8 @@ class TestTeacherStudentDetailAPI(unittest.TestCase):
         self.student_2_3 = {
             "student_id": 1,
             "uuid": "student-uuid-1",
+            "id": "student1",
+            "user_id": "student1",
             "name": "성춘향",
             "email": "student1@school.hs.kr",
             "is_deleted": False,
@@ -498,6 +500,49 @@ class TestTeacherStudentDetailAPI(unittest.TestCase):
         resp = self.client.get("/api/teacher/students/1?year=2025", headers={"Authorization": f"Bearer {admin_token}"})
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(resp.json()["data"]["year"], 2025)
+
+    def test_detail_response_includes_userId(self):
+        """학생 상세 조회 시 userId(users.id) 필드가 최상위 및 student 객체 내 포함되는지 검증"""
+        admin_token = create_access_token(data={"uuid": "admin-uuid", "id": "admin", "role": "admin"})
+
+        cursor = TeacherStudentDetailMockCursor(
+            teacher_row=None,
+            student_row=self.student_2_3,
+            academic_record=self.academic_record_2_3,
+            year_id=101,
+            areas=self.areas_fixture,
+            submissions=[],
+            merits=[],
+        )
+        app.dependency_overrides[get_db] = lambda: TeacherStudentDetailMockConnection(cursor)
+
+        resp = self.client.get("/api/teacher/students/1", headers={"Authorization": f"Bearer {admin_token}"})
+        self.assertEqual(resp.status_code, 200)
+        data = resp.json()["data"]
+        self.assertEqual(data["userId"], "student1")
+        self.assertEqual(data["user_id"], "student1")
+        self.assertEqual(data["student"]["userId"], "student1")
+
+    def test_detail_by_string_user_id(self):
+        """경로 파라미터로 문자열 로그인 ID('student1') 전달 시 200 OK 조회 검증"""
+        admin_token = create_access_token(data={"uuid": "admin-uuid", "id": "admin", "role": "admin"})
+
+        cursor = TeacherStudentDetailMockCursor(
+            teacher_row=None,
+            student_row=self.student_2_3,
+            academic_record=self.academic_record_2_3,
+            year_id=101,
+            areas=self.areas_fixture,
+            submissions=[],
+            merits=[],
+        )
+        app.dependency_overrides[get_db] = lambda: TeacherStudentDetailMockConnection(cursor)
+
+        resp = self.client.get("/api/teacher/students/student1", headers={"Authorization": f"Bearer {admin_token}"})
+        self.assertEqual(resp.status_code, 200)
+        data = resp.json()["data"]
+        self.assertEqual(data["studentId"], 1)
+        self.assertEqual(data["userId"], "student1")
 
 
 if __name__ == "__main__":

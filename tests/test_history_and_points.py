@@ -59,9 +59,17 @@ class MockCursor:
 
         # 1. 학생 조회 (student_id 또는 uuid)
         if "FROM students" in sql_clean:
-            if "WHERE student_id = %s" in sql_clean:
+            if "WHERE student_id = %s" in sql_clean or "WHERE s.student_id = %s" in sql_clean:
                 target_id = params[0]
                 matched = [s for s in self.conn.db_students if s["student_id"] == target_id and not s["is_deleted"]]
+                self._current_result = matched
+            elif "JOIN users" in sql_clean or "u.id = %s" in sql_clean:
+                u_id = params[0]
+                matched = [
+                    s for s in self.conn.db_students 
+                    if (s.get("id") == u_id or s.get("user_id") == u_id or s.get("uuid") == u_id)
+                    and not s.get("is_deleted")
+                ]
                 self._current_result = matched
             elif "WHERE uuid = %s" in sql_clean:
                 target_uuid = params[0]
@@ -190,8 +198,8 @@ class MockConnection:
             {"item_id": 12, "area_id": 3, "name": "과거 활동"},
         ]
         self.db_students = [
-            {"student_id": 1, "uuid": "student-uuid-001", "name": "홍길동", "is_deleted": False},
-            {"student_id": 2, "uuid": "student-uuid-002", "name": "이순신", "is_deleted": False},
+            {"student_id": 1, "uuid": "student-uuid-001", "id": "student1", "user_id": "student1", "name": "홍길동", "is_deleted": False},
+            {"student_id": 2, "uuid": "student-uuid-002", "id": "student2", "user_id": "student2", "name": "이순신", "is_deleted": False},
         ]
         self.db_teachers = [
             {"teachers_id": 101, "uuid": "teacher-uuid-101", "name": "김선생", "is_deleted": False},
@@ -517,6 +525,40 @@ class TestHistoryAndPointsAPI(unittest.TestCase):
         resp_missing = self.client.get("/api/points")
         self.assertEqual(resp_missing.status_code, 400)
         self.assertEqual(resp_missing.json()["error"]["code"], "VALIDATION_ERROR")
+
+    def test_student_get_points_with_own_string_login_id_success(self):
+        """학생 본인 로그인 ID('student1')로 상벌점 조회 시 정상 200 OK 조회 및 메타데이터 검증"""
+        resp = self.client.get("/api/points?studentId=student1")
+        self.assertEqual(resp.status_code, 200)
+        data = resp.json()["data"]
+        self.assertEqual(len(data), 3)
+        self.assertEqual(data[0]["studentId"], 1)
+        self.assertEqual(data[0]["userId"], "student1")
+        self.assertEqual(data[0]["user_id"], "student1")
+        self.assertEqual(data[0]["studentName"], "홍길동")
+        self.assertEqual(data[0]["name"], "홍길동")
+
+    def test_student_get_submissions_with_own_string_login_id_success(self):
+        """학생 본인 로그인 ID('student1')로 제출 목록 조회 시 403 차단 없이 200 OK 반환 검증"""
+        resp = self.client.get("/api/submissions?studentId=student1")
+        self.assertEqual(resp.status_code, 200)
+        data = resp.json()["data"]
+        self.assertEqual(len(data), 3)
+
+    def test_get_student_submissions_path_with_string_id(self):
+        """경로 파라미터 /api/students/student1/submissions 로 본인 제출 내역 조회 검증"""
+        resp = self.client.get("/api/students/student1/submissions")
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(len(resp.json()["data"]), 3)
+
+    def test_get_student_points_path_with_string_id(self):
+        """경로 파라미터 /api/students/student1/points 로 본인 상벌점 조회 검증"""
+        resp = self.client.get("/api/students/student1/points")
+        self.assertEqual(resp.status_code, 200)
+        data = resp.json()["data"]
+        self.assertEqual(len(data), 3)
+        self.assertEqual(data[0]["userId"], "student1")
+        self.assertEqual(data[0]["studentName"], "홍길동")
 
 
 if __name__ == "__main__":

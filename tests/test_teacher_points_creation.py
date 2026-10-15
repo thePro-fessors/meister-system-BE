@@ -69,13 +69,25 @@ class PointsCreationMockCursor:
 
         # 2. students 조회
         elif "FROM students" in q:
-            if "WHERE student_id = %s" in q:
+            if "WHERE student_id = %s" in q or "WHERE s.student_id = %s" in q:
                 st_id = params[0]
                 matched = [s for s in self.conn.db_students if s["student_id"] == st_id and not s.get("is_deleted")]
+                self._current_result = matched
+            elif "JOIN users" in q or "u.id = %s" in q:
+                u_id = params[0]
+                matched = [
+                    s for s in self.conn.db_students 
+                    if (s.get("id") == u_id or s.get("user_id") == u_id or s.get("uuid") == u_id)
+                    and not s.get("is_deleted")
+                ]
                 self._current_result = matched
             elif "WHERE uuid = %s" in q:
                 st_uuid = params[0]
                 matched = [s for s in self.conn.db_students if s["uuid"] == st_uuid and not s.get("is_deleted")]
+                self._current_result = matched
+            elif "WHERE email = %s" in q:
+                em = params[0]
+                matched = [s for s in self.conn.db_students if s.get("email") == em and not s.get("is_deleted")]
                 self._current_result = matched
 
         # 3. teachers 조회
@@ -170,8 +182,8 @@ class PointsCreationMockConnection:
             {"year_id": 1, "year": 2026, "is_activated": True},
         ]
         self.db_students = [
-            {"student_id": 1, "uuid": "student-uuid-1", "name": "홍길동", "is_deleted": False},
-            {"student_id": 2, "uuid": "student-uuid-2", "name": "이순신", "is_deleted": False},
+            {"student_id": 1, "uuid": "student-uuid-1", "id": "student1", "user_id": "student1", "name": "홍길동", "is_deleted": False},
+            {"student_id": 2, "uuid": "student-uuid-2", "id": "student2", "user_id": "student2", "name": "이순신", "is_deleted": False},
         ]
         self.db_teachers = [
             # 1학년 1반 담임 (teachers_id=10)
@@ -377,6 +389,93 @@ class TestTeacherPointsCreationAPI(unittest.TestCase):
             headers={"Authorization": f"Bearer {self.token_subject_teacher}"},
         )
         self.assertEqual(res_sub.status_code, 201)
+
+    def test_create_point_with_string_login_id_success(self):
+        """FE에서 문자열 로그인 ID('student1')로 studentId를 전송해도 실제 student_id(1)로 매핑되어 201 Created 성공"""
+        res = self.client.post(
+            "/api/points",
+            json={
+                "studentId": "student1",
+                "type": "상점",
+                "score": 4.0,
+                "reason": "로그인 ID 기반 상점 등록",
+            },
+            headers={"Authorization": f"Bearer {self.token_homeroom}"},
+        )
+        self.assertEqual(res.status_code, 201)
+        data = res.json()["data"]
+        self.assertEqual(data["studentId"], 1)
+        self.assertEqual(data["userId"], "student1")
+        self.assertEqual(data["user_id"], "student1")
+        self.assertEqual(data["studentName"], "홍길동")
+        self.assertEqual(self.conn.db_merits[-1]["student_id"], 1)
+
+    def test_create_point_with_integer_id_enriches_metadata(self):
+        """정수 studentId(1)로 상벌점 등록 시 응답에 userId('student1')와 studentName('홍길동')이 정상 보강되는지 검증"""
+        res = self.client.post(
+            "/api/points",
+            json={
+                "studentId": 1,
+                "type": "상점",
+                "score": 3.0,
+                "reason": "정수 ID 보강 검증",
+            },
+            headers={"Authorization": f"Bearer {self.token_homeroom}"},
+        )
+        self.assertEqual(res.status_code, 201)
+        data = res.json()["data"]
+        self.assertEqual(data["studentId"], 1)
+        self.assertEqual(data["userId"], "student1")
+        self.assertEqual(data["user_id"], "student1")
+        self.assertEqual(data["studentName"], "홍길동")
+        self.assertEqual(data["name"], "홍길동")
+
+    def test_create_point_with_numeric_string_student_id_success(self):
+        """문자열 형태의 숫자 studentId('1') 전송 시 안전하게 정수 PK(1)로 처리 검증"""
+        res = self.client.post(
+            "/api/points",
+            json={
+                "studentId": "1",
+                "type": "상점",
+                "score": 2.0,
+                "reason": "문자열 숫자 studentId 테스트",
+            },
+            headers={"Authorization": f"Bearer {self.token_homeroom}"},
+        )
+        self.assertEqual(res.status_code, 201)
+        data = res.json()["data"]
+        self.assertEqual(data["studentId"], 1)
+
+    def test_create_point_with_userId_field_success(self):
+        """DTO에 userId 필드로 'student1' 전달 시 정상 해석 검증"""
+        res = self.client.post(
+            "/api/points",
+            json={
+                "userId": "student1",
+                "type": "상점",
+                "score": 3.0,
+                "reason": "userId 필드 테스트",
+            },
+            headers={"Authorization": f"Bearer {self.token_homeroom}"},
+        )
+        self.assertEqual(res.status_code, 201)
+        data = res.json()["data"]
+        self.assertEqual(data["studentId"], 1)
+
+    def test_create_point_nonexistent_student_returns_404(self):
+        """존재하지 않는 학생 식별자 전송 시 404 USER_NOT_FOUND 거절 검증"""
+        res = self.client.post(
+            "/api/points",
+            json={
+                "studentId": "nonexistent_student_999",
+                "type": "상점",
+                "score": 5.0,
+                "reason": "미존재 학생 테스트",
+            },
+            headers={"Authorization": f"Bearer {self.token_homeroom}"},
+        )
+        self.assertEqual(res.status_code, 404)
+        self.assertEqual(res.json()["error"]["code"], "USER_NOT_FOUND")
 
 
 if __name__ == "__main__":

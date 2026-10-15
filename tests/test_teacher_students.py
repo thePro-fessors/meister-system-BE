@@ -82,6 +82,15 @@ class TeacherStudentsMockCursor:
                 matched = [s for s in matched if name_like in s["name"]]
                 param_idx += 1
 
+            if "AND (st.student_id = %s OR u.id = %s)" in q:
+                s_val = params[param_idx]
+                matched = [s for s in matched if s["student_id"] == s_val or s.get("id") == s_val or s.get("user_id") == s_val]
+                param_idx += 2
+            elif "AND u.id = %s" in q:
+                u_val = params[param_idx]
+                matched = [s for s in matched if s.get("id") == u_val or s.get("user_id") == u_val]
+                param_idx += 1
+
             if "AND (sar.number = %s OR st.student_id = %s)" in q:
                 num_val = params[param_idx]
                 matched = [s for s in matched if s["number"] == num_val or s["student_id"] == num_val]
@@ -155,9 +164,9 @@ class TestTeacherStudentsAPI(unittest.TestCase):
         }
 
         self.db_students = [
-            {"student_id": 1, "name": "홍길동", "uuid": "st-uuid-1", "grade": 2, "class_no": 3, "number": 1},
-            {"student_id": 2, "name": "성춘향", "uuid": "st-uuid-2", "grade": 2, "class_no": 3, "number": 2},
-            {"student_id": 3, "name": "이몽룡", "uuid": "st-uuid-3", "grade": 1, "class_no": 1, "number": 1},
+            {"student_id": 1, "name": "홍길동", "uuid": "st-uuid-1", "id": "student1", "user_id": "student1", "grade": 2, "class_no": 3, "number": 1},
+            {"student_id": 2, "name": "성춘향", "uuid": "st-uuid-2", "id": "student2", "user_id": "student2", "grade": 2, "class_no": 3, "number": 2},
+            {"student_id": 3, "name": "이몽룡", "uuid": "st-uuid-3", "id": "student3", "user_id": "student3", "grade": 1, "class_no": 1, "number": 1},
         ]
 
         self.db_areas = [
@@ -540,6 +549,53 @@ class TestTeacherStudentsAPI(unittest.TestCase):
         )
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(resp.json()["data"], [])
+
+    def test_student_response_includes_userId(self):
+        """학생 목록 조회 시 userId(users.id)와 studentId(정수 PK)가 모두 포함되는지 검증"""
+        token = create_access_token(data={"uuid": "teacher-uuid-10", "id": "teacher10", "role": "teacher"})
+        cursor = TeacherStudentsMockCursor(
+            teacher_row=self.teacher_homeroom,
+            year_id=101,
+            students=self.db_students,
+            areas=self.db_areas,
+            submissions=self.db_submissions,
+            merits=self.db_merits,
+        )
+        app.dependency_overrides[get_db] = lambda: TeacherStudentsMockConnection(cursor)
+
+        resp = self.client.get("/api/teacher/students", headers={"Authorization": f"Bearer {token}"})
+        self.assertEqual(resp.status_code, 200)
+        data = resp.json()["data"]
+        self.assertTrue(len(data) >= 1)
+        st1 = data[0]
+        self.assertEqual(st1["studentId"], 1)
+        self.assertEqual(st1["userId"], "student1")
+        self.assertEqual(st1["user_id"], "student1")
+
+    def test_filter_by_student_id_or_user_id(self):
+        """studentId 쿼리 파라미터로 'student1' 또는 1 필터링 시 정상 검색 검증"""
+        token = create_access_token(data={"uuid": "teacher-uuid-10", "id": "teacher10", "role": "teacher"})
+        cursor = TeacherStudentsMockCursor(
+            teacher_row=self.teacher_homeroom,
+            year_id=101,
+            students=self.db_students,
+            areas=self.db_areas,
+            submissions=self.db_submissions,
+            merits=self.db_merits,
+        )
+        app.dependency_overrides[get_db] = lambda: TeacherStudentsMockConnection(cursor)
+
+        # 1. studentId=1 (정수)
+        resp1 = self.client.get("/api/teacher/students?studentId=1", headers={"Authorization": f"Bearer {token}"})
+        self.assertEqual(resp1.status_code, 200)
+        self.assertEqual(len(resp1.json()["data"]), 1)
+        self.assertEqual(resp1.json()["data"][0]["name"], "홍길동")
+
+        # 2. studentId=student1 (문자열 로그인 ID)
+        resp2 = self.client.get("/api/teacher/students?studentId=student1", headers={"Authorization": f"Bearer {token}"})
+        self.assertEqual(resp2.status_code, 200)
+        self.assertEqual(len(resp2.json()["data"]), 1)
+        self.assertEqual(resp2.json()["data"][0]["name"], "홍길동")
 
 
 if __name__ == "__main__":

@@ -9,7 +9,7 @@ routers/students.py - 마이스터 역량인증제 학생 업무 관련 API 라�
 
 from datetime import datetime, date
 from decimal import Decimal
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 from urllib.parse import urlparse
 import math
 
@@ -33,7 +33,7 @@ from core.academic import (
     get_current_academic_year,
     get_year_id_by_year,
 )
-from core.authorization import authorize_student_access
+from core.authorization import authorize_student_access, resolve_student_id
 from core.calculator import (
     calculate_student_certification,
     calculate_area_grade,
@@ -123,7 +123,7 @@ class CertificationStatusResponse(BaseModel):
     )
 )
 async def get_certification_status(
-    student_id: int,
+    student_id: Union[int, str],
     year: Optional[int] = Query(None, description="조회할 학사년도 (생략 시 3월 학사력 기준 현재 활성 학년도 자동 적용)"),
     current_user: dict = Depends(get_current_user),
     conn: asyncmy.Connection = Depends(get_db),
@@ -146,6 +146,19 @@ async def get_certification_status(
     """
     user_uuid = current_user.get("uuid")
     user_role = current_user.get("role")  # "student", "teacher", "admin"
+
+    target_st_id = await resolve_student_id(conn, student_id)
+    if target_st_id is None:
+        return JSONResponse(
+            status_code=status.HTTP_404_NOT_FOUND,
+            content=SrFormat(
+                status_code=status.HTTP_404_NOT_FOUND,
+                success=False,
+                data=None,
+                error=Error(code="STUDENT_NOT_FOUND", message="대상 학생 정보를 찾을 수 없습니다."),
+            ).model_dump(),
+        )
+    student_id = target_st_id
 
     async with conn.cursor(cursor=DictCursor) as cur:
         # ----------------------------------------------------------------------
@@ -395,6 +408,20 @@ async def handle_submit_evidence(
     async with conn.cursor(cursor=DictCursor) as cur:
         # 2. 대상 학생 식별 및 본인 소유권 검증 (Authorization)
         if student_id_param is not None:
+            resolved_st_id = await resolve_student_id(conn, student_id_param)
+            if resolved_st_id is None:
+                return JSONResponse(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    content=SrFormat(
+                        status_code=status.HTTP_404_NOT_FOUND,
+                        success=False,
+                        data=None,
+                        error=Error(
+                            code="USER_NOT_FOUND",
+                            message="해당 학생을 찾을 수 없습니다.",
+                        ),
+                    ).model_dump(),
+                )
             await cur.execute(
                 """
                 SELECT student_id, uuid, name, email, is_deleted
@@ -402,7 +429,7 @@ async def handle_submit_evidence(
                 WHERE student_id = %s AND is_deleted = FALSE
                 LIMIT 1
                 """,
-                (student_id_param,),
+                (resolved_st_id,),
             )
             target_student = await cur.fetchone()
             if not target_student:
@@ -1002,7 +1029,7 @@ async def handle_submit_evidence(
     response_model=SrFormat,
 )
 async def submit_evidence_for_student(
-    student_id: int,
+    student_id: Union[int, str],
     item_id: Optional[int] = Form(None),
     itemId: Optional[int] = Form(None),
     detail: Optional[str] = Form(None),
@@ -1099,16 +1126,18 @@ async def handle_get_submissions(
                     ).model_dump(),
                 )
             own_student_id = student_row["student_id"]
-            if student_id_param is not None and student_id_param != own_student_id:
-                return JSONResponse(
-                    status_code=status.HTTP_403_FORBIDDEN,
-                    content=SrFormat(
+            if student_id_param is not None:
+                resolved_param = await resolve_student_id(conn, student_id_param)
+                if resolved_param != own_student_id:
+                    return JSONResponse(
                         status_code=status.HTTP_403_FORBIDDEN,
-                        success=False,
-                        data=None,
-                        error=Error(code="FORBIDDEN", message="본인의 제출 내역만 조회할 수 있습니다."),
-                    ).model_dump(),
-                )
+                        content=SrFormat(
+                            status_code=status.HTTP_403_FORBIDDEN,
+                            success=False,
+                            data=None,
+                            error=Error(code="FORBIDDEN", message="본인의 제출 내역만 조회할 수 있습니다."),
+                        ).model_dump(),
+                    )
             target_student_id = own_student_id
         else:
             # 교사 및 관리자는 studentId 파라미터 필수
@@ -1122,12 +1151,8 @@ async def handle_get_submissions(
                         error=Error(code="VALIDATION_ERROR", message="조회 대상 학생 식별자(studentId)가 필요합니다."),
                     ).model_dump(),
                 )
-            await cur.execute(
-                "SELECT student_id FROM students WHERE student_id = %s AND is_deleted = FALSE LIMIT 1",
-                (student_id_param,),
-            )
-            target_student = await cur.fetchone()
-            if not target_student:
+            resolved_st_id = await resolve_student_id(conn, student_id_param)
+            if resolved_st_id is None:
                 return JSONResponse(
                     status_code=status.HTTP_404_NOT_FOUND,
                     content=SrFormat(
@@ -1137,7 +1162,7 @@ async def handle_get_submissions(
                         error=Error(code="USER_NOT_FOUND", message="해당 학생을 찾을 수 없습니다."),
                     ).model_dump(),
                 )
-            target_student_id = student_id_param
+            target_student_id = resolved_st_id
 
         # SEC-01: 공통 인가 계층을 통한 교사 담당 범위 및 역할 검증
         auth_error = await authorize_student_access(
@@ -1319,7 +1344,7 @@ async def handle_get_submissions(
 async def handle_get_points(
     conn: Any,
     current_user: Dict[str, Any],
-    student_id_param: Optional[int] = None,
+    student_id_param: Optional[Union[int, str]] = None,
     year_val: Optional[int] = None,
 ) -> JSONResponse:
     """
@@ -1350,16 +1375,18 @@ async def handle_get_points(
                     ).model_dump(),
                 )
             own_student_id = student_row["student_id"]
-            if student_id_param is not None and student_id_param != own_student_id:
-                return JSONResponse(
-                    status_code=status.HTTP_403_FORBIDDEN,
-                    content=SrFormat(
+            if student_id_param is not None:
+                resolved_param = await resolve_student_id(conn, student_id_param)
+                if resolved_param != own_student_id:
+                    return JSONResponse(
                         status_code=status.HTTP_403_FORBIDDEN,
-                        success=False,
-                        data=None,
-                        error=Error(code="FORBIDDEN", message="본인의 상벌점 내역만 조회할 수 있습니다."),
-                    ).model_dump(),
-                )
+                        content=SrFormat(
+                            status_code=status.HTTP_403_FORBIDDEN,
+                            success=False,
+                            data=None,
+                            error=Error(code="FORBIDDEN", message="본인의 상벌점 내역만 조회할 수 있습니다."),
+                        ).model_dump(),
+                    )
             target_student_id = own_student_id
         else:
             if student_id_param is None:
@@ -1372,12 +1399,8 @@ async def handle_get_points(
                         error=Error(code="VALIDATION_ERROR", message="조회 대상 학생 식별자(studentId)가 필요합니다."),
                     ).model_dump(),
                 )
-            await cur.execute(
-                "SELECT student_id FROM students WHERE student_id = %s AND is_deleted = FALSE LIMIT 1",
-                (student_id_param,),
-            )
-            target_student = await cur.fetchone()
-            if not target_student:
+            resolved_st_id = await resolve_student_id(conn, student_id_param)
+            if resolved_st_id is None:
                 return JSONResponse(
                     status_code=status.HTTP_404_NOT_FOUND,
                     content=SrFormat(
@@ -1387,7 +1410,7 @@ async def handle_get_points(
                         error=Error(code="USER_NOT_FOUND", message="해당 학생을 찾을 수 없습니다."),
                     ).model_dump(),
                 )
-            target_student_id = student_id_param
+            target_student_id = resolved_st_id
 
         # SEC-01: 공통 인가 계층을 통한 교사 담당 범위 및 역할 검증
         auth_error = await authorize_student_access(
@@ -1437,6 +1460,27 @@ async def handle_get_points(
         rows = await cur.fetchall()
 
     # 3. FE 스펙(TODO 2.5 / Tech_spec 2.5 / SCORE-02) 규격 변환
+    st_user_id = None
+    st_name = None
+    try:
+        async with conn.cursor(cursor=DictCursor) as cur:
+            await cur.execute(
+                """
+                SELECT s.name, u.id AS user_id 
+                FROM students s 
+                LEFT JOIN users u ON s.uuid = u.uuid 
+                WHERE s.student_id = %s 
+                LIMIT 1
+                """,
+                (target_student_id,),
+            )
+            st_info = await cur.fetchone()
+            if st_info:
+                st_user_id = st_info.get("user_id") if isinstance(st_info, dict) else st_info[1]
+                st_name = st_info.get("name") if isinstance(st_info, dict) else st_info[0]
+    except Exception:
+        pass
+
     results: list[dict[str, Any]] = []
     for r in rows:
         raw_type = (r["type"] or "-").strip()
@@ -1451,6 +1495,10 @@ async def handle_get_points(
             "id": r["merits_point_id"],
             "pointId": r["merits_point_id"],
             "studentId": r["student_id"],
+            "userId": st_user_id,
+            "user_id": st_user_id,
+            "studentName": st_name,
+            "name": st_name,
             "teacherId": r["teachers_id"],
             "type": type_str,
             "points": raw_pts,
@@ -1481,7 +1529,7 @@ async def handle_get_points(
     response_model=SrFormat,
 )
 async def get_student_submissions(
-    student_id: int,
+    student_id: Union[int, str],
     year: Optional[int] = Query(None, description="학년도 필터"),
     conn: Any = Depends(get_db),
     current_user: Dict[str, Any] = Depends(get_current_user),
@@ -1505,7 +1553,7 @@ async def get_student_submissions(
     response_model=SrFormat,
 )
 async def get_student_points(
-    student_id: int,
+    student_id: Union[int, str],
     year: Optional[int] = Query(None, description="학년도 필터"),
     conn: Any = Depends(get_db),
     current_user: Dict[str, Any] = Depends(get_current_user),

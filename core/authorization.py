@@ -3,19 +3,117 @@ core/authorization.py - 중앙 집중식 학생 리소스 인가(Authorization) 
 (SEC-01: 모든 학생 리소스에 동일한 교사 권한 범위 적용)
 """
 
-from typing import Any, Dict, Optional, Set, Tuple
+from typing import Any, Dict, Optional, Set, Tuple, Union
 from fastapi.responses import JSONResponse
 from asyncmy.cursors import DictCursor
 
 from sr_format import Error, SrFormat
 
 
+async def resolve_student_id(conn: Any, identifier: Any) -> Optional[int]:
+    """
+    정수 PK(student_id), 문자열 숫자("101"), 로그인 ID(users.id e.g. "student1"), UUID, 이메일 등
+    다양한 형태의 식별자로부터 실제 students.student_id 정수 PK를 안전하게 매핑 및 반환합니다.
+    """
+    if identifier is None:
+        return None
+
+    s_val = str(identifier).strip()
+    if not s_val:
+        return None
+
+    # 1. 정수형이거나 숫자 문자열인 경우 우선 students.student_id 직접 확인
+    if isinstance(identifier, int) or s_val.isdigit():
+        try:
+            int_id = int(s_val)
+            async with conn.cursor(cursor=DictCursor) as cur:
+                await cur.execute(
+                    "SELECT student_id FROM students WHERE student_id = %s AND is_deleted = FALSE LIMIT 1",
+                    (int_id,),
+                )
+                row = await cur.fetchone()
+                if row:
+                    return row["student_id"] if isinstance(row, dict) else row[0]
+        except Exception:
+            pass
+
+    # 2. users.id (문자열 로그인 ID e.g. "student1", "student2") 또는 users.uuid / students.uuid 로 매핑
+    async with conn.cursor(cursor=DictCursor) as cur:
+        # (1) users 테이블의 로그인 ID(id)로 학생 매핑
+        try:
+            await cur.execute(
+                """
+                SELECT s.student_id 
+                FROM students s 
+                JOIN users u ON s.uuid = u.uuid 
+                WHERE u.id = %s AND s.is_deleted = FALSE 
+                LIMIT 1
+                """,
+                (s_val,),
+            )
+            row = await cur.fetchone()
+            if row:
+                return row["student_id"] if isinstance(row, dict) else row[0]
+        except Exception:
+            pass
+
+        # (2) students.uuid 직접 매핑
+        try:
+            await cur.execute(
+                "SELECT student_id FROM students WHERE uuid = %s AND is_deleted = FALSE LIMIT 1",
+                (s_val,),
+            )
+            row = await cur.fetchone()
+            if row:
+                return row["student_id"] if isinstance(row, dict) else row[0]
+        except Exception:
+            pass
+
+        # (3) students.email 로 매핑
+        try:
+            await cur.execute(
+                "SELECT student_id FROM students WHERE email = %s AND is_deleted = FALSE LIMIT 1",
+                (s_val,),
+            )
+            row = await cur.fetchone()
+            if row:
+                return row["student_id"] if isinstance(row, dict) else row[0]
+        except Exception:
+            pass
+
+        # (4) users.email 로 매핑
+        try:
+            await cur.execute(
+                """
+                SELECT s.student_id 
+                FROM students s 
+                JOIN users u ON s.uuid = u.uuid 
+                WHERE u.email = %s AND s.is_deleted = FALSE 
+                LIMIT 1
+                """,
+                (s_val,),
+            )
+            row = await cur.fetchone()
+            if row:
+                return row["student_id"] if isinstance(row, dict) else row[0]
+        except Exception:
+            pass
+
+    return None
+
+
 async def get_student_academic_record(
-    student_id: int,
+    student_id: Union[int, str],
     conn: Any,
     year: Optional[int] = None,
 ) -> Optional[Dict[str, Any]]:
     """학생의 특정 학년도(또는 활성/최신 학년도) 학적 정보를 조회합니다."""
+    if not isinstance(student_id, int):
+        resolved = await resolve_student_id(conn, student_id)
+        if resolved is None:
+            return None
+        student_id = resolved
+
     async with conn.cursor(cursor=DictCursor) as cur:
         if year is not None:
             await cur.execute(
@@ -49,7 +147,7 @@ async def get_student_academic_record(
 
 async def authorize_student_access(
     actor: Dict[str, Any],
-    student_id: int,
+    student_id: Union[int, str],
     conn: Any,
     year: Optional[int] = None,
     action: str = "read",
@@ -66,6 +164,19 @@ async def authorize_student_access(
         - 학생 전용 액션(직접 제출, 본인 삭제 등)은 교사 수행 불가 (403 FORBIDDEN)
     - 알 수 없는 역할: 403 FORBIDDEN
     """
+    if not isinstance(student_id, int):
+        resolved = await resolve_student_id(conn, student_id)
+        if resolved is None:
+            return JSONResponse(
+                status_code=404,
+                content=SrFormat(
+                    status_code=404,
+                    success=False,
+                    data=None,
+                    error=Error(code="USER_NOT_FOUND", message="학생 계정 정보를 찾을 수 없습니다."),
+                ).model_dump(),
+            )
+        student_id = resolved
     actor_role = actor.get("role")
     actor_uuid = actor.get("uuid") or actor.get("sub")
 

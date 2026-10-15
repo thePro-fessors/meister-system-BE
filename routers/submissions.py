@@ -9,7 +9,7 @@ routers/submissions.py - 마이스터 역량인증제 증빙자료 제출 및 �
 import html
 import os
 from datetime import date, datetime
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Union
 
 from fastapi import APIRouter, Depends, File, Form, Query, UploadFile
 from fastapi.responses import JSONResponse
@@ -76,7 +76,7 @@ router = APIRouter(
     response_model=SrFormat,
 )
 async def get_my_submissions(
-    student_id: Optional[int] = Query(None, alias="studentId", description="학생 식별자 (선택)"),
+    student_id: Optional[Union[int, str]] = Query(None, alias="studentId", description="학생 식별자 (선택)"),
     year: Optional[int] = Query(None, description="학년도 필터 (선택)"),
     conn: Any = Depends(get_db),
     current_user: Dict[str, Any] = Depends(get_current_user),
@@ -112,8 +112,8 @@ async def submit_evidence_direct(
     description: Optional[str] = Form(None),
     link_url: Optional[str] = Form(None),
     link: Optional[str] = Form(None),
-    student_id: Optional[int] = Form(None),
-    studentId: Optional[int] = Form(None),
+    student_id: Optional[Union[int, str]] = Form(None),
+    studentId: Optional[Union[int, str]] = Form(None),
     year: Optional[int] = Form(None),
     area: Optional[str] = Form(None),
     areaId: Optional[str] = Form(None),

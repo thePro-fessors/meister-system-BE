@@ -6,7 +6,7 @@ routers/points.py - 마이스터 역량인증제 상벌점 내역 조회 API 라
 - TODO.md 2.5 (내 상벌점 내역 조회 API: GET /api/points)
 """
 
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Union
 
 from fastapi import APIRouter, Depends, Query
 
@@ -27,7 +27,9 @@ router = APIRouter(
     response_model=SrFormat,
 )
 async def get_my_points(
-    student_id: Optional[int] = Query(None, alias="studentId", description="학생 식별자 (선택)"),
+    student_id: Optional[Union[int, str]] = Query(None, alias="studentId", description="학생 식별자 (선택)"),
+    student_id_alt: Optional[Union[int, str]] = Query(None, alias="student_id", description="학생 식별자 (선택)"),
+    user_id: Optional[str] = Query(None, alias="userId", description="학생 로그인 ID (선택)"),
     year: Optional[int] = Query(None, description="학년도 필터 (선택)"),
     conn: Any = Depends(get_db),
     current_user: Dict[str, Any] = Depends(get_current_user),
@@ -40,10 +42,13 @@ async def get_my_points(
     - 교사/관리자는 studentId 지정 시 해당 학생 내역 조회 허용
     - year: 선택적 학사년도 필터링
     """
+    target_id = student_id if student_id is not None else (
+        student_id_alt if student_id_alt is not None else user_id
+    )
     return await handle_get_points(
         conn=conn,
         current_user=current_user,
-        student_id_param=student_id,
+        student_id_param=target_id,
         year_val=year,
     )
 
@@ -58,8 +63,10 @@ except (ImportError, ModuleNotFoundError):
 
 
 class CreatePointRequest(BaseModel):
-    student_id: Optional[int] = None
-    studentId: Optional[int] = None
+    student_id: Optional[Union[int, str]] = None
+    studentId: Optional[Union[int, str]] = None
+    user_id: Optional[str] = None
+    userId: Optional[str] = None
     type: str  # "MERIT" or "DEMERIT" or "+" or "-" or "상점" or "벌점"
     points: Optional[float] = None
     score: Optional[float] = None
@@ -103,8 +110,12 @@ async def create_point(
     - merits 및 merits_log 테이블 기록
     - 상점(+)/벌점(-) 부호 정규화 (SCORE-02)
     """
-    target_student_id = req.student_id if req.student_id is not None else req.studentId
-    if target_student_id is None:
+    raw_target_id = req.student_id if req.student_id is not None else (
+        req.studentId if req.studentId is not None else (
+            req.user_id if req.user_id is not None else req.userId
+        )
+    )
+    if raw_target_id is None:
         return JSONResponse(
             status_code=400,
             content=SrFormat(
@@ -115,7 +126,19 @@ async def create_point(
             ).model_dump(),
         )
 
-    from core.authorization import authorize_student_access
+    from core.authorization import authorize_student_access, resolve_student_id
+    target_student_id = await resolve_student_id(conn, raw_target_id)
+    if target_student_id is None:
+        return JSONResponse(
+            status_code=404,
+            content=SrFormat(
+                status_code=404,
+                success=False,
+                data=None,
+                error=Error(code="USER_NOT_FOUND", message="해당 학생을 찾을 수 없습니다."),
+            ).model_dump(),
+        )
+
     auth_err = await authorize_student_access(current_user, target_student_id, conn, action="manage_points")
     if auth_err:
         return auth_err
@@ -229,6 +252,31 @@ async def create_point(
         await conn.autocommit(True)
 
     from datetime import datetime
+
+    # 학생 계정 ID(users.id) 및 성명 조회 (FE 호환성)
+    student_user_id = None
+    student_name = None
+    try:
+        async with conn.cursor(cursor=DictCursor) as cur:
+            await cur.execute(
+                """
+                SELECT s.name, u.id AS user_id 
+                FROM students s 
+                LEFT JOIN users u ON s.uuid = u.uuid 
+                WHERE s.student_id = %s 
+                LIMIT 1
+                """,
+                (target_student_id,),
+            )
+            st_row = await cur.fetchone()
+            if st_row:
+                student_user_id = st_row.get("user_id") if isinstance(st_row, dict) else st_row[1]
+                student_name = st_row.get("name") if isinstance(st_row, dict) else st_row[0]
+    except Exception:
+        pass
+
+    final_user_id = student_user_id or req.user_id or req.userId or (str(raw_target_id) if not str(raw_target_id).isdigit() else None)
+
     return JSONResponse(
         status_code=201,
         content=SrFormat(
@@ -238,6 +286,10 @@ async def create_point(
                 "id": point_id,
                 "pointId": point_id,
                 "studentId": target_student_id,
+                "userId": final_user_id,
+                "user_id": final_user_id,
+                "studentName": student_name,
+                "name": student_name,
                 "teacherId": reviewer_id,
                 "type": norm_type,
                 "points": norm_score,

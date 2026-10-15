@@ -15,7 +15,7 @@ routers/teachers.py - 마이스터 역량인증제 교사용 API 라우터
 
 import logging
 from datetime import date, datetime
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 from fastapi import APIRouter, Depends, Query, status
 from fastapi.responses import JSONResponse
@@ -31,7 +31,7 @@ from core.calculator import (
     round_decimal,
 )
 from core.academic import get_current_year, get_year_id_by_year
-from core.authorization import _expand_tokens
+from core.authorization import _expand_tokens, resolve_student_id
 from core.security import get_current_user
 from database import get_db
 from routers.students import SUBMISSION_STATUS_MAP
@@ -49,7 +49,9 @@ router = APIRouter(tags=["Teacher"])
 class TeacherStudentItem(BaseModel):
     """3.2 담당 학생 목록 및 제출 현황 검색 API 응답 아이템 (Tech_spec.md 3.2 & TODO.md 3.2)"""
     studentId: int = Field(..., description="학생 고유 ID")
-    id: Optional[int] = Field(None, description="학생 고유 ID (호환용 alias)")
+    id: Optional[Union[int, str]] = Field(None, description="학생 고유 ID (호환용 alias)")
+    userId: Optional[str] = Field(None, description="학생 로그인 계정 ID (users.id)")
+    user_id: Optional[str] = Field(None, description="학생 로그인 계정 ID (snake_case)")
     name: str = Field(..., description="학생 이름")
     grade: int = Field(..., description="학년")
     classNo: int = Field(..., description="학급 반")
@@ -102,7 +104,9 @@ class TeacherStudentDetailSubmissionItem(BaseModel):
 class TeacherStudentDetailResponse(BaseModel):
     """3.3 특정 학생 상세 현황 응답 DTO"""
     studentId: int = Field(..., description="학생 고유 ID")
-    id: Optional[int] = Field(None, description="학생 고유 ID alias")
+    id: Optional[Union[int, str]] = Field(None, description="학생 고유 ID alias")
+    userId: Optional[str] = Field(None, description="학생 로그인 계정 ID (users.id)")
+    user_id: Optional[str] = Field(None, description="학생 로그인 계정 ID (snake_case)")
     name: str = Field(..., description="학생 이름")
     grade: int = Field(..., description="학년")
     classNo: int = Field(..., description="학급 반")
@@ -536,6 +540,8 @@ async def get_teacher_students(
     name: Optional[str] = Query(None, description="학생 성명 검색 (부분 일치)"),
     studentNo: Optional[int] = Query(None, ge=1, description="학생 번호 또는 학번 필터"),
     number: Optional[int] = Query(None, ge=1, description="학생 번호 필터 (alias)"),
+    student_id: Optional[Union[int, str]] = Query(None, alias="studentId", description="학생 식별자 필터"),
+    user_id: Optional[str] = Query(None, alias="userId", description="학생 로그인 ID 필터"),
     area: Optional[str] = Query(None, description="인증 영역 필터 (영역명 또는 areaId)"),
     status_filter: Optional[str] = Query(None, alias="status", description="인증 상태 또는 제출 상태 필터"),
     hasPoints: Optional[str] = Query(None, description="상벌점 보유 여부 필터 (true/false)"),
@@ -664,10 +670,12 @@ async def get_teacher_students(
         SELECT 
             st.student_id,
             st.name,
+            u.id AS user_id,
             sar.grade,
             sar.class AS class_no,
             sar.number
         FROM students st
+        LEFT JOIN users u ON st.uuid = u.uuid AND u.is_deleted = FALSE
         JOIN student_academic_records sar ON st.student_id = sar.student_id AND sar.year_id = %s
         WHERE st.is_deleted = FALSE
     """
@@ -688,6 +696,19 @@ async def get_teacher_students(
             escaped_name = clean_name.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
             student_sql += " AND st.name LIKE %s"
             student_params.append(f"%{escaped_name}%")
+
+    if student_id is not None:
+        s_filt = str(student_id).strip()
+        if s_filt.isdigit():
+            student_sql += " AND (st.student_id = %s OR u.id = %s)"
+            student_params.extend([int(s_filt), s_filt])
+        else:
+            student_sql += " AND u.id = %s"
+            student_params.append(s_filt)
+
+    if user_id:
+        student_sql += " AND u.id = %s"
+        student_params.append(user_id.strip())
 
     if req_number is not None:
         student_sql += " AND (sar.number = %s OR st.student_id = %s)"
@@ -852,6 +873,8 @@ async def get_teacher_students(
         result_students.append({
             "studentId": sid,
             "id": sid,
+            "userId": st.get("user_id"),
+            "user_id": st.get("user_id"),
             "name": st["name"],
             "grade": st["grade"],
             "classNo": st["class_no"],
@@ -887,7 +910,7 @@ async def get_teacher_students(
     include_in_schema=False,
 )
 async def get_teacher_student_detail(
-    student_id: int,
+    student_id: Union[int, str],
     year: Optional[int] = Query(None, description="조회 학년도 (생략 시 현재 학사년도)"),
     current_user: Dict[str, Any] = Depends(get_current_user),
     conn: Any = Depends(get_db),
@@ -971,12 +994,26 @@ async def get_teacher_student_detail(
     has_homeroom = (not is_admin) and (not is_dept_head) and (not is_grade_head) and (teacher_grade is not None and teacher_class is not None)
 
     # 3. 대상 학생 존재 여부 확인
+    real_student_id = await resolve_student_id(conn, student_id)
+    if real_student_id is None:
+        return JSONResponse(
+            status_code=status.HTTP_404_NOT_FOUND,
+            content=SrFormat(
+                status_code=status.HTTP_404_NOT_FOUND,
+                success=False,
+                data=None,
+                error=Error(code="USER_NOT_FOUND", message="해당 학생을 찾을 수 없습니다."),
+            ).model_dump(),
+        )
+    student_id = real_student_id
+
     async with conn.cursor(cursor=DictCursor) as cur:
         await cur.execute(
             """
-            SELECT student_id, uuid, name, email
-            FROM students
-            WHERE student_id = %s AND is_deleted = FALSE
+            SELECT s.student_id, s.uuid, s.name, s.email, u.id AS user_id
+            FROM students s
+            LEFT JOIN users u ON s.uuid = u.uuid AND u.is_deleted = FALSE
+            WHERE s.student_id = %s AND s.is_deleted = FALSE
             LIMIT 1
             """,
             (student_id,),
@@ -1204,9 +1241,12 @@ async def get_teacher_student_detail(
         total_merit_points += signed_pts
     point_total = round_decimal(total_merit_points, 1)
 
+    st_user_id = target_student.get("user_id") if target_student else None
     response_data = {
         "studentId": student_id,
         "id": student_id,
+        "userId": st_user_id,
+        "user_id": st_user_id,
         "name": target_student["name"],
         "grade": st_grade,
         "classNo": st_class,
@@ -1223,6 +1263,8 @@ async def get_teacher_student_detail(
         "student": {
             "studentId": student_id,
             "id": student_id,
+            "userId": st_user_id,
+            "user_id": st_user_id,
             "name": target_student["name"],
             "grade": st_grade,
             "classNo": st_class,
