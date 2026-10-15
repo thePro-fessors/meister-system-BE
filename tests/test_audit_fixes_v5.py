@@ -330,6 +330,111 @@ class TestAuditFixesV5(unittest.TestCase):
 
         app.dependency_overrides.clear()
 
+    # 6. 학생 인증 현황 조회 pointTotal 반환 검증 (Item 3)
+    def test_student_certification_status_includes_point_total(self):
+        """GET /api/students/{id}/certification-status 응답에 pointTotal 필드 포함 검증"""
+        class MockDBStudent:
+            async def __aenter__(self):
+                return self
+            async def __aexit__(self, *args):
+                pass
+            def cursor(self, *args, **kwargs):
+                return self
+            async def execute(self, q, params=None):
+                self.q = q
+            async def fetchone(self):
+                if "FROM students" in getattr(self, "q", ""):
+                    return {"student_id": 1, "uuid": "student-uuid", "name": "학생1", "email": "s@b.hs.kr", "is_deleted": False}
+                elif "FROM student_academic_records" in getattr(self, "q", ""):
+                    return {"grade": 1, "class_no": 1, "number": 1}
+                return None
+            async def fetchall(self):
+                if "FROM certification_areas" in getattr(self, "q", ""):
+                    return [{"area_id": 1, "name": "기본", "max_score": 100.0}]
+                return []
+
+        app.dependency_overrides[get_db] = lambda: MockDBStudent()
+        app.dependency_overrides[get_redis] = lambda: self.redis
+
+        with patch("routers.students.get_current_academic_year", new=AsyncMock(return_value=2026)):
+            with patch("routers.students.get_year_id_by_year", new=AsyncMock(return_value=1)):
+                with patch("routers.students.authorize_student_access", new=AsyncMock(return_value=None)):
+                    with patch("routers.students.resolve_student_id", new=AsyncMock(return_value=1)):
+                        res = self.client.get(
+                            "/api/students/1/certification-status?year=2026",
+                            headers={"Authorization": f"Bearer {self.token_student}"},
+                        )
+                        self.assertEqual(res.status_code, 200)
+                        data = res.json()["data"]
+                        self.assertIn("pointTotal", data)
+                        self.assertIn("totalMeritScore", data)
+                        self.assertEqual(data["pointTotal"], data["totalMeritScore"])
+
+        app.dependency_overrides.clear()
+
+    # 7. 시스템 감사 로그 및 재계산 응답 키 호환성 검증 (Item 1)
+    def test_admin_audit_logs_and_recalculate_response_keys(self):
+        """GET /api/admin/audit-logs 응답에 total 및 logs 호환 키 포함 검증"""
+        class MockDBAudit:
+            async def __aenter__(self):
+                return self
+            async def __aexit__(self, *args):
+                pass
+            def cursor(self, *args, **kwargs):
+                return self
+            async def execute(self, q, params=None):
+                self.q = q
+            async def fetchone(self):
+                if "COUNT(*) AS total_count" in getattr(self, "q", ""):
+                    return {"total_count": 1}
+                return None
+            async def fetchall(self):
+                if "FROM (" in getattr(self, "q", ""):
+                    return [{
+                        "unified_id": "sub_1",
+                        "original_log_id": 1,
+                        "log_type": "SUBMISSION",
+                        "action_type": "APPROVE",
+                        "target_id": 10,
+                        "target_title": "자격증",
+                        "student_id": 1,
+                        "student_name": "홍길동",
+                        "student_grade": 1,
+                        "student_class": 1,
+                        "student_number": 1,
+                        "modifier_uuid": "admin-uuid",
+                        "modifier_name": "관리자",
+                        "modifier_role": "admin",
+                        "old_status_code": 1,
+                        "new_status_code": 3,
+                        "old_score": 0.0,
+                        "new_score": 50.0,
+                        "old_points": None,
+                        "new_points": None,
+                        "reason": "승인 완료",
+                        "created_at": "2026-04-01T12:00:00",
+                    }]
+                return []
+
+        app.dependency_overrides[get_db] = lambda: MockDBAudit()
+        app.dependency_overrides[get_redis] = lambda: self.redis
+
+        res = self.client.get(
+            "/api/admin/audit-logs",
+            headers={"Authorization": f"Bearer {self.token_admin}"},
+        )
+        self.assertEqual(res.status_code, 200)
+        data = res.json()["data"]
+        self.assertIn("total", data)
+        self.assertIn("logs", data)
+        self.assertIn("pagination", data)
+        self.assertEqual(data["total"], data["pagination"]["totalCount"])
+        self.assertIn("log_id", data["logs"][0])
+        self.assertIn("user_id", data["logs"][0])
+
+        app.dependency_overrides.clear()
+
 
 if __name__ == "__main__":
     unittest.main()
+

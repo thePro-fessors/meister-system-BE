@@ -91,11 +91,13 @@ def is_valid_evidence_url(url: Optional[str]) -> bool:
 
 class AreaStatusItem(BaseModel):
     """5대 영역별 세부 인증 현황 응답 객체"""
+    areaId: Optional[int] = Field(None, description="인증 영역 고유 ID")
     area: str = Field(..., description="인증 영역명 (예: 전문기술역량, 인성/직업의식 등)")
     score: float = Field(..., description="학생 취득 점수 (상벌점 반영 및 소수점 1자리 반올림)")
     maxScore: float = Field(..., description="해당 학년/영역의 최대 배점")
     grade: str = Field(..., description="영역 등급 (S, A, B, 미달성)")
     status: str = Field(..., description="영역 진행 상태 (달성, 검토중, 보완 필요)")
+    pendingCount: Optional[int] = Field(0, description="심사 대기 건수")
 
 
 class CertificationStatusResponse(BaseModel):
@@ -107,6 +109,9 @@ class CertificationStatusResponse(BaseModel):
     areas: List[AreaStatusItem] = Field(..., description="5대 영역별 세부 인증 현황 리스트")
     totalScore: float = Field(..., description="학생의 총 취득 점수 합계")
     certStatus: str = Field(..., description="종합 역량인증 상태 (인증 가능, 검토중, 보완 필요, 미달성)")
+    pendingCount: Optional[int] = Field(0, description="심사 대기 건수")
+    totalMeritScore: Optional[float] = Field(0.0, description="총 상벌점")
+    pointTotal: Optional[float] = Field(0.0, description="총 상벌점 (기술명세서 규격)")
 
 
 # ==============================================================================
