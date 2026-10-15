@@ -17,7 +17,7 @@ services:
       - --collation-server=utf8mb4_unicode_ci
       - --sql-mode=STRICT_TRANS_TABLES,NO_ENGINE_SUBSTITUTION
     environment:
-      MYSQL_ROOT_PASSWORD: ${DATABASE_PASSWORD:-meister_root_secure_pw_2026}
+      MYSQL_ROOT_PASSWORD: ${DATABASE_PASSWORD:?DATABASE_PASSWORD must be set in .env}
       MYSQL_DATABASE: ${DATABASE_NAME:-swMeister}
     volumes:
       - mysql_data:/var/lib/mysql
@@ -43,13 +43,13 @@ services:
       options:
         max-size: "20m"
         max-file: "5"
-    command: ["sh", "-c", "redis-server --requirepass $${REDIS_PASSWORD:-meister_redis_secure_pw_2026} --appendonly yes"]
+    command: ["sh", "-c", "redis-server --requirepass \"$${REDIS_PASSWORD}\" --appendonly yes"]
     environment:
-      REDIS_PASSWORD: ${REDIS_PASSWORD:-meister_redis_secure_pw_2026}
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?REDIS_PASSWORD must be set in .env}
     volumes:
       - redis_data:/data
     healthcheck:
-      test: ["CMD", "redis-cli", "-a", "$${REDIS_PASSWORD:-meister_redis_secure_pw_2026}", "ping"]
+      test: ["CMD", "redis-cli", "-a", "$${REDIS_PASSWORD}", "ping"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -82,8 +82,8 @@ services:
       DATABASE_PORT: 3306
       DATABASE_NAME: ${DATABASE_NAME:-swMeister}
       DATABASE_USER: ${DATABASE_USER:-root}
-      DATABASE_PASSWORD: ${DATABASE_PASSWORD:-meister_root_secure_pw_2026}
-      REDIS_URL: redis://:${REDIS_PASSWORD:-meister_redis_secure_pw_2026}@redis:6379/0
+      DATABASE_PASSWORD: ${DATABASE_PASSWORD}
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
       UPLOAD_DIR: /app/uploads
       TRUSTED_PROXIES: "127.0.0.1,nginx,172.16.0.0/12,192.168.0.0/16,10.0.0.0/8"
     volumes:
