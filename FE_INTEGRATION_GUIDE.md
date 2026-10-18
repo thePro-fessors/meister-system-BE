@@ -615,3 +615,64 @@ const handleApproveSubmission = async (submissionId: number, score: number, comm
 4. [ ] **파일 다운로드**: 파일 직접 링크 대신 `/api/submissions/{id}/download-ticket` 또는 `/api/uploads/ticket?file_path=`을 호출하여 1회용 티켓을 발급받아 서빙하는가?
 5. [ ] **상벌점 부호**: 벌점 부여 시 `score: -N` 또는 `type: "벌점", points: N` 형식을 준수하여 `INVALID_POINT_SIGN`을 방지했는가?
 6. [ ] **AI 권한**: 학생 챗봇/자동분류는 학생/관리자만, 심사초안은 심사 권한 교사만 호출하도록 UI 버튼 노출 가드를 적용했는가?
+7. [ ] **초대코드 가입**: 관리자 발급 난수 초대코드(`XXX-XXXX-XXXXXX`)를 `send-otp` 및 `register`의 `admin_code` 필드로 전달하는가?
+
+---
+
+## 9. 관리자 난수 초대코드(Invitation Code) 발급 및 가입 연동 규약
+
+관리자 화면에서 특정 역할(교사/관리자/학생), 유효기간(기본 1일), 사용 횟수(기본 1회)를 지정하여 난수 초대코드를 발급하고 가입에 활용할 수 있습니다.
+
+### 9.1 초대코드 규격 (`XXX-XXXX-XXXXXX`)
+1. **첫 3자리 (역할 접두사)**: 학생(`STU`), 교사(`TCH`), 관리자(`ADM`)
+2. **중간 4자리 (16진수 학년도)**: 2026학년도 $\rightarrow$ `07EA` (대문자 4자리)
+3. **뒷 6자리 (난수)**: UUID v4의 마지막 6자리 대문자 (예: `3A9F1B`)
+- **생성 예시**: `TCH-07EA-3A9F1B`, `ADM-07EA-9C2E41`, `STU-07EA-1B8D50`
+
+### 9.2 API 엔드포인트 명세
+
+#### ① 초대코드 신규 발급 (`POST /api/admin/invitations`) - 관리자 전용
+- **Request Body**:
+  ```json
+  {
+    "role": "teacher",     // "student" | "teacher" | "admin" (한글 "학생", "교사", "관리자" 가능)
+    "validDays": 1,        // 유효기간 (일 단위, 기본 1일, 1~365)
+    "maxUses": 1,          // 허용 사용 횟수 (기본 1회, 1~10000)
+    "year": 2026           // 대상 학년도 (생략 시 당해 활성 학년도 자동 반영)
+  }
+  ```
+- **Response (201 Created)**:
+  ```json
+  {
+    "status_code": 201,
+    "success": true,
+    "data": {
+      "code": "TCH-07EA-3A9F1B",
+      "role": "teacher",
+      "role_prefix": "TCH",
+      "target_role": 1,
+      "year": 2026,
+      "max_uses": 1,
+      "remaining_uses": 1,
+      "created_at": "2026-10-18T23:40:00.000000+00:00",
+      "expires_at": "2026-10-19T23:40:00.000000+00:00",
+      "created_by": "admin"
+    },
+    "error": null
+  }
+  ```
+
+#### ② 활성 초대코드 목록 조회 (`GET /api/admin/invitations`) - 관리자 전용
+- 만료되었거나 소진된 코드는 Redis에서 자동 정리되며, 현재 사용 가능한 활성 목록 최신순 반환.
+
+#### ③ 초대코드 즉시 폐기/취소 (`DELETE /api/admin/invitations/{code}`) - 관리자 전용
+- 즉시 Redis에서 키 삭제 및 활성 목록에서 제거.
+
+### 9.3 회원가입 연동 플로우
+1. 사용자가 회원가입 화면에서 초대코드 입력:
+   - `POST /auth/send-otp` 호출 시 body에 `admin_code: "TCH-07EA-3A9F1B"` 전달.
+   - 사전 명단에 등록되지 않은 교사/학생도 유효한 초대코드가 있으면 OTP 인증번호 수신 가능.
+2. OTP 검증 통과 후 회원가입:
+   - `POST /auth/register` 호출 시 body에 `admin_code: "TCH-07EA-3A9F1B"` 전달.
+   - 가입 완료 시 Redis 내 `remaining_uses`가 1회 원자적 차감되며, 0회 도달 시 자동 소멸.
+

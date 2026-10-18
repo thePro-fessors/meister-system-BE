@@ -8,6 +8,7 @@ routers/auth.py - 인증(Authentication) 및 계정 관리 관련 API 라우터
 """
 
 import os
+import json
 import re
 import uuid
 from typing import Optional, Any
@@ -572,7 +573,22 @@ async def send_otp(
     expected_admin_code = os.getenv("ADMIN_REGISTRATION_CODE", "MEISTER_ADMIN_2026!")
 
     if req.admin_code is not None and req.admin_code.strip():
-        if not secrets.compare_digest(req.admin_code.strip(), expected_admin_code):
+        input_code = req.admin_code.strip()
+        is_env_match = secrets.compare_digest(input_code, expected_admin_code)
+        invitation_data = None
+
+        if not is_env_match:
+            raw_inv = await redis.get(f"invitation_code:{input_code.upper()}")
+            if raw_inv:
+                try:
+                    val_str = raw_inv.decode("utf-8") if isinstance(raw_inv, bytes) else str(raw_inv)
+                    parsed = json.loads(val_str)
+                    if parsed.get("remaining_uses", 0) > 0:
+                        invitation_data = parsed
+                except Exception:
+                    invitation_data = None
+
+        if not is_env_match and not invitation_data:
             return JSONResponse(
                 status_code=403,
                 content=SrFormat(
@@ -581,7 +597,7 @@ async def send_otp(
                     data=None,
                     error=Error(
                         code="FORBIDDEN",
-                        message="관리자 가입 보안 코드가 올바르지 않습니다."
+                        message="가입 보안 코드 또는 초대 코드가 올바르지 않거나 만료되었습니다."
                     )
                 ).model_dump()
             )
@@ -605,10 +621,12 @@ async def send_otp(
                 ).model_dump()
             )
 
-        user_name = "관리자"
+        user_name = "관리자" if is_env_match else f"{invitation_data.get('role', '초대')} 가입자"
         otp_key = f"otp:{clean_mail}"
-        # Redis에 관리자 가입 의도 플래그 기록 (5분 유효)
-        await redis.setex(f"otp:admin_reg:{clean_mail}", 300, "1")
+        if is_env_match or (invitation_data and invitation_data.get("target_role") == 2):
+            await redis.setex(f"otp:admin_reg:{clean_mail}", 300, "1")
+        if invitation_data:
+            await redis.setex(f"otp:invite_meta:{clean_mail}", 300, json.dumps(invitation_data, ensure_ascii=False))
 
     elif req.purpose == "change_email":
         async with conn.cursor(cursor=DictCursor) as cur:
@@ -842,6 +860,9 @@ async def verify_otp(req: VerifyOtpRequest, redis: aioredis.Redis = Depends(get_
     else:
         if await redis.get(f"otp:admin_reg:{clean_mail}"):
             await redis.setex(f"otp:admin_reg:{clean_mail}", 600, "1")
+        invite_meta = await redis.get(f"otp:invite_meta:{clean_mail}")
+        if invite_meta:
+            await redis.setex(f"otp:invite_meta:{clean_mail}", 600, invite_meta)
         await redis.setex(f"register_token:{clean_mail}", 600, token_val)
         return SrFormat(
             status_code=200,
@@ -915,34 +936,59 @@ async def register_user(
             ).model_dump()
         )
 
-    # 관리자 가입 판별 (보안 코드 직접 제시 또는 Redis OTP 검증 플래그 확인)
+    # 관리자/초대코드 가입 판별 (보안 코드 직접 제시 또는 Redis OTP 검증 플래그 확인)
     expected_admin_code = os.getenv("ADMIN_REGISTRATION_CODE", "MEISTER_ADMIN_2026!")
     is_admin = False
+    invitation_data = None
+    code_to_consume = None
 
-    admin_flag = await redis.get(f"otp:admin_reg:{clean_mail}")
-    if admin_flag:
-        is_admin = True
+    raw_invite_meta = await redis.get(f"otp:invite_meta:{clean_mail}")
+    if raw_invite_meta:
+        try:
+            val_str = raw_invite_meta.decode("utf-8") if isinstance(raw_invite_meta, bytes) else str(raw_invite_meta)
+            invitation_data = json.loads(val_str)
+            code_to_consume = invitation_data.get("code")
+        except Exception:
+            invitation_data = None
 
     if req.admin_code is not None and req.admin_code.strip():
-        if not secrets.compare_digest(req.admin_code.strip(), expected_admin_code):
-            return JSONResponse(
-                status_code=403,
-                content=SrFormat(
+        input_code = req.admin_code.strip()
+        if secrets.compare_digest(input_code, expected_admin_code):
+            is_admin = True
+        else:
+            raw_inv = await redis.get(f"invitation_code:{input_code.upper()}")
+            if raw_inv:
+                try:
+                    val_str = raw_inv.decode("utf-8") if isinstance(raw_inv, bytes) else str(raw_inv)
+                    parsed = json.loads(val_str)
+                    if parsed.get("remaining_uses", 0) > 0:
+                        invitation_data = parsed
+                        code_to_consume = parsed.get("code")
+                except Exception:
+                    pass
+            if not is_admin and not invitation_data:
+                return JSONResponse(
                     status_code=403,
-                    success=False,
-                    data=None,
-                    error=Error(
-                        code="FORBIDDEN",
-                        message="관리자 가입 보안 코드가 올바르지 않습니다."
-                    )
-                ).model_dump()
-            )
-        is_admin = True
+                    content=SrFormat(
+                        status_code=403,
+                        success=False,
+                        data=None,
+                        error=Error(
+                            code="FORBIDDEN",
+                            message="관리자 가입 보안 코드 또는 초대 코드가 올바르지 않습니다."
+                        )
+                    ).model_dump()
+                )
+
+    if not is_admin:
+        admin_flag = await redis.get(f"otp:admin_reg:{clean_mail}")
+        if admin_flag:
+            is_admin = True
 
     determined_role = None
     target_table = None
 
-    if is_admin:
+    if is_admin or (invitation_data and invitation_data.get("target_role") == 2):
         determined_role = 2
         async with conn.cursor(cursor=DictCursor) as cur:
             # 이메일 중복 검사
@@ -982,6 +1028,63 @@ async def register_user(
             teacher_row = await cur.fetchone()
             if teacher_row:
                 target_table = "teachers"
+
+    elif invitation_data:
+        # 학생 / 교사 동적 초대 코드 기반 가입
+        inv_target_role = invitation_data.get("target_role", 0)
+        determined_role = inv_target_role
+
+        async with conn.cursor(cursor=DictCursor) as cur:
+            # 이메일 중복 검사
+            await cur.execute("SELECT uuid FROM users WHERE email = %s AND is_deleted = FALSE LIMIT 1", (clean_mail,))
+            if await cur.fetchone():
+                return JSONResponse(
+                    status_code=409,
+                    content=SrFormat(
+                        status_code=409,
+                        success=False,
+                        data=None,
+                        error=Error(
+                            code="DUPLICATE_EMAIL",
+                            message="이미 가입된 이메일 주소입니다."
+                        )
+                    ).model_dump()
+                )
+
+            # 아이디 중복 검사
+            await cur.execute("SELECT uuid FROM users WHERE id = %s LIMIT 1", (req.id,))
+            if await cur.fetchone():
+                return JSONResponse(
+                    status_code=409,
+                    content=SrFormat(
+                        status_code=409,
+                        success=False,
+                        data=None,
+                        error=Error(
+                            code="DUPLICATE_ID",
+                            message="이미 사용 중인 아이디입니다."
+                        )
+                    ).model_dump()
+                )
+
+            if inv_target_role == 1:
+                target_table = "teachers"
+                await cur.execute("SELECT teachers_id FROM teachers WHERE email = %s AND is_deleted = FALSE LIMIT 1", (clean_mail,))
+                teacher_row = await cur.fetchone()
+                if not teacher_row:
+                    await cur.execute(
+                        "INSERT INTO teachers (name, email, is_deleted) VALUES (%s, %s, FALSE)",
+                        (req.id, clean_mail)
+                    )
+            else:
+                target_table = "students"
+                await cur.execute("SELECT student_id FROM students WHERE email = %s AND is_deleted = FALSE LIMIT 1", (clean_mail,))
+                student_row = await cur.fetchone()
+                if not student_row:
+                    await cur.execute(
+                        "INSERT INTO students (name, email, is_deleted) VALUES (%s, %s, FALSE)",
+                        (req.id, clean_mail)
+                    )
     else:
         # 학생 / 교사 서버 기반 권한(Role) 확정 판별 (권한 상승 위조 원천 방어)
         async with conn.cursor(cursor=DictCursor) as cur:
@@ -1108,6 +1211,23 @@ async def register_user(
 
         await conn.commit()
         await redis.delete(f"otp:admin_reg:{clean_mail}")
+        if code_to_consume:
+            raw_inv = await redis.get(f"invitation_code:{code_to_consume}")
+            if raw_inv:
+                try:
+                    val_str = raw_inv.decode("utf-8") if isinstance(raw_inv, bytes) else str(raw_inv)
+                    inv_obj = json.loads(val_str)
+                    inv_obj["remaining_uses"] = max(0, inv_obj.get("remaining_uses", 1) - 1)
+                    if inv_obj["remaining_uses"] <= 0:
+                        await redis.delete(f"invitation_code:{code_to_consume}")
+                        await redis.srem("invitation_codes:active", code_to_consume)
+                    else:
+                        ttl = await redis.ttl(f"invitation_code:{code_to_consume}")
+                        if ttl > 0:
+                            await redis.setex(f"invitation_code:{code_to_consume}", ttl, json.dumps(inv_obj, ensure_ascii=False))
+                except Exception:
+                    pass
+            await redis.delete(f"otp:invite_meta:{clean_mail}")
     except Exception as e:
         await conn.rollback()
         return JSONResponse(

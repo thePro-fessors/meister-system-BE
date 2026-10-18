@@ -3,13 +3,15 @@ routers/admin.py - 학년도 관리, 평가 기준 관리, 관리자 통계 개�
 """
 
 import html
+import json
 import os
 import re
-from datetime import datetime
+import uuid
+from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional, Tuple, Union
 from fastapi import APIRouter, Depends, File, Form, Query, Request, UploadFile, status
 from fastapi.responses import JSONResponse, Response
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 import redis.asyncio as aioredis
 
 try:
@@ -17,7 +19,7 @@ try:
 except (ImportError, ModuleNotFoundError):
     DictCursor = Any  # type: ignore
 
-from core.academic import clear_year_cache
+from core.academic import clear_year_cache, get_current_year
 from core.calculator import calculate_student_certification
 from core.excel_parser import (
     parse_homeroom_field,
@@ -3613,6 +3615,153 @@ async def recalculate_student_certifications(
                 "sampleStudents": recalculated_students,
             },
         ).model_dump()
+
+
+# ------------------------------------------------------------------------------
+# 관리자 난수 초대코드 발급 및 관리 API
+# ------------------------------------------------------------------------------
+class CreateInvitationRequest(BaseModel):
+    role: str = Field(..., description="대상 역할 (student/학생, teacher/교사, admin/관리자)")
+    valid_days: int = Field(default=1, ge=1, le=365, alias="validDays", description="유효기간(일), 기본 1일")
+    max_uses: int = Field(default=1, ge=1, le=10000, alias="maxUses", description="사용 횟수, 기본 1회")
+    year: Optional[int] = Field(default=None, description="대상 학년도 (생략 시 활성 학년도)")
+
+    model_config = {"populate_by_name": True}
+
+
+def _normalize_role(role_input: str) -> Tuple[str, str, int]:
+    r = (role_input or "").strip().lower()
+    if r in ("student", "학생", "stu", "0"):
+        return "student", "STU", 0
+    if r in ("teacher", "교사", "선생님", "tch", "1"):
+        return "teacher", "TCH", 1
+    if r in ("admin", "관리자", "adm", "2"):
+        return "admin", "ADM", 2
+    raise ValueError("지원하지 않는 역할입니다. (학생/교사/관리자 중 선택)")
+
+
+@admin_router.post("/invitations", status_code=status.HTTP_201_CREATED)
+async def create_invitation_code(
+    req: CreateInvitationRequest,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+    conn: Any = Depends(get_db),
+    redis: aioredis.Redis = Depends(get_redis),
+):
+    admin_guard = check_admin_access(current_user)
+    if admin_guard:
+        return admin_guard
+
+    try:
+        role_name, role_prefix, role_code = _normalize_role(req.role)
+    except ValueError as e:
+        return JSONResponse(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            content=SrFormat(
+                status_code=400,
+                success=False,
+                data=None,
+                error=Error(code="VALIDATION_ERROR", message=str(e)),
+            ).model_dump(),
+        )
+
+    target_year = req.year if req.year and (2000 <= req.year <= 2100) else await get_current_year(conn)
+    if not target_year:
+        target_year = datetime.now().year
+
+    # 난수 초대코드 규격: XXX-XXXX-XXXXXX
+    # 1. 첫 3자리 : 학생(STU), 교사(TCH), 관리자(ADM)
+    # 2. 중간 4자리 : 16진수 학년도(2026학년도면 07EA)
+    # 3. 뒷 6자리 : UUID v4로 생성된 UUID 중 맨 뒤 6자
+    hex_year = f"{int(target_year):04X}"
+    suffix = uuid.uuid4().hex[-6:].upper()
+    code = f"{role_prefix}-{hex_year}-{suffix}"
+
+    now = datetime.now(timezone.utc)
+    expires_at = now + timedelta(days=req.valid_days)
+    ttl_seconds = int(req.valid_days * 86400)
+
+    payload = {
+        "code": code,
+        "role": role_name,
+        "role_prefix": role_prefix,
+        "target_role": role_code,
+        "year": int(target_year),
+        "max_uses": req.max_uses,
+        "remaining_uses": req.max_uses,
+        "created_at": now.isoformat(),
+        "expires_at": expires_at.isoformat(),
+        "created_by": current_user.get("id") or current_user.get("user_id") or "admin",
+    }
+
+    await redis.setex(f"invitation_code:{code}", ttl_seconds, json.dumps(payload, ensure_ascii=False))
+    await redis.sadd("invitation_codes:active", code)
+
+    return SrFormat(status_code=201, success=True, data=payload).model_dump()
+
+
+@admin_router.get("/invitations")
+async def list_invitation_codes(
+    current_user: Dict[str, Any] = Depends(get_current_user),
+    redis: aioredis.Redis = Depends(get_redis),
+):
+    admin_guard = check_admin_access(current_user)
+    if admin_guard:
+        return admin_guard
+
+    active_codes = await redis.smembers("invitation_codes:active")
+    results = []
+    for code_raw in active_codes:
+        code_str = code_raw.decode("utf-8") if isinstance(code_raw, bytes) else str(code_raw)
+        raw_val = await redis.get(f"invitation_code:{code_str}")
+        if not raw_val:
+            await redis.srem("invitation_codes:active", code_str)
+            continue
+        try:
+            val_str = raw_val.decode("utf-8") if isinstance(raw_val, bytes) else str(raw_val)
+            item = json.loads(val_str)
+            results.append(item)
+        except Exception:
+            continue
+
+    results.sort(key=lambda x: x.get("created_at", ""), reverse=True)
+    return SrFormat(
+        status_code=200,
+        success=True,
+        data={"invitations": results, "total": len(results)},
+    ).model_dump()
+
+
+@admin_router.delete("/invitations/{code}")
+async def revoke_invitation_code(
+    code: str,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+    redis: aioredis.Redis = Depends(get_redis),
+):
+    admin_guard = check_admin_access(current_user)
+    if admin_guard:
+        return admin_guard
+
+    clean_code = (code or "").strip().upper()
+    deleted = await redis.delete(f"invitation_code:{clean_code}")
+    await redis.srem("invitation_codes:active", clean_code)
+
+    if not deleted:
+        return JSONResponse(
+            status_code=status.HTTP_404_NOT_FOUND,
+            content=SrFormat(
+                status_code=404,
+                success=False,
+                data=None,
+                error=Error(code="NOT_FOUND", message="존재하지 않거나 이미 만료된 초대 코드입니다."),
+            ).model_dump(),
+        )
+
+    return SrFormat(
+        status_code=200,
+        success=True,
+        data={"revokedCode": clean_code},
+    ).model_dump()
+
 
 
 
