@@ -1432,3 +1432,65 @@ async def patch_email(
             "email": clean_mail,
         }
     ).model_dump()
+
+
+class PatchPasswordRequest(BaseModel):
+    current_password: str = Field(..., alias="currentPassword")
+    new_password: str = Field(..., alias="newPassword")
+
+    model_config = {"populate_by_name": True}
+
+
+@router.patch("/password")
+async def patch_password(
+    req: PatchPasswordRequest,
+    current_user: dict = Depends(get_current_user),
+    conn: asyncmy.Connection = Depends(get_db),
+):
+    uuid_val = current_user["uuid"]
+    if not req.current_password or not req.new_password:
+        return JSONResponse(
+            status_code=400,
+            content=SrFormat(
+                status_code=400,
+                success=False,
+                data=None,
+                error=Error(code="VALIDATION_ERROR", message="현재 비밀번호와 새 비밀번호를 모두 입력해주세요."),
+            ).model_dump(),
+        )
+    if not validate_password_complexity(req.new_password):
+        return JSONResponse(
+            status_code=400,
+            content=SrFormat(
+                status_code=400,
+                success=False,
+                data=None,
+                error=Error(
+                    code="WEAK_PASSWORD",
+                    message="새 비밀번호는 영문·숫자·특수문자 3종 조합 8자 이상(또는 2종 조합 10자 이상)이어야 합니다.",
+                ),
+            ).model_dump(),
+        )
+    async with conn.cursor(cursor=DictCursor) as cur:
+        await cur.execute("SELECT password FROM users WHERE uuid = %s AND is_deleted = FALSE LIMIT 1", (uuid_val,))
+        row = await cur.fetchone()
+    if not row or not await verify_password(req.current_password, row["password"]):
+        return JSONResponse(
+            status_code=401,
+            content=SrFormat(
+                status_code=401,
+                success=False,
+                data=None,
+                error=Error(code="INVALID_CREDENTIAL", message="현재 비밀번호가 일치하지 않습니다."),
+            ).model_dump(),
+        )
+    hashed_new = await asyncio.to_thread(hash_password, req.new_password)
+    async with conn.cursor(cursor=DictCursor) as cur:
+        await cur.execute("UPDATE users SET password = %s WHERE uuid = %s AND is_deleted = FALSE", (hashed_new, uuid_val))
+    await conn.commit()
+    return SrFormat(
+        status_code=200,
+        success=True,
+        data={"message": "비밀번호가 성공적으로 변경되었습니다."},
+    ).model_dump()
+
