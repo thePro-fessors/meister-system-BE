@@ -74,6 +74,39 @@ end
 return raw
 """
 
+_REFUND_INVITATION_LUA = """
+local raw = redis.call('GET', KEYS[1])
+if raw then
+    local data = cjson.decode(raw)
+    local max_uses = tonumber(data['max_uses'] or 999999)
+    local rem = tonumber(data['remaining_uses'] or 0) + 1
+    if rem > max_uses then
+        rem = max_uses
+    end
+    data['remaining_uses'] = rem
+    local ttl = redis.call('TTL', KEYS[1])
+    local encoded = cjson.encode(data)
+    if ttl and ttl > 0 then
+        redis.call('SETEX', KEYS[1], ttl, encoded)
+    else
+        redis.call('SET', KEYS[1], encoded)
+    end
+    redis.call('SADD', KEYS[2], ARGV[1])
+    return 1
+else
+    local fallback_ttl = tonumber(ARGV[3] or 0)
+    if fallback_ttl > 0 and ARGV[2] and ARGV[2] ~= '' then
+        local data = cjson.decode(ARGV[2])
+        data['remaining_uses'] = 1
+        local encoded = cjson.encode(data)
+        redis.call('SETEX', KEYS[1], fallback_ttl, encoded)
+        redis.call('SADD', KEYS[2], ARGV[1])
+        return 1
+    end
+    return 0
+end
+"""
+
 
 async def _consume_invitation_code_atomically(redis: Any, code: str) -> Optional[dict]:
     """Redis Lua 스크립트를 사용하여 초대코드 잔여 횟수 확인 및 차감을 단일 원자적 연산으로 처리합니다."""
@@ -120,6 +153,66 @@ async def _consume_invitation_code_atomically(redis: Any, code: str) -> Optional
             return original_obj
         except Exception:
             return None
+
+
+async def _refund_invitation_code_atomically(
+    redis: Any, code: str, consumed_inv: Optional[dict] = None
+) -> bool:
+    """초대코드 사용 롤백 시 잔여 횟수를 원자적으로 +1 환불하고 TTL 및 활성 목록을 복원합니다."""
+    clean_code = (code or "").strip().upper()
+    if not clean_code or not consumed_inv:
+        return False
+    inv_key = f"invitation_code:{clean_code}"
+    active_set_key = "invitation_codes:active"
+
+    fallback_ttl = 86400
+    try:
+        exp_str = consumed_inv.get("expires_at")
+        if exp_str:
+            exp_dt = datetime.fromisoformat(exp_str)
+            if exp_dt.tzinfo is None:
+                exp_dt = exp_dt.replace(tzinfo=timezone.utc)
+            diff = int((exp_dt - datetime.now(timezone.utc)).total_seconds())
+            if diff > 0:
+                fallback_ttl = diff
+            else:
+                return False  # 이미 만료된 코드는 환불 복원하지 않음
+    except Exception:
+        fallback_ttl = 86400
+
+    fallback_json = json.dumps(consumed_inv, ensure_ascii=False)
+
+    if hasattr(redis, "eval"):
+        try:
+            res = await redis.eval(
+                _REFUND_INVITATION_LUA, 2, inv_key, active_set_key, clean_code, fallback_json, fallback_ttl
+            )
+            return bool(res)
+        except (AttributeError, NotImplementedError):
+            pass
+        except Exception as e:
+            logger.warning(f"[INVITATION_REFUND_LUA_FALLBACK] eval fallback due to: {e}")
+
+    async with _INVITATION_FALLBACK_LOCK:
+        try:
+            raw_inv = await redis.get(inv_key)
+            if raw_inv:
+                val_str = raw_inv.decode("utf-8") if isinstance(raw_inv, bytes) else str(raw_inv)
+                inv_obj = json.loads(val_str)
+                max_u = int(inv_obj.get("max_uses", 999999))
+                inv_obj["remaining_uses"] = min(int(inv_obj.get("remaining_uses", 0)) + 1, max_u)
+                ttl = await redis.ttl(inv_key) if hasattr(redis, "ttl") else fallback_ttl
+                ttl_sec = ttl if isinstance(ttl, int) and ttl > 0 else fallback_ttl
+                await redis.setex(inv_key, ttl_sec, json.dumps(inv_obj, ensure_ascii=False))
+            else:
+                restored = dict(consumed_inv)
+                restored["remaining_uses"] = 1
+                await redis.setex(inv_key, fallback_ttl, json.dumps(restored, ensure_ascii=False))
+            if hasattr(redis, "sadd"):
+                await redis.sadd(active_set_key, clean_code)
+            return True
+        except Exception:
+            return False
 
 # ==============================================================================
 # 보안 설정 & 타이밍 공격(Timing Attack) 방어용 상수
@@ -986,6 +1079,8 @@ async def register_user(
                 # [보안 1.5] Race Condition 방어: 학생/교사 가입 시 동시 요청으로 이미 UUID가 할당된 경우 롤백
                 if not is_admin and cur.rowcount != 1:
                     await conn.rollback()
+                    if code_to_consume and consumed_inv:
+                        await _refund_invitation_code_atomically(redis, code_to_consume, consumed_inv)
                     return error_response(409, "CONFLICT", "이미 가입 처리가 완료된 계정입니다.")
 
         await conn.commit()
@@ -995,14 +1090,7 @@ async def register_user(
     except Exception as e:
         await conn.rollback()
         if code_to_consume and consumed_inv:
-            try:
-                await redis.setex(
-                    f"invitation_code:{code_to_consume}",
-                    86400,
-                    json.dumps(consumed_inv, ensure_ascii=False),
-                )
-            except Exception:
-                pass
+            await _refund_invitation_code_atomically(redis, code_to_consume, consumed_inv)
         return error_response(500, "DATABASE_ERROR", "회원가입 처리 중 데이터베이스 오류가 발생했습니다.")
     finally:
         await conn.autocommit(True)

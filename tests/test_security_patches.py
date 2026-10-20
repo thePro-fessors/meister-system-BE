@@ -275,13 +275,13 @@ class TestSecurityPatches(unittest.IsolatedAsyncioTestCase):
         # 위조된 모든 헤더를 무시하고 실제 연결 소켓 IP를 반환해야 함
         self.assertEqual(get_client_ip(req_untrusted), "203.0.113.195")
 
-        # (2) 신뢰할 수 있는 로컬 리버스 프록시 (127.0.0.1) 경유
+        # (2) 신뢰할 수 있는 로컬 리버스 프록시 (127.0.0.1) 경유 (도커 브릿지 프록시 172.18.0.2 건너뜀)
         req_trusted_proxy = MagicMock()
         req_trusted_proxy.client.host = "127.0.0.1"
         req_trusted_proxy.headers = {
-            "X-Forwarded-For": "198.51.100.5, 10.0.0.2",
+            "X-Forwarded-For": "198.51.100.5, 172.18.0.2",
         }
-        # 체인 우측(10.0.0.2: 사설 프록시)을 건너뛰고 비신뢰 발신자 198.51.100.5를 추출해야 함
+        # 체인 우측(172.18.0.2: 도커 사설 프록시)을 건너뛰고 비신뢰 발신자 198.51.100.5를 추출해야 함
         self.assertEqual(get_client_ip(req_trusted_proxy), "198.51.100.5")
 
         # (3) Cloudflare 경유 시 TRUST_CLOUDFLARE_HEADERS=true 일 때만 CF-Connecting-IP 신뢰
@@ -709,17 +709,33 @@ class TestSecurityPatches(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(res_new.status_code, 200)
         await self.mock_redis.delete("user_token_revoked_at:student-uuid-1")
 
-        # (Item 5) 1회용 초대코드 원자적 차감 검증 (첫 번째 성공, 두 번째 즉시 None 반환)
+        # (Item 5) 1회용 초대코드 원자적 차감 및 환불(Rollback) 검증
+        from routers.auth import _refund_invitation_code_atomically
         inv_code = "TCH-07EA-ABCDEF"
+        payload_data = {"code": inv_code, "role": "teacher", "target_role": 1, "remaining_uses": 1, "max_uses": 1}
         await self.mock_redis.set(
             f"invitation_code:{inv_code}",
-            json.dumps({"code": inv_code, "role": "teacher", "target_role": 1, "remaining_uses": 1}),
+            json.dumps(payload_data),
             ex=3600,
         )
         first_use = await _consume_invitation_code_atomically(self.mock_redis, inv_code)
         self.assertIsNotNone(first_use)
         second_use = await _consume_invitation_code_atomically(self.mock_redis, inv_code)
         self.assertIsNone(second_use)
+
+        # 환불 처리 후 다시 1회 사용 가능한지 검증
+        refund_ok = await _refund_invitation_code_atomically(self.mock_redis, inv_code, first_use)
+        self.assertTrue(refund_ok)
+        re_use = await _consume_invitation_code_atomically(self.mock_redis, inv_code)
+        self.assertIsNotNone(re_use)
+        self.assertIsNone(await _consume_invitation_code_atomically(self.mock_redis, inv_code))
+
+        # (Private Client IP Spoofing 방어 검증)
+        from core.security import is_trusted_proxy
+        self.assertFalse(is_trusted_proxy("10.0.1.50"))
+        self.assertFalse(is_trusted_proxy("192.168.1.100"))
+        self.assertTrue(is_trusted_proxy("127.0.0.1"))
+        self.assertTrue(is_trusted_proxy("172.18.0.5"))
 
         # (Item 15) 숫자로만 이루어진 로그인 ID 가입 차단 (400 VALIDATION_ERROR)
         res_num_id = self.client.post(

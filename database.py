@@ -41,8 +41,17 @@ async def init_db_pool():
     if is_prod and not password:
         raise RuntimeError("[FATAL] 프로덕션 환경에서는 DATABASE_PASSWORD 환경변수가 반드시 설정되어야 합니다.")
     admin_reg_code = (os.getenv("ADMIN_REGISTRATION_CODE") or "").strip()
-    if is_prod and (not admin_reg_code or admin_reg_code == "MEISTER_ADMIN_2026!"):
-        raise RuntimeError("[FATAL] 프로덕션 환경에서는 안전한 ADMIN_REGISTRATION_CODE 환경변수가 설정되어야 합니다.")
+    if is_prod:
+        _admin_lower = admin_reg_code.lower()
+        if (
+            not admin_reg_code
+            or _admin_lower.startswith(("change_this", "generate_", "default_"))
+            or admin_reg_code == "MEISTER_ADMIN_2026!"
+            or len(admin_reg_code) < 16
+        ):
+            raise RuntimeError(
+                "[FATAL] 프로덕션 환경에서는 16자 이상의 안전하고 고유한 ADMIN_REGISTRATION_CODE(예시 템플릿 사용 불가)가 설정되어야 합니다."
+            )
     
     # 런타임 환경변수 동적 동기화
     DB_CONFIG["host"] = os.getenv("DATABASE_HOST") or DB_CONFIG.get("host", "localhost")

@@ -65,5 +65,5 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
 
 EXPOSE 8000
 
-# Gunicorn / UvicornWorker 실행 (프로덕션 4 워커, 신뢰된 사설망/프록시 대역만 X-Forwarded-For 허용)
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "4", "--proxy-headers", "--forwarded-allow-ips", "127.0.0.1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16"]
+# Gunicorn / UvicornWorker 실행 (프로덕션 4 워커, 신뢰된 도커 네트워크 대역만 X-Forwarded-For 허용)
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "4", "--proxy-headers", "--forwarded-allow-ips", "127.0.0.1,172.16.0.0/12"]

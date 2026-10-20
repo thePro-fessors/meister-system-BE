@@ -36,6 +36,16 @@ load_dotenv()
 JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY")
 if not JWT_SECRET_KEY:
     raise RuntimeError("ALERT: JWT_SECRET_KEY 환경 변수가 설정되지 않았습니다.")
+_is_prod = os.getenv("ENVIRONMENT") == "production" or os.getenv("PROD") == "true"
+if _is_prod:
+    _key_lower = JWT_SECRET_KEY.lower()
+    if (
+        _key_lower.startswith(("change_this", "generate_", "your_", "default_", "secret"))
+        or len(JWT_SECRET_KEY) < 32
+    ):
+        raise RuntimeError(
+            "[FATAL] 프로덕션 환경에서는 32자 이상의 안전하고 고유한 JWT_SECRET_KEY(예시 템플릿 사용 불가)가 설정되어야 합니다."
+        )
 JWT_ALGORITHM = os.getenv("JWT_ALGORITHM", "HS256")
 ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "240"))
 
@@ -61,12 +71,9 @@ _DEFAULT_TRUSTED_PROXIES = {
 }
 
 _PRIVATE_PROXIES = [
-    ipaddress.ip_network("10.0.0.0/8"),
-    ipaddress.ip_network("172.16.0.0/12"),
-    ipaddress.ip_network("192.168.0.0/16"),
     ipaddress.ip_network("127.0.0.0/8"),
+    ipaddress.ip_network("172.16.0.0/12"),
     ipaddress.ip_network("::1/128"),
-    ipaddress.ip_network("fc00::/7"),
 ]
 
 
