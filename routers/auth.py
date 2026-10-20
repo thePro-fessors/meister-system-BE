@@ -41,7 +41,85 @@ from core.email import send_otp_email, validate_email_format
 from core.logger import logger
 from database import get_db, get_redis
 from sr_format import *
-from core.security import create_access_token, get_current_user, get_client_ip
+from core.security import error_response, normalize_role, create_access_token, get_current_user, get_client_ip, revoke_all_user_tokens
+
+_INVITATION_FALLBACK_LOCK = asyncio.Lock()
+
+_CONSUME_INVITATION_LUA = """
+local raw = redis.call('GET', KEYS[1])
+if not raw then
+    return nil
+end
+local data = cjson.decode(raw)
+local rem = tonumber(data['remaining_uses'] or 0)
+if rem <= 0 then
+    redis.call('DEL', KEYS[1])
+    redis.call('SREM', KEYS[2], ARGV[1])
+    return nil
+end
+rem = rem - 1
+data['remaining_uses'] = rem
+if rem <= 0 then
+    redis.call('DEL', KEYS[1])
+    redis.call('SREM', KEYS[2], ARGV[1])
+else
+    local ttl = redis.call('TTL', KEYS[1])
+    local encoded = cjson.encode(data)
+    if ttl and ttl > 0 then
+        redis.call('SETEX', KEYS[1], ttl, encoded)
+    else
+        redis.call('SET', KEYS[1], encoded)
+    end
+end
+return raw
+"""
+
+
+async def _consume_invitation_code_atomically(redis: Any, code: str) -> Optional[dict]:
+    """Redis Lua 스크립트를 사용하여 초대코드 잔여 횟수 확인 및 차감을 단일 원자적 연산으로 처리합니다."""
+    clean_code = (code or "").strip().upper()
+    if not clean_code:
+        return None
+    inv_key = f"invitation_code:{clean_code}"
+    active_set_key = "invitation_codes:active"
+    if hasattr(redis, "eval"):
+        try:
+            raw_res = await redis.eval(_CONSUME_INVITATION_LUA, 2, inv_key, active_set_key, clean_code)
+            if not raw_res:
+                return None
+            val_str = raw_res.decode("utf-8") if isinstance(raw_res, bytes) else str(raw_res)
+            return json.loads(val_str)
+        except (AttributeError, NotImplementedError):
+            pass
+        except Exception as e:
+            logger.warning(f"[INVITATION_LUA_FALLBACK] eval fallback due to: {e}")
+
+    async with _INVITATION_FALLBACK_LOCK:
+        raw_inv = await redis.get(inv_key)
+        if not raw_inv:
+            return None
+        try:
+            val_str = raw_inv.decode("utf-8") if isinstance(raw_inv, bytes) else str(raw_inv)
+            inv_obj = json.loads(val_str)
+            rem = int(inv_obj.get("remaining_uses", 0))
+            if rem <= 0:
+                await redis.delete(inv_key)
+                if hasattr(redis, "srem"):
+                    await redis.srem(active_set_key, clean_code)
+                return None
+            original_obj = dict(inv_obj)
+            inv_obj["remaining_uses"] = rem - 1
+            if inv_obj["remaining_uses"] <= 0:
+                await redis.delete(inv_key)
+                if hasattr(redis, "srem"):
+                    await redis.srem(active_set_key, clean_code)
+            else:
+                ttl = await redis.ttl(inv_key) if hasattr(redis, "ttl") else 86400
+                ttl_sec = ttl if isinstance(ttl, int) and ttl > 0 else 86400
+                await redis.setex(inv_key, ttl_sec, json.dumps(inv_obj, ensure_ascii=False))
+            return original_obj
+        except Exception:
+            return None
 
 # ==============================================================================
 # 보안 설정 & 타이밍 공격(Timing Attack) 방어용 상수
@@ -188,18 +266,7 @@ async def login(
 
     login_id = (req.username or req.id or "").strip()
     if not login_id:
-        return JSONResponse(
-            status_code=400,
-            content=SrFormat(
-                status_code=400,
-                success=False,
-                data=None,
-                error=Error(
-                    code="VALIDATION_ERROR",
-                    message="아이디(username 또는 id)를 입력해주세요.",
-                ),
-            ).model_dump(),
-        )
+        return error_response(400, "VALIDATION_ERROR", "아이디(username 또는 id)를 입력해주세요.")
     req.username = login_id
 
     # ── [보안 1.1] IP별 분당 20회 요청 제한 (DoS 방어) ──
@@ -209,30 +276,22 @@ async def login(
         await redis.expire(ip_limit_key, 60)
     if ip_requests > 20:
         logger.warning(f"[LOGIN_IP_BLOCKED] IP={client_ip} 분당 20회 초과")
-        return JSONResponse(
-            status_code=429,
-            content=SrFormat(
-                status_code=429,
-                success=False,
-                data=None,
-                error=Error(
-                    code="TOO_MANY_REQUESTS",
-                    message="너무 많은 로그인 요청이 발생했습니다. 잠시 후 다시 시도해주세요."
-                )
-            ).model_dump()
-        )
+        return error_response(429, "TOO_MANY_REQUESTS", "너무 많은 로그인 요청이 발생했습니다. 잠시 후 다시 시도해주세요.")
 
-    # ── [보안 1.1] 계정별 연속 실패 잠금 확인 ──
-    account_lock_key = f"login_failures:{req.username}"
-    account_locked = await redis.get(account_lock_key)
+    # ── [보안 1.1] 계정+IP 복합 연속 실패 잠금 확인 (타 IP로부터의 계정 잠금 DoS 방어) ──
+    account_lock_key = f"login_failures:{req.username}:{client_ip}"
+    legacy_lock_key = f"login_failures:{req.username}"
+    account_locked = await redis.get(account_lock_key) or await redis.get(legacy_lock_key)
     if account_locked and int(account_locked) >= 5:
         lock_ttl = await redis.ttl(account_lock_key)
+        if not isinstance(lock_ttl, int) or lock_ttl < 0:
+            lock_ttl = await redis.ttl(legacy_lock_key)
         return JSONResponse(
             status_code=429,
             content=SrFormat(
                 status_code=429,
                 success=False,
-                data={"remainingSeconds": max(0, lock_ttl)},
+                data={"remainingSeconds": max(0, lock_ttl if isinstance(lock_ttl, int) else 0)},
                 error=Error(
                     code="ACCOUNT_LOCKED",
                     message="로그인 실패 횟수를 초과하였습니다. 잠시 후 다시 시도해주세요."
@@ -275,15 +334,7 @@ async def login(
                 user = await cur.fetchone()
         except Exception as fatal_err:
             logger.error(f"[LOGIN_DB_FATAL] DB connection error during login: {fatal_err}")
-            return JSONResponse(
-                status_code=500,
-                content=SrFormat(
-                    status_code=500,
-                    success=False,
-                    data=None,
-                    error=Error(code="INTERNAL_SERVER_ERROR", message="데이터베이스 통신 오류가 발생했습니다."),
-                ).model_dump(),
-            )
+            return error_response(500, "INTERNAL_SERVER_ERROR", "데이터베이스 통신 오류가 발생했습니다.")
 
     # 계정이 없을 경우 더미 해시 검증을 수행하여 유저 유무에 따른 시간차 공격 차단 (AUTH-03)
     hash_data = user["password"] if user else DUMMY_HASH
@@ -377,18 +428,7 @@ async def logout(
     exp = current_user.get("exp")
 
     if not jti or not exp:
-        return JSONResponse(
-            status_code=400,
-            content=SrFormat(
-                status_code=400,
-                success=False,
-                data=None,
-                error=Error(
-                    code="INVALID_TOKEN",
-                    message="토큰 정보가 올바르지 않습니다."
-                )
-            ).model_dump()
-        )
+        return error_response(400, "INVALID_TOKEN", "토큰 정보가 올바르지 않습니다.")
 
     now_ts = int(datetime.now(timezone.utc).timestamp())
     remaining_seconds = int(exp - now_ts)
@@ -423,18 +463,7 @@ async def get_my_info(
         await cur.execute(sql_cmd, (user_uuid,))
         user = await cur.fetchone()
         if not user:
-            return JSONResponse(
-                status_code=404,
-                content=SrFormat(
-                    status_code=404,
-                    success=False,
-                    data=None,
-                    error=Error(
-                        code="NOT_FOUND",
-                        message="유저를 찾을 수 없습니다."
-                    )
-                ).model_dump()
-            )
+            return error_response(404, "NOT_FOUND", "유저를 찾을 수 없습니다.")
 
     role_map = {0: "student", 1: "teacher", 2: "admin"}
     role_str = role_map.get(user["role"], "student")
@@ -514,18 +543,7 @@ async def send_otp(
     """
     clean_mail = (req.email or "").strip().lower()
     if not clean_mail or not validate_email_format(clean_mail):
-        return JSONResponse(
-            status_code=400,
-            content=SrFormat(
-                status_code=400,
-                success=False,
-                data=None,
-                error=Error(
-                    code="VALIDATION_ERROR",
-                    message="올바른 이메일 형식이 아닙니다."
-                )
-            ).model_dump()
-        )
+        return error_response(400, "VALIDATION_ERROR", "올바른 이메일 형식이 아닙니다.")
 
     client_ip = get_client_ip(request)
 
@@ -536,18 +554,7 @@ async def send_otp(
         await redis.expire(ip_otp_key, 3600)
     if ip_otp_count > 10:
         logger.warning(f"[OTP_IP_BLOCKED] IP={client_ip} 시간당 10회 초과")
-        return JSONResponse(
-            status_code=429,
-            content=SrFormat(
-                status_code=429,
-                success=False,
-                data=None,
-                error=Error(
-                    code="TOO_MANY_REQUESTS",
-                    message="해당 IP에서 너무 많은 인증 요청이 발생했습니다. 잠시 후 다시 시도해주세요."
-                )
-            ).model_dump()
-        )
+        return error_response(429, "TOO_MANY_REQUESTS", "해당 IP에서 너무 많은 인증 요청이 발생했습니다. 잠시 후 다시 시도해주세요.")
 
     # 60초 재발송 쿨다운 체크
     times = await redis.ttl(f"email_cooldown:{clean_mail}")
@@ -570,11 +577,11 @@ async def send_otp(
     await redis.setex(f"email_cooldown:{clean_mail}", 60, f"{datetime.now()}")
 
     # 목적별 분기 처리 (AUTH-01: 회원가입 vs 이메일 변경 OTP 분리 및 관리자 가입 코드 지원)
-    expected_admin_code = os.getenv("ADMIN_REGISTRATION_CODE", "MEISTER_ADMIN_2026!")
+    expected_admin_code = (os.getenv("ADMIN_REGISTRATION_CODE") or "").strip()
 
     if req.admin_code is not None and req.admin_code.strip():
         input_code = req.admin_code.strip()
-        is_env_match = secrets.compare_digest(input_code, expected_admin_code)
+        is_env_match = bool(expected_admin_code) and secrets.compare_digest(input_code, expected_admin_code)
         invitation_data = None
 
         if not is_env_match:
@@ -589,18 +596,7 @@ async def send_otp(
                     invitation_data = None
 
         if not is_env_match and not invitation_data:
-            return JSONResponse(
-                status_code=403,
-                content=SrFormat(
-                    status_code=403,
-                    success=False,
-                    data=None,
-                    error=Error(
-                        code="FORBIDDEN",
-                        message="가입 보안 코드 또는 초대 코드가 올바르지 않거나 만료되었습니다."
-                    )
-                ).model_dump()
-            )
+            return error_response(403, "FORBIDDEN", "가입 보안 코드 또는 초대 코드가 올바르지 않거나 만료되었습니다.")
 
         # 이미 users 테이블에 존재하는 이메일인지 중복 검사 (중복 시 409 DUPLICATE_EMAIL)
         async with conn.cursor(cursor=DictCursor) as cur:
@@ -608,18 +604,7 @@ async def send_otp(
             ex_u = await cur.fetchone()
 
         if ex_u:
-            return JSONResponse(
-                status_code=409,
-                content=SrFormat(
-                    status_code=409,
-                    success=False,
-                    data=None,
-                    error=Error(
-                        code="DUPLICATE_EMAIL",
-                        message="이미 가입된 관리자 또는 사용자 이메일입니다."
-                    )
-                ).model_dump()
-            )
+            return error_response(409, "DUPLICATE_EMAIL", "이미 가입된 관리자 또는 사용자 이메일입니다.")
 
         user_name = "관리자" if is_env_match else f"{invitation_data.get('role', '초대')} 가입자"
         otp_key = f"otp:{clean_mail}"
@@ -640,15 +625,7 @@ async def send_otp(
                 ex_u = await cur.fetchone()
 
         if ex_u:
-            return JSONResponse(
-                status_code=409,
-                content=SrFormat(
-                    status_code=409,
-                    success=False,
-                    data=None,
-                    error=Error(code="DUPLICATE_EMAIL", message="이미 사용 중이거나 등록된 이메일 주소입니다."),
-                ).model_dump(),
-            )
+            return error_response(409, "DUPLICATE_EMAIL", "이미 사용 중이거나 등록된 이메일 주소입니다.")
         user_name = "사용자"
         otp_key = f"otp:change_email:{clean_mail}"
     else:
@@ -681,31 +658,9 @@ async def send_otp(
                 datas = await cur.fetchone()
 
         if not datas:
-            return JSONResponse(
-                status_code=404,
-                content=SrFormat(
-                    status_code=404,
-                    success=False,
-                    data=None,
-                    error=Error(
-                        code="NOT_FOUND",
-                        message="유저를 찾을 수 없거나, 요청이 잘못 되었습니다."
-                    )
-                ).model_dump()
-            )
+            return error_response(404, "NOT_FOUND", "유저를 찾을 수 없거나, 요청이 잘못 되었습니다.")
         if datas.get("uuid") is not None:
-            return JSONResponse(
-                status_code=403,
-                content=SrFormat(
-                    status_code=403,
-                    success=False,
-                    data=None,
-                    error=Error(
-                        code="FORBIDDEN",
-                        message="이미 가입한 사용자입니다."
-                    )
-                ).model_dump()
-            )
+            return error_response(403, "FORBIDDEN", "이미 가입한 사용자입니다.")
         user_name = datas.get("name", "사용자")
         otp_key = f"otp:{clean_mail}"
 
@@ -742,18 +697,7 @@ async def verify_otp(req: VerifyOtpRequest, redis: aioredis.Redis = Depends(get_
     """
     clean_mail = (req.email or "").strip().lower()
     if not clean_mail or not req.verify_code or not validate_email_format(clean_mail):
-        return JSONResponse(
-            status_code=400,
-            content=SrFormat(
-                status_code=400,
-                success=False,
-                data=None,
-                error=Error(
-                    code="VALIDATION_ERROR",
-                    message="요청이 올바르지 않습니다."
-                )
-            ).model_dump()
-        )
+        return error_response(400, "VALIDATION_ERROR", "요청이 올바르지 않습니다.")
 
     clean_code = req.verify_code.strip()
 
@@ -773,34 +717,12 @@ async def verify_otp(req: VerifyOtpRequest, redis: aioredis.Redis = Depends(get_
     if attempts > 5:
         await redis.delete(otp_key)
         await redis.delete(attempt_key)
-        return JSONResponse(
-            status_code=429,
-            content=SrFormat(
-                status_code=429,
-                success=False,
-                data=None,
-                error=Error(
-                    code="TOO_MANY_REQUESTS",
-                    message="인증번호 입력 횟수를 초과하였습니다."
-                )
-            ).model_dump()
-        )
+        return error_response(429, "TOO_MANY_REQUESTS", "인증번호 입력 횟수를 초과하였습니다.")
 
     stored_otp = await redis.get(otp_key)
 
     if stored_otp is None:
-        return JSONResponse(
-            status_code=400,
-            content=SrFormat(
-                status_code=400,
-                success=False,
-                data=None,
-                error=Error(
-                    code="OTP_EXPIRED",
-                    message="인증번호가 만료되었거나, 발송되지 않았습니다."
-                )
-            ).model_dump()
-        )
+        return error_response(400, "OTP_EXPIRED", "인증번호가 만료되었거나, 발송되지 않았습니다.")
 
     if stored_otp != clean_code:
         remain = max(0, 5 - attempts)
@@ -893,51 +815,22 @@ async def register_user(
     """
     clean_mail = (req.email or "").strip().lower()
     if not clean_mail or not req.password or not req.id or not req.register_token or not validate_email_format(clean_mail):
-        return JSONResponse(
-            status_code=400,
-            content=SrFormat(
-                status_code=400,
-                success=False,
-                data=None,
-                error=Error(
-                    code="VALIDATION_ERROR",
-                    message="올바른 이메일 형식이 아니거나 필수 인자가 누락되었습니다."
-                )
-            ).model_dump()
-        )
+        return error_response(400, "VALIDATION_ERROR", "올바른 이메일 형식이 아니거나 필수 인자가 누락되었습니다.")
+
+    # 숫자 문자열 로그인 ID 금지 (students.student_id 정수 PK와의 식별자 충돌 원천 방어)
+    if req.id.strip().isdigit():
+        return error_response(400, "VALIDATION_ERROR", "로그인 아이디는 숫자로만 구성할 수 없습니다. 영문자를 포함해주세요.")
 
     # [보안 1.5] 비밀번호 복잡도 정규식/정책 검증
     if not validate_password_complexity(req.password):
-        return JSONResponse(
-            status_code=400,
-            content=SrFormat(
-                status_code=400,
-                success=False,
-                data=None,
-                error=Error(
-                    code="WEAK_PASSWORD",
-                    message="비밀번호는 영문자, 숫자, 특수문자 중 3종 이상 조합 시 8자 이상, 2종 이상 조합 시 10자 이상이어야 합니다."
-                )
-            ).model_dump()
-        )
+        return error_response(400, "WEAK_PASSWORD", "비밀번호는 영문자, 숫자, 특수문자 중 3종 이상 조합 시 8자 이상, 2종 이상 조합 시 10자 이상이어야 합니다.")
 
     stored_token = await redis.getdel(f"register_token:{clean_mail}")
     if stored_token is None or stored_token != req.register_token:
-        return JSONResponse(
-            status_code=401,
-            content=SrFormat(
-                status_code=401,
-                success=False,
-                data=None,
-                error=Error(
-                    code="INVALID_REGISTER_TOKEN",
-                    message="토큰이 만료되었거나, 올바르지 않습니다."
-                )
-            ).model_dump()
-        )
+        return error_response(401, "INVALID_REGISTER_TOKEN", "토큰이 만료되었거나, 올바르지 않습니다.")
 
     # 관리자/초대코드 가입 판별 (보안 코드 직접 제시 또는 Redis OTP 검증 플래그 확인)
-    expected_admin_code = os.getenv("ADMIN_REGISTRATION_CODE", "MEISTER_ADMIN_2026!")
+    expected_admin_code = (os.getenv("ADMIN_REGISTRATION_CODE") or "").strip()
     is_admin = False
     invitation_data = None
     code_to_consume = None
@@ -953,7 +846,7 @@ async def register_user(
 
     if req.admin_code is not None and req.admin_code.strip():
         input_code = req.admin_code.strip()
-        if secrets.compare_digest(input_code, expected_admin_code):
+        if bool(expected_admin_code) and secrets.compare_digest(input_code, expected_admin_code):
             is_admin = True
         else:
             raw_inv = await redis.get(f"invitation_code:{input_code.upper()}")
@@ -967,18 +860,7 @@ async def register_user(
                 except Exception:
                     pass
             if not is_admin and not invitation_data:
-                return JSONResponse(
-                    status_code=403,
-                    content=SrFormat(
-                        status_code=403,
-                        success=False,
-                        data=None,
-                        error=Error(
-                            code="FORBIDDEN",
-                            message="관리자 가입 보안 코드 또는 초대 코드가 올바르지 않습니다."
-                        )
-                    ).model_dump()
-                )
+                return error_response(403, "FORBIDDEN", "관리자 가입 보안 코드 또는 초대 코드가 올바르지 않습니다.")
 
     if not is_admin:
         admin_flag = await redis.get(f"otp:admin_reg:{clean_mail}")
@@ -994,34 +876,12 @@ async def register_user(
             # 이메일 중복 검사
             await cur.execute("SELECT uuid FROM users WHERE email = %s AND is_deleted = FALSE LIMIT 1", (clean_mail,))
             if await cur.fetchone():
-                return JSONResponse(
-                    status_code=409,
-                    content=SrFormat(
-                        status_code=409,
-                        success=False,
-                        data=None,
-                        error=Error(
-                            code="DUPLICATE_EMAIL",
-                            message="이미 가입된 이메일 주소입니다."
-                        )
-                    ).model_dump()
-                )
+                return error_response(409, "DUPLICATE_EMAIL", "이미 가입된 이메일 주소입니다.")
 
             # 아이디 중복 검사
             await cur.execute("SELECT uuid FROM users WHERE id = %s LIMIT 1", (req.id,))
             if await cur.fetchone():
-                return JSONResponse(
-                    status_code=409,
-                    content=SrFormat(
-                        status_code=409,
-                        success=False,
-                        data=None,
-                        error=Error(
-                            code="DUPLICATE_ID",
-                            message="이미 사용 중인 아이디입니다."
-                        )
-                    ).model_dump()
-                )
+                return error_response(409, "DUPLICATE_ID", "이미 사용 중인 아이디입니다.")
 
             # 교사 테이블에 동일 이메일이 존재하는지 확인 (있으면 uuid 연동)
             await cur.execute("SELECT teachers_id FROM teachers WHERE email = %s AND is_deleted = FALSE LIMIT 1", (clean_mail,))
@@ -1038,34 +898,12 @@ async def register_user(
             # 이메일 중복 검사
             await cur.execute("SELECT uuid FROM users WHERE email = %s AND is_deleted = FALSE LIMIT 1", (clean_mail,))
             if await cur.fetchone():
-                return JSONResponse(
-                    status_code=409,
-                    content=SrFormat(
-                        status_code=409,
-                        success=False,
-                        data=None,
-                        error=Error(
-                            code="DUPLICATE_EMAIL",
-                            message="이미 가입된 이메일 주소입니다."
-                        )
-                    ).model_dump()
-                )
+                return error_response(409, "DUPLICATE_EMAIL", "이미 가입된 이메일 주소입니다.")
 
             # 아이디 중복 검사
             await cur.execute("SELECT uuid FROM users WHERE id = %s LIMIT 1", (req.id,))
             if await cur.fetchone():
-                return JSONResponse(
-                    status_code=409,
-                    content=SrFormat(
-                        status_code=409,
-                        success=False,
-                        data=None,
-                        error=Error(
-                            code="DUPLICATE_ID",
-                            message="이미 사용 중인 아이디입니다."
-                        )
-                    ).model_dump()
-                )
+                return error_response(409, "DUPLICATE_ID", "이미 사용 중인 아이디입니다.")
 
             if inv_target_role == 1:
                 target_table = "teachers"
@@ -1093,18 +931,7 @@ async def register_user(
             student_row = await cur.fetchone()
             if student_row:
                 if student_row.get("uuid") is not None:
-                    return JSONResponse(
-                        status_code=403,
-                        content=SrFormat(
-                            status_code=403,
-                            success=False,
-                            data=None,
-                            error=Error(
-                                code="FORBIDDEN",
-                                message="이미 가입된 사용자입니다."
-                            )
-                        ).model_dump()
-                    )
+                    return error_response(403, "FORBIDDEN", "이미 가입된 사용자입니다.")
                 determined_role = 0
                 target_table = "students"
             else:
@@ -1113,68 +940,31 @@ async def register_user(
                 teacher_row = await cur.fetchone()
                 if teacher_row:
                     if teacher_row.get("uuid") is not None:
-                        return JSONResponse(
-                            status_code=403,
-                            content=SrFormat(
-                                status_code=403,
-                                success=False,
-                                data=None,
-                                error=Error(
-                                    code="FORBIDDEN",
-                                    message="이미 가입된 사용자입니다."
-                                )
-                            ).model_dump()
-                        )
+                        return error_response(403, "FORBIDDEN", "이미 가입된 사용자입니다.")
                     determined_role = 1
                     target_table = "teachers"
                 else:
-                    return JSONResponse(
-                        status_code=404,
-                        content=SrFormat(
-                            status_code=404,
-                            success=False,
-                            data=None,
-                            error=Error(
-                                code="NOT_FOUND",
-                                message="사전 등록된 학생 또는 교사 명단에서 이메일을 찾을 수 없습니다."
-                            )
-                        ).model_dump()
-                    )
+                    return error_response(404, "NOT_FOUND", "사전 등록된 학생 또는 교사 명단에서 이메일을 찾을 수 없습니다.")
 
             # 이메일 중복 검사
             await cur.execute("SELECT uuid FROM users WHERE email = %s AND is_deleted = FALSE LIMIT 1", (clean_mail,))
             if await cur.fetchone():
-                return JSONResponse(
-                    status_code=409,
-                    content=SrFormat(
-                        status_code=409,
-                        success=False,
-                        data=None,
-                        error=Error(
-                            code="DUPLICATE_EMAIL",
-                            message="이미 가입된 이메일 주소입니다."
-                        )
-                    ).model_dump()
-                )
+                return error_response(409, "DUPLICATE_EMAIL", "이미 가입된 이메일 주소입니다.")
 
             # 아이디 중복 검사
             await cur.execute("SELECT uuid FROM users WHERE id = %s LIMIT 1", (req.id,))
             if await cur.fetchone():
-                return JSONResponse(
-                    status_code=409,
-                    content=SrFormat(
-                        status_code=409,
-                        success=False,
-                        data=None,
-                        error=Error(
-                            code="DUPLICATE_ID",
-                            message="이미 사용 중인 아이디입니다."
-                        )
-                    ).model_dump()
-                )
+                return error_response(409, "DUPLICATE_ID", "이미 사용 중인 아이디입니다.")
 
     user_uuid = str(uuid.uuid4())
     user_pw = hash_password(req.password)
+
+    # 초대 코드가 사용된 경우 DB 커밋 직전 원자적으로 횟수 차감 (동시 가입 TOCTOU 차단)
+    consumed_inv = None
+    if code_to_consume:
+        consumed_inv = await _consume_invitation_code_atomically(redis, code_to_consume)
+        if not consumed_inv:
+            return error_response(403, "FORBIDDEN", "초대 코드가 만료되었거나 사용 가능 횟수가 모두 소진되었습니다.")
 
     # DB 트랜잭션 롤백 보장
     try:
@@ -1196,52 +986,24 @@ async def register_user(
                 # [보안 1.5] Race Condition 방어: 학생/교사 가입 시 동시 요청으로 이미 UUID가 할당된 경우 롤백
                 if not is_admin and cur.rowcount != 1:
                     await conn.rollback()
-                    return JSONResponse(
-                        status_code=409,
-                        content=SrFormat(
-                            status_code=409,
-                            success=False,
-                            data=None,
-                            error=Error(
-                                code="CONFLICT",
-                                message="이미 가입 처리가 완료된 계정입니다."
-                            )
-                        ).model_dump()
-                    )
+                    return error_response(409, "CONFLICT", "이미 가입 처리가 완료된 계정입니다.")
 
         await conn.commit()
         await redis.delete(f"otp:admin_reg:{clean_mail}")
         if code_to_consume:
-            raw_inv = await redis.get(f"invitation_code:{code_to_consume}")
-            if raw_inv:
-                try:
-                    val_str = raw_inv.decode("utf-8") if isinstance(raw_inv, bytes) else str(raw_inv)
-                    inv_obj = json.loads(val_str)
-                    inv_obj["remaining_uses"] = max(0, inv_obj.get("remaining_uses", 1) - 1)
-                    if inv_obj["remaining_uses"] <= 0:
-                        await redis.delete(f"invitation_code:{code_to_consume}")
-                        await redis.srem("invitation_codes:active", code_to_consume)
-                    else:
-                        ttl = await redis.ttl(f"invitation_code:{code_to_consume}")
-                        if ttl > 0:
-                            await redis.setex(f"invitation_code:{code_to_consume}", ttl, json.dumps(inv_obj, ensure_ascii=False))
-                except Exception:
-                    pass
             await redis.delete(f"otp:invite_meta:{clean_mail}")
     except Exception as e:
         await conn.rollback()
-        return JSONResponse(
-            status_code=500,
-            content=SrFormat(
-                status_code=500,
-                success=False,
-                data=None,
-                error=Error(
-                    code="DATABASE_ERROR",
-                    message="회원가입 처리 중 데이터베이스 오류가 발생했습니다."
+        if code_to_consume and consumed_inv:
+            try:
+                await redis.setex(
+                    f"invitation_code:{code_to_consume}",
+                    86400,
+                    json.dumps(consumed_inv, ensure_ascii=False),
                 )
-            ).model_dump()
-        )
+            except Exception:
+                pass
+        return error_response(500, "DATABASE_ERROR", "회원가입 처리 중 데이터베이스 오류가 발생했습니다.")
     finally:
         await conn.autocommit(True)
 
@@ -1286,36 +1048,14 @@ async def patch_email(
     token_val = req.email_change_token or req.emailChangeToken or req.register_token or req.registerToken
     clean_mail = (req.email or "").strip().lower()
     if not clean_mail or not req.password or not token_val or not validate_email_format(clean_mail):
-        return JSONResponse(
-            status_code=400,
-            content=SrFormat(
-                status_code=400,
-                success=False,
-                data=None,
-                error=Error(
-                    code="VALIDATION_ERROR",
-                    message="올바른 이메일 형식이 아니거나 필수 인자가 누락되었습니다."
-                )
-            ).model_dump()
-        )
+        return error_response(400, "VALIDATION_ERROR", "올바른 이메일 형식이 아니거나 필수 인자가 누락되었습니다.")
 
     # 1. 새 이메일 인증 토큰 원자적 검증 및 소비 (AUTH-01, AUTH-02)
     stored_token = await redis.getdel(f"email_change_token:{clean_mail}")
     if not stored_token:
         stored_token = await redis.getdel(f"register_token:{clean_mail}")
     if stored_token is None or stored_token != token_val:
-        return JSONResponse(
-            status_code=401,
-            content=SrFormat(
-                status_code=401,
-                success=False,
-                data=None,
-                error=Error(
-                    code="INVALID_REGISTER_TOKEN",
-                    message="토큰이 만료되었거나, 올바르지 않습니다."
-                )
-            ).model_dump()
-        )
+        return error_response(401, "INVALID_REGISTER_TOKEN", "토큰이 만료되었거나, 올바르지 않습니다.")
 
     # 2. 이메일 중복 및 사용자/비밀번호 검증
     #    [보안 1.4] users뿐 아니라 students, teachers 테이블도 중복 검사
@@ -1337,46 +1077,13 @@ async def patch_email(
         user_data = await cur.fetchone()
 
     if existing_user is not None:
-        return JSONResponse(
-            status_code=409,
-            content=SrFormat(
-                status_code=409,
-                success=False,
-                data=None,
-                error=Error(
-                    code="DUPLICATE_EMAIL",
-                    message="이미 사용 중인 이메일입니다."
-                )
-            ).model_dump()
-        )
+        return error_response(409, "DUPLICATE_EMAIL", "이미 사용 중인 이메일입니다.")
 
     if user_data is None:
-        return JSONResponse(
-            status_code=404,
-            content=SrFormat(
-                status_code=404,
-                success=False,
-                data=None,
-                error=Error(
-                    code="NOT_FOUND",
-                    message="사용자를 찾을 수 없습니다."
-                )
-            ).model_dump()
-        )
+        return error_response(404, "NOT_FOUND", "사용자를 찾을 수 없습니다.")
 
     if not await verify_password(req.password, user_data["password"]):
-        return JSONResponse(
-            status_code=401,
-            content=SrFormat(
-                status_code=401,
-                success=False,
-                data=None,
-                error=Error(
-                    code="INVALID_CREDENTIAL",
-                    message="비밀번호가 일치하지 않습니다."
-                )
-            ).model_dump()
-        )
+        return error_response(401, "INVALID_CREDENTIAL", "비밀번호가 일치하지 않습니다.")
 
     # 4. 트랜잭션 기반 이메일 업데이트
     #    [보안 1.4] users와 대상 테이블(students/teachers)의 이메일을 원자적으로 동시 UPDATE
@@ -1408,18 +1115,7 @@ async def patch_email(
         await conn.commit()
     except Exception as e:
         await conn.rollback()
-        return JSONResponse(
-            status_code=500,
-            content=SrFormat(
-                status_code=500,
-                success=False,
-                data=None,
-                error=Error(
-                    code="DATABASE_ERROR",
-                    message="이메일 업데이트 중 데이터베이스 오류가 발생했습니다."
-                )
-            ).model_dump()
-        )
+        return error_response(500, "DATABASE_ERROR", "이메일 업데이트 중 데이터베이스 오류가 발생했습니다.")
     finally:
         await conn.autocommit(True)
 
@@ -1446,51 +1142,45 @@ async def patch_password(
     req: PatchPasswordRequest,
     current_user: dict = Depends(get_current_user),
     conn: asyncmy.Connection = Depends(get_db),
+    redis: aioredis.Redis = Depends(get_redis),
 ):
     uuid_val = current_user["uuid"]
     if not req.current_password or not req.new_password:
-        return JSONResponse(
-            status_code=400,
-            content=SrFormat(
-                status_code=400,
-                success=False,
-                data=None,
-                error=Error(code="VALIDATION_ERROR", message="현재 비밀번호와 새 비밀번호를 모두 입력해주세요."),
-            ).model_dump(),
-        )
+        return error_response(400, "VALIDATION_ERROR", "현재 비밀번호와 새 비밀번호를 모두 입력해주세요.")
     if not validate_password_complexity(req.new_password):
-        return JSONResponse(
-            status_code=400,
-            content=SrFormat(
-                status_code=400,
-                success=False,
-                data=None,
-                error=Error(
-                    code="WEAK_PASSWORD",
-                    message="새 비밀번호는 영문·숫자·특수문자 3종 조합 8자 이상(또는 2종 조합 10자 이상)이어야 합니다.",
-                ),
-            ).model_dump(),
-        )
+        return error_response(400, "WEAK_PASSWORD", "새 비밀번호는 영문·숫자·특수문자 3종 조합 8자 이상(또는 2종 조합 10자 이상)이어야 합니다.")
     async with conn.cursor(cursor=DictCursor) as cur:
         await cur.execute("SELECT password FROM users WHERE uuid = %s AND is_deleted = FALSE LIMIT 1", (uuid_val,))
         row = await cur.fetchone()
     if not row or not await verify_password(req.current_password, row["password"]):
-        return JSONResponse(
-            status_code=401,
-            content=SrFormat(
-                status_code=401,
-                success=False,
-                data=None,
-                error=Error(code="INVALID_CREDENTIAL", message="현재 비밀번호가 일치하지 않습니다."),
-            ).model_dump(),
-        )
+        return error_response(401, "INVALID_CREDENTIAL", "현재 비밀번호가 일치하지 않습니다.")
     hashed_new = await asyncio.to_thread(hash_password, req.new_password)
     async with conn.cursor(cursor=DictCursor) as cur:
         await cur.execute("UPDATE users SET password = %s WHERE uuid = %s AND is_deleted = FALSE", (hashed_new, uuid_val))
     await conn.commit()
+
+    new_jti = str(uuid.uuid4())
+    new_token = create_access_token(
+        data={
+            "sub": uuid_val,
+            "id": current_user.get("id"),
+            "role": current_user.get("role"),
+            "jti": new_jti,
+        }
+    )
+    await revoke_all_user_tokens(
+        redis=redis,
+        user_uuid=uuid_val,
+        current_jti=current_user.get("jti"),
+        exempt_jti=new_jti,
+    )
+
     return SrFormat(
         status_code=200,
         success=True,
-        data={"message": "비밀번호가 성공적으로 변경되었습니다."},
+        data={
+            "message": "비밀번호가 성공적으로 변경되었습니다.",
+            "token": new_token,
+        },
     ).model_dump()
 

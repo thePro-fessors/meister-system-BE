@@ -11,7 +11,8 @@ from typing import Any, Dict, Optional, Union
 
 from fastapi import APIRouter, Depends, Query
 
-from core.security import get_current_user
+import core.authorization as authz
+from core.security import error_response, normalize_role, get_current_user
 from database import get_db
 from routers.students import handle_get_points
 from sr_format import SrFormat
@@ -117,30 +118,13 @@ async def create_point(
         )
     )
     if raw_target_id is None:
-        return JSONResponse(
-            status_code=400,
-            content=SrFormat(
-                status_code=400,
-                success=False,
-                data=None,
-                error=Error(code="VALIDATION_ERROR", message="학생 식별자(studentId)가 필요합니다."),
-            ).model_dump(),
-        )
+        return error_response(400, "VALIDATION_ERROR", "학생 식별자(studentId)가 필요합니다.")
 
-    from core.authorization import authorize_student_access, resolve_student_id
-    target_student_id = await resolve_student_id(conn, raw_target_id)
+    target_student_id = await authz.resolve_student_id(conn, raw_target_id)
     if target_student_id is None:
-        return JSONResponse(
-            status_code=404,
-            content=SrFormat(
-                status_code=404,
-                success=False,
-                data=None,
-                error=Error(code="USER_NOT_FOUND", message="해당 학생을 찾을 수 없습니다."),
-            ).model_dump(),
-        )
+        return error_response(404, "USER_NOT_FOUND", "해당 학생을 찾을 수 없습니다.")
 
-    auth_err = await authorize_student_access(current_user, target_student_id, conn, action="manage_points")
+    auth_err = await authz.authorize_student_access(current_user, target_student_id, conn, action="manage_points")
     if auth_err:
         return auth_err
 
@@ -157,28 +141,12 @@ async def create_point(
     # 입력 점수 추출 (points 또는 score)
     raw_points = req.points if req.points is not None else req.score
     if raw_points is None:
-        return JSONResponse(
-            status_code=400,
-            content=SrFormat(
-                status_code=400,
-                success=False,
-                data=None,
-                error=Error(code="VALIDATION_ERROR", message="상벌점 점수(score/points)는 필수 입력 항목입니다."),
-            ).model_dump(),
-        )
+        return error_response(400, "VALIDATION_ERROR", "상벌점 점수(score/points)는 필수 입력 항목입니다.")
 
-    # 점수 상하한선 방어 검증 (0 초과 100 이하, 음수로 들어온 경우 절댓값 기준 허용)
+    # 점수 상하한선 및 정수 규칙 검증 (FE validPointMagnitude와 통일: 1~5 정수, 음수로 들어온 경우 절댓값 기준 허용)
     abs_points = abs(raw_points)
-    if abs_points <= 0 or abs_points > 100:
-        return JSONResponse(
-            status_code=400,
-            content=SrFormat(
-                status_code=400,
-                success=False,
-                data=None,
-                error=Error(code="VALIDATION_ERROR", message="상벌점 점수는 0 초과 100 이하의 숫자여야 합니다."),
-            ).model_dump(),
-        )
+    if abs_points < 1 or abs_points > 5 or not float(abs_points).is_integer():
+        return error_response(400, "VALIDATION_ERROR", "상벌점 점수는 1 이상 5 이하의 정수여야 합니다.")
 
     # 부호 및 구분 정규화 (SCORE-02 & FE 호환: 점수가 음수이면 자동으로 벌점으로 판정)
     raw_type = (req.type or "").strip().upper()
@@ -192,30 +160,13 @@ async def create_point(
         norm_type = "-"
         norm_score = -abs_points
     else:
-        return JSONResponse(
-            status_code=400,
-            content=SrFormat(
-                status_code=400,
-                success=False,
-                data=None,
-                error=Error(code="VALIDATION_ERROR", message="상벌점 유형은 상점(MERIT/+) 또는 벌점(DEMERIT/-)이어야 합니다."),
-            ).model_dump(),
-        )
+        return error_response(400, "VALIDATION_ERROR", "상벌점 유형은 상점(MERIT/+) 또는 벌점(DEMERIT/-)이어야 합니다.")
 
-    # 사유(reason) 필수 검증 및 XSS 방어 (SECURITY_AND_AUDIT.md & TODO.md 3.7)
+    # 사유(reason) 필수 검증 (출력 시점 이스케이프 원칙에 따라 저장 시점 html.escape 제거)
     raw_reason = (req.reason or "").strip()
     if not raw_reason:
-        return JSONResponse(
-            status_code=400,
-            content=SrFormat(
-                status_code=400,
-                success=False,
-                data=None,
-                error=Error(code="VALIDATION_ERROR", message="상벌점 부여 사유(reason)는 필수 입력 항목입니다."),
-            ).model_dump(),
-        )
-    import html
-    escaped_reason = html.escape(raw_reason)
+        return error_response(400, "VALIDATION_ERROR", "상벌점 부여 사유(reason)는 필수 입력 항목입니다.")
+    escaped_reason = raw_reason
 
     occ_date = req.occurred_at or req.occurredAt or req.date or req.issued_date or req.issuedDate
     rel_area = req.related_area or req.relatedArea or req.reflected_area or req.reflectedArea
@@ -251,8 +202,6 @@ async def create_point(
         raise
     finally:
         await conn.autocommit(True)
-
-    from datetime import datetime
 
     # 학생 계정 ID(users.id) 및 성명 조회 (FE 호환성)
     student_user_id = None
@@ -335,21 +284,12 @@ async def update_point(
         existing = await cur.fetchone()
 
     if not existing:
-        return JSONResponse(
-            status_code=404,
-            content=SrFormat(
-                status_code=404,
-                success=False,
-                data=None,
-                error=Error(code="ITEM_NOT_FOUND", message="해당 상벌점 내역을 찾을 수 없습니다."),
-            ).model_dump(),
-        )
+        return error_response(404, "ITEM_NOT_FOUND", "해당 상벌점 내역을 찾을 수 없습니다.")
 
-    from core.authorization import authorize_point_mutation, authorize_student_access
-    auth_err = await authorize_student_access(current_user, existing["student_id"], conn, action="manage_points")
+    auth_err = await authz.authorize_student_access(current_user, existing["student_id"], conn, action="manage_points")
     if auth_err:
         return auth_err
-    mut_err = await authorize_point_mutation(current_user, existing, conn, action="modify")
+    mut_err = await authz.authorize_point_mutation(current_user, existing, conn, action="modify")
     if mut_err:
         return mut_err
 
@@ -369,16 +309,8 @@ async def update_point(
     input_points = req.points if req.points is not None else req.score
     if input_points is not None:
         abs_pts = abs(input_points)
-        if abs_pts <= 0 or abs_pts > 100:
-            return JSONResponse(
-                status_code=400,
-                content=SrFormat(
-                    status_code=400,
-                    success=False,
-                    data=None,
-                    error=Error(code="VALIDATION_ERROR", message="상벌점 점수는 0 초과 100 이하의 숫자여야 합니다."),
-                ).model_dump(),
-            )
+        if abs_pts < 1 or abs_pts > 5 or not float(abs_pts).is_integer():
+            return error_response(400, "VALIDATION_ERROR", "상벌점 점수는 1 이상 5 이하의 정수여야 합니다.")
         # FE가 score에 부호를 명시하여 전송한 경우 자동 타입 보정
         if req.score is not None and req.type is None:
             if req.score < 0:
@@ -395,17 +327,8 @@ async def update_point(
     if req.reason is not None:
         raw_reason = req.reason.strip()
         if not raw_reason:
-            return JSONResponse(
-                status_code=400,
-                content=SrFormat(
-                    status_code=400,
-                    success=False,
-                    data=None,
-                    error=Error(code="VALIDATION_ERROR", message="수정 사유는 빈 문자열일 수 없습니다."),
-                ).model_dump(),
-            )
-        import html
-        new_reason = html.escape(raw_reason)
+            return error_response(400, "VALIDATION_ERROR", "수정 사유는 빈 문자열일 수 없습니다.")
+        new_reason = raw_reason
     else:
         new_reason = existing["reason"]
 
@@ -520,27 +443,17 @@ async def delete_point(
         existing = await cur.fetchone()
 
     if not existing:
-        return JSONResponse(
-            status_code=404,
-            content=SrFormat(
-                status_code=404,
-                success=False,
-                data=None,
-                error=Error(code="ITEM_NOT_FOUND", message="해당 상벌점 내역을 찾을 수 없습니다."),
-            ).model_dump(),
-        )
+        return error_response(404, "ITEM_NOT_FOUND", "해당 상벌점 내역을 찾을 수 없습니다.")
 
-    from core.authorization import authorize_point_mutation, authorize_student_access
-    auth_err = await authorize_student_access(current_user, existing["student_id"], conn, action="manage_points")
+    auth_err = await authz.authorize_student_access(current_user, existing["student_id"], conn, action="manage_points")
     if auth_err:
         return auth_err
-    mut_err = await authorize_point_mutation(current_user, existing, conn, action="delete")
+    mut_err = await authz.authorize_point_mutation(current_user, existing, conn, action="delete")
     if mut_err:
         return mut_err
 
     user_uuid = current_user.get("uuid") or current_user.get("sub")
-    import html
-    del_reason = html.escape((reason or "상벌점 삭제").strip())
+    del_reason = (reason or "상벌점 삭제").strip()
 
     try:
         await conn.autocommit(False)

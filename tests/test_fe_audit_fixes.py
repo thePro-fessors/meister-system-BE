@@ -289,12 +289,15 @@ class TestFEAuditFixes(unittest.TestCase):
                     self.row = {
                         "merits_point_id": 5,
                         "student_id": 1,
+                        "teachers_id": 10,
                         "type": "+",
                         "points": 5.0,
                         "reason": "원래 사유",
                         "related_area": "인성",
                         "occurred_at": "2026-04-01",
                     }
+                elif "FROM teachers" in q:
+                    self.row = {"teachers_id": 10, "position": "정담임"}
                 elif "UPDATE merits" in q:
                     updated_points["type"] = params[0]
                     updated_points["points"] = params[1]
@@ -310,24 +313,24 @@ class TestFEAuditFixes(unittest.TestCase):
 
         token_teacher = create_access_token({"sub": "teacher-1", "id": "t1", "role": "teacher"})
         with patch("core.authorization.authorize_student_access", new=AsyncMock(return_value=None)):
-            # 1. FE score 필드로 양수 10점 수정
+            # 1. FE score 필드로 양수 4점 수정
             res1 = self.client.patch(
                 "/api/points/5",
                 headers={"Authorization": f"Bearer {token_teacher}"},
-                json={"score": 10.0, "reason": "우수 활동 점수 상향"},
+                json={"score": 4.0, "reason": "우수 활동 점수 상향"},
             )
             self.assertEqual(res1.status_code, 200)
-            self.assertEqual(updated_points["points"], 10.0)
+            self.assertEqual(updated_points["points"], 4.0)
             self.assertEqual(updated_points["type"], "+")
 
-            # 2. FE score 필드로 음수 벌점(-15) 수정
+            # 2. FE score 필드로 음수 벌점(-3) 수정
             res2 = self.client.patch(
                 "/api/points/5",
                 headers={"Authorization": f"Bearer {token_teacher}"},
-                json={"score": -15.0, "reason": "지각 벌점 반영"},
+                json={"score": -3.0, "reason": "지각 벌점 반영"},
             )
             self.assertEqual(res2.status_code, 200)
-            self.assertEqual(updated_points["points"], -15.0)
+            self.assertEqual(updated_points["points"], -3.0)
             self.assertEqual(updated_points["type"], "-")
 
             # 3. 절댓값 범위 초과(150점) -> 400 거부

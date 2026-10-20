@@ -1,3 +1,4 @@
+from core.security import error_response, normalize_role
 """
 core/authorization.py - 중앙 집중식 학생 리소스 인가(Authorization) 및 권한 제어 모듈
 (SEC-01: 모든 학생 리소스에 동일한 교사 권한 범위 적용)
@@ -22,7 +23,7 @@ async def resolve_student_id(conn: Any, identifier: Any) -> Optional[int]:
     if not s_val:
         return None
 
-    # 1. 정수형이거나 숫자 문자열인 경우 우선 students.student_id 직접 확인
+    # 1. 정수형이거나 숫자 문자열인 경우 오직 students.student_id PK만 확인 (숫자형 로그인 ID와의 모호성 및 충돌 원천 차단)
     if isinstance(identifier, int) or s_val.isdigit():
         try:
             int_id = int(s_val)
@@ -36,8 +37,40 @@ async def resolve_student_id(conn: Any, identifier: Any) -> Optional[int]:
                     return row["student_id"] if isinstance(row, dict) else row[0]
         except Exception:
             pass
+        return None
 
-    # 2. users.id (문자열 로그인 ID e.g. "student1", "student2") 또는 users.uuid / students.uuid 로 매핑
+    # 2. 이메일 형식(@ 포함)인 경우 이메일로만 매핑
+    if "@" in s_val:
+        async with conn.cursor(cursor=DictCursor) as cur:
+            try:
+                await cur.execute(
+                    "SELECT student_id FROM students WHERE email = %s AND is_deleted = FALSE LIMIT 1",
+                    (s_val,),
+                )
+                row = await cur.fetchone()
+                if row:
+                    return row["student_id"] if isinstance(row, dict) else row[0]
+            except Exception:
+                pass
+            try:
+                await cur.execute(
+                    """
+                    SELECT s.student_id 
+                    FROM students s 
+                    JOIN users u ON s.uuid = u.uuid 
+                    WHERE u.email = %s AND s.is_deleted = FALSE 
+                    LIMIT 1
+                    """,
+                    (s_val,),
+                )
+                row = await cur.fetchone()
+                if row:
+                    return row["student_id"] if isinstance(row, dict) else row[0]
+            except Exception:
+                pass
+        return None
+
+    # 3. UUID 또는 로그인 ID(users.id) 매핑
     async with conn.cursor(cursor=DictCursor) as cur:
         # (1) users 테이블의 로그인 ID(id)로 학생 매핑
         try:
@@ -61,36 +94,6 @@ async def resolve_student_id(conn: Any, identifier: Any) -> Optional[int]:
         try:
             await cur.execute(
                 "SELECT student_id FROM students WHERE uuid = %s AND is_deleted = FALSE LIMIT 1",
-                (s_val,),
-            )
-            row = await cur.fetchone()
-            if row:
-                return row["student_id"] if isinstance(row, dict) else row[0]
-        except Exception:
-            pass
-
-        # (3) students.email 로 매핑
-        try:
-            await cur.execute(
-                "SELECT student_id FROM students WHERE email = %s AND is_deleted = FALSE LIMIT 1",
-                (s_val,),
-            )
-            row = await cur.fetchone()
-            if row:
-                return row["student_id"] if isinstance(row, dict) else row[0]
-        except Exception:
-            pass
-
-        # (4) users.email 로 매핑
-        try:
-            await cur.execute(
-                """
-                SELECT s.student_id 
-                FROM students s 
-                JOIN users u ON s.uuid = u.uuid 
-                WHERE u.email = %s AND s.is_deleted = FALSE 
-                LIMIT 1
-                """,
                 (s_val,),
             )
             row = await cur.fetchone()
@@ -167,23 +170,15 @@ async def authorize_student_access(
     if not isinstance(student_id, int):
         resolved = await resolve_student_id(conn, student_id)
         if resolved is None:
-            return JSONResponse(
-                status_code=404,
-                content=SrFormat(
-                    status_code=404,
-                    success=False,
-                    data=None,
-                    error=Error(code="USER_NOT_FOUND", message="학생 계정 정보를 찾을 수 없습니다."),
-                ).model_dump(),
-            )
+            return error_response(404, "USER_NOT_FOUND", "학생 계정 정보를 찾을 수 없습니다.")
         student_id = resolved
     actor_role = actor.get("role")
     actor_uuid = actor.get("uuid") or actor.get("sub")
 
     # 1. 역할 정규화
-    is_admin = actor_role in ("admin", 2, "2")
-    is_teacher = actor_role in ("teacher", 1, "1")
-    is_student = actor_role in ("student", 0, "0")
+    is_admin = normalize_role(actor_role) == "admin"
+    is_teacher = normalize_role(actor_role) == "teacher"
+    is_student = normalize_role(actor_role) == "student"
 
     if is_admin:
         return None
@@ -191,15 +186,7 @@ async def authorize_student_access(
     # 2. 학생 역할 인가 검증
     if is_student:
         if action in ("review", "approve", "reject", "score_modify", "manage_points"):
-            return JSONResponse(
-                status_code=403,
-                content=SrFormat(
-                    status_code=403,
-                    success=False,
-                    data=None,
-                    error=Error(code="FORBIDDEN", message="학생은 심사 또는 상벌점 관리 권한이 없습니다."),
-                ).model_dump(),
-            )
+            return error_response(403, "FORBIDDEN", "학생은 심사 또는 상벌점 관리 권한이 없습니다.")
 
         async with conn.cursor(cursor=DictCursor) as cur:
             await cur.execute(
@@ -216,48 +203,16 @@ async def authorize_student_access(
                 if target_st and target_st.get("uuid") == actor_uuid:
                     return None
                 if target_st and target_st.get("uuid") != actor_uuid:
-                    return JSONResponse(
-                        status_code=403,
-                        content=SrFormat(
-                            status_code=403,
-                            success=False,
-                            data=None,
-                            error=Error(code="FORBIDDEN", message="본인의 데이터만 접근할 수 있습니다."),
-                        ).model_dump(),
-                    )
-                return JSONResponse(
-                    status_code=404,
-                    content=SrFormat(
-                        status_code=404,
-                        success=False,
-                        data=None,
-                        error=Error(code="USER_NOT_FOUND", message="학생 계정 정보를 찾을 수 없습니다."),
-                    ).model_dump(),
-                )
+                    return error_response(403, "FORBIDDEN", "본인의 데이터만 접근할 수 있습니다.")
+                return error_response(404, "USER_NOT_FOUND", "학생 계정 정보를 찾을 수 없습니다.")
             if st_row["student_id"] != student_id:
-                return JSONResponse(
-                    status_code=403,
-                    content=SrFormat(
-                        status_code=403,
-                        success=False,
-                        data=None,
-                        error=Error(code="FORBIDDEN", message="본인의 데이터만 접근할 수 있습니다."),
-                    ).model_dump(),
-                )
+                return error_response(403, "FORBIDDEN", "본인의 데이터만 접근할 수 있습니다.")
         return None
 
     # 3. 교사 역할 인가 검증
     if is_teacher:
         if action in ("student_submit", "student_resubmit", "student_delete"):
-            return JSONResponse(
-                status_code=403,
-                content=SrFormat(
-                    status_code=403,
-                    success=False,
-                    data=None,
-                    error=Error(code="FORBIDDEN", message="교사는 학생 본인 제출/삭제 작업을 직접 수행할 수 없습니다."),
-                ).model_dump(),
-            )
+            return error_response(403, "FORBIDDEN", "교사는 학생 본인 제출/삭제 작업을 직접 수행할 수 없습니다.")
 
         async with conn.cursor(cursor=DictCursor) as cur:
             await cur.execute(
@@ -266,15 +221,7 @@ async def authorize_student_access(
             )
             t_row = await cur.fetchone()
             if not t_row:
-                return JSONResponse(
-                    status_code=404,
-                    content=SrFormat(
-                        status_code=404,
-                        success=False,
-                        data=None,
-                        error=Error(code="TEACHER_NOT_FOUND", message="교사 정보를 찾을 수 없습니다."),
-                    ).model_dump(),
-                )
+                return error_response(404, "TEACHER_NOT_FOUND", "교사 정보를 찾을 수 없습니다.")
 
         t_grade = t_row.get("grade")
         t_class = t_row.get("class")
@@ -297,15 +244,7 @@ async def authorize_student_access(
         if t_position == "학년부장" and t_grade is not None:
             academic_record = await get_student_academic_record(student_id, conn, year)
             if not academic_record or academic_record.get("grade") != t_grade:
-                return JSONResponse(
-                    status_code=403,
-                    content=SrFormat(
-                        status_code=403,
-                        success=False,
-                        data=None,
-                        error=Error(code="FORBIDDEN", message=f"{t_grade}학년 학생의 데이터만 관리할 수 있습니다."),
-                    ).model_dump(),
-                )
+                return error_response(403, "FORBIDDEN", f"{t_grade}학년 학생의 데이터만 관리할 수 있습니다.")
             return None
 
         # [정책 4] 담임교사(정담임, 부담임, 임시담임): 담당 학급 학생 접근 허용
@@ -316,41 +255,17 @@ async def authorize_student_access(
             else:
                 academic_record = await get_student_academic_record(student_id, conn, year)
                 if not academic_record:
-                    return JSONResponse(
-                        status_code=404,
-                        content=SrFormat(
-                            status_code=404,
-                            success=False,
-                            data=None,
-                            error=Error(code="USER_NOT_FOUND", message="해당 학년도의 학생 학적 정보를 찾을 수 없습니다."),
-                        ).model_dump(),
-                    )
+                    return error_response(404, "USER_NOT_FOUND", "해당 학년도의 학생 학적 정보를 찾을 수 없습니다.")
 
                 st_grade = academic_record.get("grade")
                 st_class = academic_record.get("class_no")
                 if st_grade != t_grade or st_class != t_class:
-                    return JSONResponse(
-                        status_code=403,
-                        content=SrFormat(
-                            status_code=403,
-                            success=False,
-                            data=None,
-                            error=Error(code="FORBIDDEN", message="담당 학급 학생의 데이터만 접근할 수 있습니다."),
-                        ).model_dump(),
-                    )
+                    return error_response(403, "FORBIDDEN", "담당 학급 학생의 데이터만 접근할 수 있습니다.")
 
         return None
 
     # 4. 알 수 없는 역할 차단
-    return JSONResponse(
-        status_code=403,
-        content=SrFormat(
-            status_code=403,
-            success=False,
-            data=None,
-            error=Error(code="FORBIDDEN", message="유효하지 않은 권한 역할입니다."),
-        ).model_dump(),
-    )
+    return error_response(403, "FORBIDDEN", "유효하지 않은 권한 역할입니다.")
 
 
 async def authorize_point_mutation(
@@ -365,21 +280,13 @@ async def authorize_point_mutation(
     """
     actor_role = actor.get("role")
     actor_uuid = actor.get("uuid") or actor.get("sub")
-    is_admin = actor_role in ("admin", 2, "2")
+    is_admin = normalize_role(actor_role) == "admin"
     if is_admin:
         return None
 
-    is_teacher = actor_role in ("teacher", 1, "1")
+    is_teacher = normalize_role(actor_role) == "teacher"
     if not is_teacher:
-        return JSONResponse(
-            status_code=403,
-            content=SrFormat(
-                status_code=403,
-                success=False,
-                data=None,
-                error=Error(code="FORBIDDEN", message="상벌점 수정/삭제 권한이 없습니다."),
-            ).model_dump(),
-        )
+        return error_response(403, "FORBIDDEN", "상벌점 수정/삭제 권한이 없습니다.")
 
     async with conn.cursor(cursor=DictCursor) as cur:
         await cur.execute(
@@ -388,7 +295,7 @@ async def authorize_point_mutation(
         )
         t_row = await cur.fetchone()
         if not t_row or "teachers_id" not in t_row:
-            return None
+            return error_response(403, "FORBIDDEN", "교원 정보가 존재하지 않거나 상벌점 관리 권한이 없습니다.")
 
     t_id = t_row.get("teachers_id")
     t_grade = t_row.get("grade")
@@ -423,18 +330,7 @@ async def authorize_point_mutation(
                 return None
 
     act_name = "삭제" if action == "delete" else "수정"
-    return JSONResponse(
-        status_code=403,
-        content=SrFormat(
-            status_code=403,
-            success=False,
-            data=None,
-            error=Error(
-                code="FORBIDDEN",
-                message=f"상벌점 {act_name} 권한이 없습니다. (본인이 부여한 건, 담임교사, 학년부장, 학생생활안전부 교사, 관리자만 {act_name} 가능)",
-            ),
-        ).model_dump(),
-    )
+    return error_response(403, "FORBIDDEN", f"상벌점 {act_name} 권한이 없습니다. (본인이 부여한 건, 담임교사, 학년부장, 학생생활안전부 교사, 관리자만 {act_name} 가능)")
 
 
 def _expand_tokens(dept: Optional[str], subj: Optional[str]) -> Set[str]:
@@ -561,7 +457,7 @@ async def authorize_submission_access(
         await cur.execute(
             """
             SELECT s.submission_id, s.student_id, st.uuid AS student_uuid,
-                   COALESCE(ay.year, 2026) AS year, s.is_deleted, s.status_code,
+                   COALESCE(ay.year, YEAR(CURDATE() - INTERVAL 2 MONTH)) AS year, s.is_deleted, s.status_code,
                    s.item_id,
                    ei.area_id,
                    ei.subject AS item_subject, ei.department AS item_department, ei.name AS item_name,
@@ -578,15 +474,7 @@ async def authorize_submission_access(
         )
         sub_row = await cur.fetchone()
         if not sub_row or sub_row.get("is_deleted"):
-            return JSONResponse(
-                status_code=404,
-                content=SrFormat(
-                    status_code=404,
-                    success=False,
-                    data=None,
-                    error=Error(code="ITEM_NOT_FOUND", message="해당 증빙자료를 찾을 수 없습니다."),
-                ).model_dump(),
-            )
+            return error_response(404, "ITEM_NOT_FOUND", "해당 증빙자료를 찾을 수 없습니다.")
 
         # 1순위: 전담 교사 N명 매핑 조회 (활성 교사만 필터링)
         item_id = sub_row.get("item_id")
@@ -651,58 +539,26 @@ async def authorize_submission_access(
             target_subject = area_subject
             target_department = area_department
 
-    is_student = actor_role in ("student", 0, "0")
+    is_student = normalize_role(actor_role) == "student"
     if is_student:
         if action in ("approve", "reject", "score_modify"):
-            return JSONResponse(
-                status_code=403,
-                content=SrFormat(
-                    status_code=403,
-                    success=False,
-                    data=None,
-                    error=Error(code="FORBIDDEN", message="학생은 심사 작업을 수행할 수 없습니다."),
-                ).model_dump(),
-            )
+            return error_response(403, "FORBIDDEN", "학생은 심사 작업을 수행할 수 없습니다.")
         sub_student_uuid = sub_row.get("student_uuid") or sub_row.get("uuid")
         if sub_student_uuid != actor_uuid:
-            return JSONResponse(
-                status_code=403,
-                content=SrFormat(
-                    status_code=403,
-                    success=False,
-                    data=None,
-                    error=Error(code="FORBIDDEN", message="본인의 증빙자료만 접근할 수 있습니다."),
-                ).model_dump(),
-            )
+            return error_response(403, "FORBIDDEN", "본인의 증빙자료만 접근할 수 있습니다.")
         return None
 
-    is_admin = actor_role in ("admin", 2, "2")
+    is_admin = normalize_role(actor_role) == "admin"
     if is_admin:
         if action in ("student_submit", "student_resubmit"):
-            return JSONResponse(
-                status_code=403,
-                content=SrFormat(
-                    status_code=403,
-                    success=False,
-                    data=None,
-                    error=Error(code="FORBIDDEN", message="관리자는 학생 본인 제출 작업을 직접 수행할 수 없습니다."),
-                ).model_dump(),
-            )
+            return error_response(403, "FORBIDDEN", "관리자는 학생 본인 제출 작업을 직접 수행할 수 없습니다.")
         # 관리자는 승인 완료건을 포함한 제출물 삭제(Soft Delete) 허용 (의심-10 결정 A)
         return None
 
-    is_teacher = actor_role in ("teacher", 1, "1")
+    is_teacher = normalize_role(actor_role) == "teacher"
     if is_teacher:
         if action in ("student_submit", "student_resubmit", "student_delete"):
-            return JSONResponse(
-                status_code=403,
-                content=SrFormat(
-                    status_code=403,
-                    success=False,
-                    data=None,
-                    error=Error(code="FORBIDDEN", message="교사는 학생 본인 제출/삭제 작업을 직접 수행할 수 없습니다. 잘못 승인한 경우 반려로 상태를 변경하십시오."),
-                ).model_dump(),
-            )
+            return error_response(403, "FORBIDDEN", "교사는 학생 본인 제출/삭제 작업을 직접 수행할 수 없습니다. 잘못 승인한 경우 반려로 상태를 변경하십시오.")
 
         # [의심-02 결정 B] 모든 교사에게 전교생 증빙자료 및 다운로드 티켓 '열람(Read)' 허용
         if action == "read":
@@ -715,15 +571,7 @@ async def authorize_submission_access(
             )
             t_row = await cur.fetchone()
             if not t_row:
-                return JSONResponse(
-                    status_code=404,
-                    content=SrFormat(
-                        status_code=404,
-                        success=False,
-                        data=None,
-                        error=Error(code="TEACHER_NOT_FOUND", message="교사 정보를 찾을 수 없습니다."),
-                    ).model_dump(),
-                )
+                return error_response(404, "TEACHER_NOT_FOUND", "교사 정보를 찾을 수 없습니다.")
 
         t_id = t_row.get("teachers_id")
         t_grade = t_row.get("grade")
@@ -752,15 +600,7 @@ async def authorize_submission_access(
         if target_teacher_ids:
             if t_id in target_teacher_ids:
                 return None
-            return JSONResponse(
-                status_code=403,
-                content=SrFormat(
-                    status_code=403,
-                    success=False,
-                    data=None,
-                    error=Error(code="FORBIDDEN", message="1순위: 지정된 전담 교사만 심사할 수 있습니다."),
-                ).model_dump(),
-            )
+            return error_response(403, "FORBIDDEN", "1순위: 지정된 전담 교사만 심사할 수 있습니다.")
 
         # [의심-01 결정 B] 2순위: 담당 교과(subject) 지정 과제 (유형 B)
         # - 오직 해당 교과 담당 교사만 심사 가능 (타 교과 담임교사, 학년부장 심사 불가)
@@ -770,15 +610,7 @@ async def authorize_submission_access(
             s_raw = target_subject.strip()
             if (t_tokens & s_tokens) or (t_subject and (t_subject in s_raw or s_raw in t_subject)) or any(tok in s_raw or s_raw in tok for tok in t_tokens if len(tok) >= 2):
                 return None
-            return JSONResponse(
-                status_code=403,
-                content=SrFormat(
-                    status_code=403,
-                    success=False,
-                    data=None,
-                    error=Error(code="FORBIDDEN", message=f"2순위: {s_raw} 담당 교사만 심사할 수 있습니다."),
-                ).model_dump(),
-            )
+            return error_response(403, "FORBIDDEN", f"2순위: {s_raw} 담당 교사만 심사할 수 있습니다.")
 
         # [의심-06 결정 B] 3순위: 담당 부서(department) 지정 과제 (유형 B)
         # - 해당 소속 부서 교사 또는 해당 부서 부서장(position='부서부장') 심사 가능
@@ -794,15 +626,7 @@ async def authorize_submission_access(
                 if academic_record and academic_record.get("grade") == t_grade:
                     return None
             msg = f"{t_grade}학년 학생의 과제 또는 지정된 심사 권한(전담/교과/부서)이 있는 과제만 심사할 수 있습니다." if (t_position == "학년부장" and t_grade is not None) else f"3순위: {d_raw} 소속 교사만 심사할 수 있습니다."
-            return JSONResponse(
-                status_code=403,
-                content=SrFormat(
-                    status_code=403,
-                    success=False,
-                    data=None,
-                    error=Error(code="FORBIDDEN", message=msg),
-                ).model_dump(),
-            )
+            return error_response(403, "FORBIDDEN", msg)
 
         # 교사의 소속 부서 또는 담당 교과가 항목/영역명(예: 외국어교육부 <-> 외국어능력)과 일치하는 경우 허용
         if (t_department or t_subject) and _is_department_or_subject_matched(t_department, t_subject, target_department, sub_item_name, sub_area_name):
@@ -827,49 +651,11 @@ async def authorize_submission_access(
             return None
 
         if t_position == "학년부장" and t_grade is not None and st_grade is not None and t_grade != st_grade:
-            return JSONResponse(
-                status_code=403,
-                content=SrFormat(
-                    status_code=403,
-                    success=False,
-                    data=None,
-                    error=Error(
-                        code="FORBIDDEN",
-                        message=f"{t_grade}학년 담당 학년부장으로 타 학년({st_grade}학년) 학생의 증빙자료를 심사할 수 없습니다 (학년 권한 격리).",
-                    ),
-                ).model_dump(),
-            )
+            return error_response(403, "FORBIDDEN", f"{t_grade}학년 담당 학년부장으로 타 학년({st_grade}학년) 학생의 증빙자료를 심사할 수 없습니다 (학년 권한 격리).")
 
         if t_grade is not None and t_class is not None:
-            return JSONResponse(
-                status_code=403,
-                content=SrFormat(
-                    status_code=403,
-                    success=False,
-                    data=None,
-                    error=Error(
-                        code="FORBIDDEN",
-                        message=f"담당 학급({t_grade}학년 {t_class}반) 외 타 학급 학생의 증빙자료를 심사할 수 없습니다 (담임 권한 격리).",
-                    ),
-                ).model_dump(),
-            )
+            return error_response(403, "FORBIDDEN", f"담당 학급({t_grade}학년 {t_class}반) 외 타 학급 학생의 증빙자료를 심사할 수 없습니다 (담임 권한 격리).")
 
-        return JSONResponse(
-            status_code=403,
-            content=SrFormat(
-                status_code=403,
-                success=False,
-                data=None,
-                error=Error(code="FORBIDDEN", message="전담교사 및 담당부서가 미지정된 일반 과제는 해당 학생의 담임교사 및 학년부장만 심사할 수 있습니다."),
-            ).model_dump(),
-        )
+        return error_response(403, "FORBIDDEN", "전담교사 및 담당부서가 미지정된 일반 과제는 해당 학생의 담임교사 및 학년부장만 심사할 수 있습니다.")
 
-    return JSONResponse(
-        status_code=403,
-        content=SrFormat(
-            status_code=403,
-            success=False,
-            data=None,
-            error=Error(code="FORBIDDEN", message="유효하지 않은 권한 역할입니다."),
-        ).model_dump(),
-    )
+    return error_response(403, "FORBIDDEN", "유효하지 않은 권한 역할입니다.")

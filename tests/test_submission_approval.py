@@ -386,9 +386,8 @@ class TestSubmissionApprovalAPI(unittest.TestCase):
         self.assertEqual(data["grantedScore"], 40.0)
         self.assertEqual(data["reviewerId"], 10)
 
-        # XSS 스크립트 이스케이프 검증
-        self.assertNotIn("<script>", data["teacherComment"])
-        self.assertIn("&lt;script&gt;", data["teacherComment"])
+        # 출력 시점 이스케이프 원칙에 따라 저장 시점 이중 이스케이프 없이 원문 보존 검증
+        self.assertIn("<script>", data["teacherComment"])
 
         # studentTotals 자동 산출 반환 검증
         self.assertIn("studentTotals", data)

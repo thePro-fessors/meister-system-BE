@@ -253,7 +253,10 @@ class MockConnection:
 
 
 class TestAuthAPI(unittest.IsolatedAsyncioTestCase):
+    TEST_ADMIN_CODE = "TEST_ADMIN_SECRET_CODE!"
+
     def setUp(self):
+        os.environ["ADMIN_REGISTRATION_CODE"] = self.TEST_ADMIN_CODE
         self.mock_redis = MockRedis()
         self.mock_conn = MockConnection()
 
@@ -262,6 +265,7 @@ class TestAuthAPI(unittest.IsolatedAsyncioTestCase):
         self.client = TestClient(app)
 
     def tearDown(self):
+        os.environ.pop("ADMIN_REGISTRATION_CODE", None)
         app.dependency_overrides.clear()
 
     # 1. 학생 단일 JOIN 로그인 성공
@@ -483,7 +487,7 @@ class TestAuthAPI(unittest.IsolatedAsyncioTestCase):
             "/api/auth/send-otp",
             json={
                 "email": "teacher1@school.kr",  # 이미 users에 존재하는 계정
-                "admin_code": "MEISTER_ADMIN_2026!",
+                "admin_code": self.TEST_ADMIN_CODE,
             },
         )
         self.assertEqual(res.status_code, 409)
@@ -496,7 +500,7 @@ class TestAuthAPI(unittest.IsolatedAsyncioTestCase):
             "/api/auth/send-otp",
             json={
                 "email": email,
-                "admin_code": "MEISTER_ADMIN_2026!",
+                "admin_code": self.TEST_ADMIN_CODE,
             },
         )
         self.assertEqual(res.status_code, 200)
@@ -510,7 +514,7 @@ class TestAuthAPI(unittest.IsolatedAsyncioTestCase):
             "/api/auth/send-otp",
             json={
                 "email": email,
-                "adminCode": "MEISTER_ADMIN_2026!",
+                "adminCode": self.TEST_ADMIN_CODE,
             },
         )
         self.assertEqual(res.status_code, 200)
@@ -545,7 +549,7 @@ class TestAuthAPI(unittest.IsolatedAsyncioTestCase):
                 "email": email,
                 "password": "AdminPassword123!",
                 "register_token": "tok_admin_direct",
-                "admin_code": "MEISTER_ADMIN_2026!",
+                "admin_code": self.TEST_ADMIN_CODE,
             },
         )
         self.assertEqual(res.status_code, 200)
@@ -563,7 +567,7 @@ class TestAuthAPI(unittest.IsolatedAsyncioTestCase):
         # 1) OTP 발송 (admin_code 제공)
         res_otp = self.client.post(
             "/api/auth/send-otp",
-            json={"email": email, "admin_code": "MEISTER_ADMIN_2026!"},
+            json={"email": email, "admin_code": self.TEST_ADMIN_CODE},
         )
         self.assertEqual(res_otp.status_code, 200)
         otp_code = self.mock_redis.data[f"otp:{email}"]
@@ -609,7 +613,7 @@ class TestAuthAPI(unittest.IsolatedAsyncioTestCase):
                 "email": email,
                 "password": "AdminPassword123!",
                 "register_token": "tok_teacher_admin",
-                "admin_code": "MEISTER_ADMIN_2026!",
+                "admin_code": self.TEST_ADMIN_CODE,
             },
         )
         self.assertEqual(res.status_code, 200)
@@ -638,7 +642,7 @@ class TestAuthAPI(unittest.IsolatedAsyncioTestCase):
                 "email": email1,
                 "password": "AdminPassword123!",
                 "register_token": "tok_dup_id",
-                "admin_code": "MEISTER_ADMIN_2026!",
+                "admin_code": self.TEST_ADMIN_CODE,
             },
         )
         self.assertEqual(res_dup_id.status_code, 409)
@@ -653,7 +657,7 @@ class TestAuthAPI(unittest.IsolatedAsyncioTestCase):
                 "email": "student1@school.kr",  # 이미 users에 등록된 이메일
                 "password": "AdminPassword123!",
                 "register_token": "tok_dup_email",
-                "admin_code": "MEISTER_ADMIN_2026!",
+                "admin_code": self.TEST_ADMIN_CODE,
             },
         )
         self.assertEqual(res_dup_email.status_code, 409)
@@ -708,7 +712,7 @@ class TestAuthAPI(unittest.IsolatedAsyncioTestCase):
                 "email": email,
                 "password": "AdminPassword123!",
                 "registerToken": "tok_camel",
-                "adminCode": "MEISTER_ADMIN_2026!",
+                "adminCode": self.TEST_ADMIN_CODE,
             },
         )
         self.assertEqual(res.status_code, 200)

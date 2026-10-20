@@ -13,18 +13,7 @@ import ipaddress
 import json
 import os
 import secrets
-import sys
 import uuid
-
-# 로컬 개발 환경에서 가상환경 미활성화 상태로 python3 직접 호출 시 로컬 .venv 자동 탐색 (Docker/운영 배포 시에는 미동작)
-if "VIRTUAL_ENV" not in os.environ:
-    _base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    _venv_root = os.path.join(_base_dir, ".venv")
-    if os.path.isdir(_venv_root):
-        import glob
-        for _sp in glob.glob(os.path.join(_venv_root, "lib", "python*", "site-packages")):
-            if _sp not in sys.path:
-                sys.path.append(_sp)
 
 from datetime import datetime, timedelta, timezone
 from enum import StrEnum
@@ -136,10 +125,11 @@ def get_client_ip(request: Request) -> str:
     if not is_trusted_proxy(direct_ip):
         return direct_ip
 
-    # 1. Cloudflare 경유 시 CF-Connecting-IP 헤더 우선
-    cf_ip = request.headers.get("CF-Connecting-IP")
-    if cf_ip and cf_ip.strip():
-        return cf_ip.strip()
+    # 1. Cloudflare 경유 시 CF-Connecting-IP 헤더 우선 (명시적으로 TRUST_CLOUDFLARE_HEADERS=true 설정 시에만 신뢰)
+    if os.getenv("TRUST_CLOUDFLARE_HEADERS", "false").lower() in ("1", "true", "yes"):
+        cf_ip = request.headers.get("CF-Connecting-IP")
+        if cf_ip and cf_ip.strip():
+            return cf_ip.strip()
 
     # 2. Nginx proxy_set_header X-Real-IP
     real_ip = request.headers.get("X-Real-IP")
@@ -465,9 +455,19 @@ async def get_current_user(
             ).model_dump(),
         )
 
-    # Redis 블랙리스트 키 확인: 장애 시 pass로 우회하지 않고 503 반환 (SEC-02)
+    user_uuid = payload.get("sub") or payload.get("uuid")
+
+    # Redis 블랙리스트 및 사용자 전역 토큰 무효화(비밀번호/권한 변경, 계정 삭제) 확인: 장애 시 pass로 우회하지 않고 503 반환 (SEC-02)
     try:
         is_revoked = await redis.get(f"blacklist:{jti}")
+        revoked_at_raw = await redis.get(f"user_token_revoked_at:{user_uuid}") if user_uuid and not is_revoked else None
+        if not is_revoked and revoked_at_raw is not None:
+            token_iat = int(payload.get("iat") or 0)
+            revoked_at = int(revoked_at_raw.decode("utf-8") if isinstance(revoked_at_raw, bytes) else str(revoked_at_raw))
+            if token_iat <= revoked_at:
+                is_exempt = await redis.get(f"token_exempt:{jti}")
+                if not is_exempt:
+                    is_revoked = "revoked_by_timestamp"
     except Exception:
         raise HTTPException(
             status_code=503,
@@ -496,8 +496,6 @@ async def get_current_user(
             ).model_dump(),
         )
 
-    user_uuid = payload.get("sub") or payload.get("uuid")
-
     return {
         "uuid": user_uuid,
         "sub": user_uuid,
@@ -507,6 +505,30 @@ async def get_current_user(
         "exp": payload.get("exp"),
         "token": token,
     }
+
+
+async def revoke_all_user_tokens(
+    redis: Any,
+    user_uuid: str,
+    current_jti: Optional[str] = None,
+    exempt_jti: Optional[str] = None,
+) -> None:
+    """
+    특정 사용자의 모든 기존 발급 토큰을 즉시 무효화합니다.
+    비밀번호 변경, 계정 삭제, 역할 변경 시 호출합니다.
+    """
+    if not redis or not user_uuid:
+        return
+    ttl = ACCESS_TOKEN_EXPIRE_MINUTES * 60 + 60
+    now_ts = int(datetime.now(timezone.utc).timestamp())
+    try:
+        await redis.setex(f"user_token_revoked_at:{user_uuid}", ttl, str(now_ts))
+        if current_jti:
+            await redis.setex(f"blacklist:{current_jti}", ttl, "1")
+        if exempt_jti:
+            await redis.setex(f"token_exempt:{exempt_jti}", ttl, "1")
+    except Exception:
+        pass
 
 
 class RoleChecker:
@@ -556,6 +578,25 @@ class RoleChecker:
                 ).model_dump(),
             )
         return current_user
+
+
+def normalize_role(role: Any) -> str:
+    """문자열('student', 'teacher', 'admin') 또는 정수형(0, 1, 2) 역할을 표준 문자열로 정규화합니다."""
+    return RoleChecker.ROLE_NORMALIZATION.get(role, str(role).strip().lower() if role is not None else "student")
+
+
+def error_response(status_code: int, code: str | int, message: str, data: Any = None):
+    """표준 SrFormat 에러 응답(JSONResponse)을 생성하는 공통 헬퍼 함수"""
+    from fastapi.responses import JSONResponse
+    return JSONResponse(
+        status_code=status_code,
+        content=SrFormat(
+            status_code=status_code,
+            success=False,
+            data=data,
+            error=Error(code=code, message=message),
+        ).model_dump(),
+    )
 
 
 def require_roles(*roles: str | int | UserRole) -> Callable[..., Dict[str, Any]]:

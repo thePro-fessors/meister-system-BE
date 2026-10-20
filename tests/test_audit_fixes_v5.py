@@ -237,7 +237,7 @@ class TestAuditFixesV5(unittest.TestCase):
             with patch("core.authorization.authorize_point_mutation", new=AsyncMock(return_value=None)):
                 res = self.client.patch(
                     "/api/points/10",
-                    json={"score": 10.0, "reason": "점수 정정 사유"},
+                    json={"score": 4.0, "reason": "점수 정정 사유"},
                     headers={"Authorization": f"Bearer {self.token_teacher}"},
                 )
                 self.assertEqual(res.status_code, 200)

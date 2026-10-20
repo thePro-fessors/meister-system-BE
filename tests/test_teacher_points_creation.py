@@ -342,9 +342,8 @@ class TestTeacherPointsCreationAPI(unittest.TestCase):
         self.assertEqual(data["date"], "2026-06-15")
         self.assertEqual(data["reflectedArea"], "직업기초능력")
 
-        # XSS 필터링 검증
-        self.assertNotIn("<script>", data["reason"])
-        self.assertIn("&lt;script&gt;", data["reason"])
+        # 출력 시점 이스케이프 원칙에 따라 저장 시점 이중 이스케이프 없이 원문 보존 검증
+        self.assertIn("<script>", data["reason"])
 
         # merits 및 merits_log DB 저장 검증
         self.assertEqual(len(self.conn.db_merits), 1)

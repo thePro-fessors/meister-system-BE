@@ -394,9 +394,8 @@ class TestSubmissionScoreModifyAPI(unittest.TestCase):
         self.assertEqual(data["score"], 45.0)
         self.assertEqual(data["grantedScore"], 45.0)
 
-        # XSS 이스케이프 검증
-        self.assertNotIn("<script>", data["reason"])
-        self.assertIn("&lt;script&gt;", data["reason"])
+        # 출력 시점 이스케이프 원칙에 따라 저장 시점 이중 이스케이프 없이 원문 보존 검증
+        self.assertIn("<script>", data["reason"])
 
         # studentTotals 반환 검증
         self.assertIn("studentTotals", data)
@@ -408,7 +407,7 @@ class TestSubmissionScoreModifyAPI(unittest.TestCase):
         self.assertIsNotNone(audit_log)
         self.assertEqual(audit_log["old_score"], 30.0)
         self.assertEqual(audit_log["new_score"], 45.0)
-        self.assertIn("&lt;script&gt;", audit_log["comment"])
+        self.assertIn("<script>", audit_log["comment"])
 
     def test_subject_teacher_and_admin_can_modify_score(self):
         """비담임 교과교사 및 관리자(admin) 점수 사후 수정 권한 정상 허용 검증"""

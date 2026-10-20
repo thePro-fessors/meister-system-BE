@@ -6,7 +6,6 @@ routers/submissions.py - 마이스터 역량인증제 증빙자료 제출 및 �
 - TODO.md 2.2 (증빙자료 신규 제출 API: POST /api/submissions)
 """
 
-import html
 import os
 from datetime import date, datetime
 from typing import Any, Dict, Optional, Union
@@ -19,10 +18,13 @@ try:
 except (ImportError, ModuleNotFoundError):
     DictCursor = Any  # type: ignore
 
+from core.academic import get_current_academic_year
+import core.authorization as authz
 from core.logger import logger
-from core.security import get_current_user
+from core.security import error_response, normalize_role, get_current_user
+from core.storage import cleanup_old_file_on_resubmit, delete_uploaded_file, save_upload_file
 from database import get_db, get_redis
-from routers.students import handle_submit_evidence, handle_get_submissions
+from routers.students import handle_submit_evidence, handle_get_submissions, is_valid_evidence_url
 from pydantic import BaseModel
 from sr_format import Error, SrFormat
 import redis.asyncio as aioredis
@@ -175,24 +177,11 @@ async def resubmit_evidence(
     5. DB 에러 시 신규 업로드 파일 자동 롤백 및 삭제
     6. 상태를 검토중(1)으로 변경하고 submissions_logs에 재제출 이력 기록
     """
-    from fastapi.responses import JSONResponse
-    from core.storage import save_upload_file, delete_uploaded_file, cleanup_old_file_on_resubmit
-    from routers.students import is_valid_evidence_url
-    from sr_format import Error
-
     user_role = current_user.get("role")
     user_uuid = current_user.get("uuid")
 
-    if user_role not in ("student", "0", 0):
-        return JSONResponse(
-            status_code=403,
-            content=SrFormat(
-                status_code=403,
-                success=False,
-                data=None,
-                error=Error(code="FORBIDDEN", message="학생 본인만 증빙자료를 재제출할 수 있습니다."),
-            ).model_dump(),
-        )
+    if normalize_role(user_role) != "student":
+        return error_response(403, "FORBIDDEN", "학생 본인만 증빙자료를 재제출할 수 있습니다.")
 
     # 재제출 동시성 경합(Race Condition) 방어 분산 락
     lock_acquired = False
@@ -203,15 +192,7 @@ async def resubmit_evidence(
         except Exception:
             lock_acquired = True
         if not lock_acquired:
-            return JSONResponse(
-                status_code=409,
-                content=SrFormat(
-                    status_code=409,
-                    success=False,
-                    data=None,
-                    error=Error(code="CONCURRENT_REQUEST", message="이미 재제출 처리가 진행 중입니다. 잠시 후 다시 시도해주세요."),
-                ).model_dump(),
-            )
+            return error_response(409, "CONCURRENT_REQUEST", "이미 재제출 처리가 진행 중입니다. 잠시 후 다시 시도해주세요.")
 
     try:
         # 1. 기존 제출 건 조회
@@ -229,81 +210,30 @@ async def resubmit_evidence(
             existing = await cur.fetchone()
 
         if not existing:
-            return JSONResponse(
-                status_code=404,
-                content=SrFormat(
-                    status_code=404,
-                    success=False,
-                    data=None,
-                    error=Error(code="NOT_FOUND", message="해당 증빙자료를 찾을 수 없습니다."),
-                ).model_dump(),
-            )
+            return error_response(404, "NOT_FOUND", "해당 증빙자료를 찾을 수 없습니다.")
 
         # 2. 소유권 검증 (IDOR 방어)
         if existing["uuid"] != user_uuid:
-            return JSONResponse(
-                status_code=403,
-                content=SrFormat(
-                    status_code=403,
-                    success=False,
-                    data=None,
-                    error=Error(code="FORBIDDEN", message="본인이 제출한 증빙자료만 재제출할 수 있습니다."),
-                ).model_dump(),
-            )
+            return error_response(403, "FORBIDDEN", "본인이 제출한 증빙자료만 재제출할 수 있습니다.")
 
         # 3. 상태 검증: 이미 인정 완료된 건 수정 차단
         if existing["status_code"] == 3:
-            return JSONResponse(
-                status_code=400,
-                content=SrFormat(
-                    status_code=400,
-                    success=False,
-                    data=None,
-                    error=Error(code="CANNOT_RESUBMIT_APPROVED", message="이미 승인 완료된 증빙자료는 수정할 수 없습니다."),
-                ).model_dump(),
-            )
+            return error_response(400, "CANNOT_RESUBMIT_APPROVED", "이미 승인 완료된 증빙자료는 수정할 수 없습니다.")
 
         if existing["status_code"] not in (4, 5):
-            return JSONResponse(
-                status_code=400,
-                content=SrFormat(
-                    status_code=400,
-                    success=False,
-                    data=None,
-                    error=Error(code="INVALID_STATUS", message="반려(4) 또는 재제출요청(5) 상태의 증빙자료만 재제출할 수 있습니다."),
-                ).model_dump(),
-            )
+            return error_response(400, "INVALID_STATUS", "반려(4) 또는 재제출요청(5) 상태의 증빙자료만 재제출할 수 있습니다.")
 
         # 링크 유효성 검증
         if link_url or link:
             raw_link = (link_url or link or "").strip()
             if raw_link:
                 if not is_valid_evidence_url(raw_link):
-                    return JSONResponse(
-                        status_code=400,
-                        content=SrFormat(
-                            status_code=400,
-                            success=False,
-                            data=None,
-                            error=Error(
-                                code="VALIDATION_ERROR",
-                                message="외부 링크는 http:// 또는 https:// 형식의 올바른 웹 주소(도메인 포함)여야 합니다.",
-                            ),
-                        ).model_dump(),
-                    )
+                    return error_response(400, "VALIDATION_ERROR", "외부 링크는 http:// 또는 https:// 형식의 올바른 웹 주소(도메인 포함)여야 합니다.")
                 if len(raw_link) > 500:
-                    return JSONResponse(
-                        status_code=400,
-                        content=SrFormat(
-                            status_code=400,
-                            success=False,
-                            data=None,
-                            error=Error(code="VALIDATION_ERROR", message="외부 링크는 최대 500자까지 입력 가능합니다."),
-                        ).model_dump(),
-                    )
+                    return error_response(400, "VALIDATION_ERROR", "외부 링크는 최대 500자까지 입력 가능합니다.")
 
         raw_desc = (description or "").strip()
-        new_desc = html.escape(raw_desc) if raw_desc else existing["description"]
+        new_desc = raw_desc if raw_desc else existing["description"]
         target_link = (link_url or link or "").strip() or existing["link_url"]
         old_file_path = existing["file_path"]
 
@@ -343,15 +273,7 @@ async def resubmit_evidence(
                     await conn.rollback()
                     if new_disk_path:
                         delete_uploaded_file(new_disk_path)
-                    return JSONResponse(
-                        status_code=409,
-                        content=SrFormat(
-                            status_code=409,
-                            success=False,
-                            data=None,
-                            error=Error(code="CONFLICT", message="이미 상태가 변경되었거나 재제출 가능한 상태가 아닙니다."),
-                        ).model_dump(),
-                    )
+                    return error_response(409, "CONFLICT", "이미 상태가 변경되었거나 재제출 가능한 상태가 아닙니다.")
 
                 # submissions_logs 스키마 준수 이력 기록 (DATA-01)
                 await cur.execute(
@@ -416,12 +338,9 @@ async def get_submission_download_ticket(
     개별 증빙자료 파일에 대해 안전하게 소비할 수 있는 60초 일회용 티켓을 발급합니다.
     (SECURITY_AND_AUDIT.md 1.2 & TODO.md 6.1 P1 / SEC-01 권한 격리 적용)
     """
-    from fastapi.responses import JSONResponse
     from core.security import create_download_ticket
-    from core.authorization import authorize_submission_access
-    from sr_format import Error
 
-    auth_err = await authorize_submission_access(current_user, submission_id, conn, action="read")
+    auth_err = await authz.authorize_submission_access(current_user, submission_id, conn, action="read")
     if auth_err:
         return auth_err
 
@@ -442,15 +361,7 @@ async def get_submission_download_ticket(
         row = await cur.fetchone()
 
     if not row or not row.get("file_path"):
-        return JSONResponse(
-            status_code=404,
-            content=SrFormat(
-                status_code=404,
-                success=False,
-                data=None,
-                error=Error(code="FILE_NOT_FOUND", message="첨부된 증빙 파일이 없습니다."),
-            ).model_dump(),
-        )
+        return error_response(404, "FILE_NOT_FOUND", "첨부된 증빙 파일이 없습니다.")
 
     file_path = row["file_path"]
     raw_p = file_path.strip().lstrip("/\\")
@@ -502,12 +413,7 @@ async def delete_submission(
     증빙자료 안전 삭제(Soft-Delete) 및 첨부파일 디스크 정리 엔드포인트
     - 학생 본인 전용 (교사 직접 삭제 불가 403 차단)
     """
-    from fastapi.responses import JSONResponse
-    from core.storage import cleanup_old_file_on_resubmit
-    from core.authorization import authorize_submission_access
-    from sr_format import Error
-
-    auth_err = await authorize_submission_access(current_user, submission_id, conn, action="student_delete")
+    auth_err = await authz.authorize_submission_access(current_user, submission_id, conn, action="student_delete")
     if auth_err:
         return auth_err
 
@@ -528,29 +434,13 @@ async def delete_submission(
         row = await cur.fetchone()
 
     if not row:
-        return JSONResponse(
-            status_code=404,
-            content=SrFormat(
-                status_code=404,
-                success=False,
-                data=None,
-                error=Error(code="NOT_FOUND", message="해당 증빙자료를 찾을 수 없습니다."),
-            ).model_dump(),
-        )
+        return error_response(404, "NOT_FOUND", "해당 증빙자료를 찾을 수 없습니다.")
 
-    is_admin = user_role in ("admin", "2", 2)
+    is_admin = normalize_role(user_role) == "admin"
 
     # 의심-10 결정 A: 관리자는 승인 완료건을 포함한 모든 삭제(Soft Delete) 가능, 학생은 미승인건만 삭제 가능
     if not is_admin and row["status_code"] == 3:
-        return JSONResponse(
-            status_code=400,
-            content=SrFormat(
-                status_code=400,
-                success=False,
-                data=None,
-                error=Error(code="CANNOT_DELETE_APPROVED", message="이미 승인 완료된 증빙자료는 학생이 삭제할 수 없습니다. 잘못 승인된 경우 반려로 상태를 변경하십시오."),
-            ).model_dump(),
-        )
+        return error_response(400, "CANNOT_DELETE_APPROVED", "이미 승인 완료된 증빙자료는 학생이 삭제할 수 없습니다. 잘못 승인된 경우 반려로 상태를 변경하십시오.")
 
     file_to_clean = row.get("file_path")
 
@@ -581,15 +471,7 @@ async def delete_submission(
             row_cnt = getattr(cur, "rowcount", 1)
             if row_cnt == 0:
                 await conn.rollback()
-                return JSONResponse(
-                    status_code=409,
-                    content=SrFormat(
-                        status_code=409,
-                        success=False,
-                        data=None,
-                        error=Error(code="CONFLICT", message="이미 승인 처리되었거나 삭제된 증빙자료는 삭제할 수 없습니다."),
-                    ).model_dump(),
-                )
+                return error_response(409, "CONFLICT", "이미 승인 처리되었거나 삭제된 증빙자료는 삭제할 수 없습니다.")
 
             await cur.execute(
                 """
@@ -633,8 +515,7 @@ async def get_submission_detail(
     증빙자료 단건 상세 조회 엔드포인트 (API-01)
     - 학생 본인, 교사(담임/교과), 관리자 인가 적용 (SEC-01)
     """
-    from core.authorization import authorize_submission_access
-    auth_err = await authorize_submission_access(current_user, submission_id, conn, action="read")
+    auth_err = await authz.authorize_submission_access(current_user, submission_id, conn, action="read")
     if auth_err:
         return auth_err
 
@@ -682,15 +563,7 @@ async def get_submission_detail(
         row = await cur.fetchone()
 
     if not row:
-        return JSONResponse(
-            status_code=404,
-            content=SrFormat(
-                status_code=404,
-                success=False,
-                data=None,
-                error=Error(code="ITEM_NOT_FOUND", message="증빙자료를 찾을 수 없습니다."),
-            ).model_dump(),
-        )
+        return error_response(404, "ITEM_NOT_FOUND", "증빙자료를 찾을 수 없습니다.")
 
     st_code = row.get("statusCode", 1)
     row["status"] = SUBMISSION_STATUS_MAP.get(st_code, "제출완료")
@@ -721,7 +594,6 @@ async def _calculate_student_totals(
     """심사 액션(승인/반려/점수수정) 후 학생 인증 현황 총점 및 상태 자동 재계산 (SCORE-01 공통화)"""
     try:
         from core.calculator import calculate_student_certification, round_decimal
-        from datetime import date
         async with conn.cursor(cursor=DictCursor) as cur:
             await cur.execute(
                 """
@@ -818,8 +690,7 @@ async def approve_submission(
     - 교사(담임/교과) 및 관리자 전용
     - 상태 전이 원자적 검증(status_code IN (1, 2) -> 3)
     """
-    from core.authorization import authorize_submission_access
-    auth_err = await authorize_submission_access(current_user, submission_id, conn, action="approve")
+    auth_err = await authz.authorize_submission_access(current_user, submission_id, conn, action="approve")
     if auth_err:
         return auth_err
 
@@ -842,26 +713,10 @@ async def approve_submission(
         row = await cur.fetchone()
 
     if not row:
-        return JSONResponse(
-            status_code=404,
-            content=SrFormat(
-                status_code=404,
-                success=False,
-                data=None,
-                error=Error(code="ITEM_NOT_FOUND", message="증빙자료를 찾을 수 없습니다."),
-            ).model_dump(),
-        )
+        return error_response(404, "ITEM_NOT_FOUND", "증빙자료를 찾을 수 없습니다.")
 
     if row["status_code"] not in (1, 2):
-        return JSONResponse(
-            status_code=400,
-            content=SrFormat(
-                status_code=400,
-                success=False,
-                data=None,
-                error=Error(code="INVALID_STATUS", message="제출완료(1) 또는 검토중(2) 상태의 증빙만 승인할 수 있습니다."),
-            ).model_dump(),
-        )
+        return error_response(400, "INVALID_STATUS", "제출완료(1) 또는 검토중(2) 상태의 증빙만 승인할 수 있습니다.")
 
     max_score = float(row["max_score"]) if row.get("max_score") is not None else float(row.get("item_max_score", 100.0))
     score = req.score if req.score is not None else (req.granted_score if req.granted_score is not None else req.grantedScore)
@@ -869,19 +724,10 @@ async def approve_submission(
         score = max_score
 
     if score < 0 or score > max_score:
-        return JSONResponse(
-            status_code=400,
-            content=SrFormat(
-                status_code=400,
-                success=False,
-                data=None,
-                error=Error(code="VALIDATION_ERROR", message=f"인정 점수는 0 이상 {max_score} 이하이어야 합니다."),
-            ).model_dump(),
-        )
+        return error_response(400, "VALIDATION_ERROR", f"인정 점수는 0 이상 {max_score} 이하이어야 합니다.")
 
     raw_comment = req.comment if req.comment is not None else (req.teacher_comment if req.teacher_comment is not None else req.teacherComment)
-    import html
-    comment = html.escape(raw_comment.strip()) if raw_comment else None
+    comment = raw_comment.strip() if raw_comment else None
 
     reviewer_id = None
     async with conn.cursor(cursor=DictCursor) as cur:
@@ -908,15 +754,7 @@ async def approve_submission(
             )
             if cur.rowcount == 0:
                 await conn.rollback()
-                return JSONResponse(
-                    status_code=409,
-                    content=SrFormat(
-                        status_code=409,
-                        success=False,
-                        data=None,
-                        error=Error(code="CONFLICT", message="다른 사용자에 의해 이미 심사 처리되었거나 상태가 변경되었습니다."),
-                    ).model_dump(),
-                )
+                return error_response(409, "CONFLICT", "다른 사용자에 의해 이미 심사 처리되었거나 상태가 변경되었습니다.")
 
             await cur.execute(
                 """
@@ -938,7 +776,7 @@ async def approve_submission(
     # 학생 인증 현황 총점 자동 갱신 및 계산 (Tech_spec.md 3.4 & TODO.md 3.4)
     student_id = row["student_id"]
     year_id = row.get("year_id")
-    target_year = row.get("year", 2026)
+    target_year = row.get("year") or get_current_academic_year()
     student_totals = await _calculate_student_totals(student_id, year_id, target_year, conn)
 
     return SrFormat(
@@ -975,23 +813,14 @@ async def reject_submission(
     - 교사 및 관리자 전용
     - 대상 상태: 4(반려) 또는 5(재제출요청)
     """
-    from core.authorization import authorize_submission_access
-    auth_err = await authorize_submission_access(current_user, submission_id, conn, action="reject")
+    auth_err = await authz.authorize_submission_access(current_user, submission_id, conn, action="reject")
     if auth_err:
         return auth_err
 
     user_uuid = current_user.get("uuid") or current_user.get("sub")
     target_status = req.status_code if req.status_code is not None else (req.statusCode or 4)
     if target_status not in (4, 5):
-        return JSONResponse(
-            status_code=400,
-            content=SrFormat(
-                status_code=400,
-                success=False,
-                data=None,
-                error=Error(code="INVALID_STATUS", message="반려 대상 상태 코드는 4(반려) 또는 5(재제출요청)여야 합니다."),
-            ).model_dump(),
-        )
+        return error_response(400, "INVALID_STATUS", "반려 대상 상태 코드는 4(반려) 또는 5(재제출요청)여야 합니다.")
 
     # 1. 반려 사유 필수 입력 검증 (Tech_spec.md 3.5 & TODO.md 3.5)
     raw_comment = (
@@ -1008,19 +837,9 @@ async def reject_submission(
         )
     )
     if not raw_comment or not raw_comment.strip():
-        return JSONResponse(
-            status_code=400,
-            content=SrFormat(
-                status_code=400,
-                success=False,
-                data=None,
-                error=Error(code="VALIDATION_ERROR", message="반려 사유(comment)는 필수 입력 항목입니다."),
-            ).model_dump(),
-        )
+        return error_response(400, "VALIDATION_ERROR", "반려 사유(comment)는 필수 입력 항목입니다.")
 
-    # 2. XSS 방어 HTML 이스케이프
-    import html
-    comment = html.escape(raw_comment.strip())
+    comment = raw_comment.strip()
 
     async with conn.cursor(cursor=DictCursor) as cur:
         await cur.execute(
@@ -1039,26 +858,10 @@ async def reject_submission(
         row = await cur.fetchone()
 
     if not row:
-        return JSONResponse(
-            status_code=404,
-            content=SrFormat(
-                status_code=404,
-                success=False,
-                data=None,
-                error=Error(code="ITEM_NOT_FOUND", message="증빙자료를 찾을 수 없습니다."),
-            ).model_dump(),
-        )
+        return error_response(404, "ITEM_NOT_FOUND", "증빙자료를 찾을 수 없습니다.")
 
     if row["status_code"] not in (1, 2):
-        return JSONResponse(
-            status_code=400,
-            content=SrFormat(
-                status_code=400,
-                success=False,
-                data=None,
-                error=Error(code="INVALID_STATUS", message="제출완료(1) 또는 검토중(2) 상태의 증빙만 반려할 수 있습니다."),
-            ).model_dump(),
-        )
+        return error_response(400, "INVALID_STATUS", "제출완료(1) 또는 검토중(2) 상태의 증빙만 반려할 수 있습니다.")
 
     reviewer_id = None
     async with conn.cursor(cursor=DictCursor) as cur:
@@ -1087,15 +890,7 @@ async def reject_submission(
             )
             if cur.rowcount == 0:
                 await conn.rollback()
-                return JSONResponse(
-                    status_code=409,
-                    content=SrFormat(
-                        status_code=409,
-                        success=False,
-                        data=None,
-                        error=Error(code="CONFLICT", message="다른 사용자에 의해 이미 심사 처리되었거나 상태가 변경되었습니다."),
-                    ).model_dump(),
-                )
+                return error_response(409, "CONFLICT", "다른 사용자에 의해 이미 심사 처리되었거나 상태가 변경되었습니다.")
 
             await cur.execute(
                 """
@@ -1117,7 +912,7 @@ async def reject_submission(
     # 3. 반려 후 학생 인증 현황 총점 자동 재계산 (Tech_spec.md & TODO.md 3.5)
     student_id = row["student_id"]
     year_id = row.get("year_id")
-    target_year = row.get("year", 2026)
+    target_year = row.get("year") or get_current_academic_year()
     student_totals = await _calculate_student_totals(student_id, year_id, target_year, conn)
 
     status_str = "반려" if target_status == 4 else "재제출요청"
@@ -1154,8 +949,7 @@ async def modify_submission_score(
     - 교사 및 관리자 전용
     - 승인 완료(3) 상태 건에 대해서만 허용
     """
-    from core.authorization import authorize_submission_access
-    auth_err = await authorize_submission_access(current_user, submission_id, conn, action="score_modify")
+    auth_err = await authz.authorize_submission_access(current_user, submission_id, conn, action="score_modify")
     if auth_err:
         return auth_err
 
@@ -1178,26 +972,10 @@ async def modify_submission_score(
         row = await cur.fetchone()
 
     if not row:
-        return JSONResponse(
-            status_code=404,
-            content=SrFormat(
-                status_code=404,
-                success=False,
-                data=None,
-                error=Error(code="ITEM_NOT_FOUND", message="증빙자료를 찾을 수 없습니다."),
-            ).model_dump(),
-        )
+        return error_response(404, "ITEM_NOT_FOUND", "증빙자료를 찾을 수 없습니다.")
 
     if row["status_code"] != 3:
-        return JSONResponse(
-            status_code=400,
-            content=SrFormat(
-                status_code=400,
-                success=False,
-                data=None,
-                error=Error(code="INVALID_STATUS", message="승인 완료(3) 상태의 증빙에 대해서만 점수를 수정할 수 있습니다."),
-            ).model_dump(),
-        )
+        return error_response(400, "INVALID_STATUS", "승인 완료(3) 상태의 증빙에 대해서만 점수를 수정할 수 있습니다.")
 
     # 1. 점수 입력값 확인
     score = (
@@ -1206,27 +984,11 @@ async def modify_submission_score(
         else (req.granted_score if req.granted_score is not None else req.grantedScore)
     )
     if score is None:
-        return JSONResponse(
-            status_code=400,
-            content=SrFormat(
-                status_code=400,
-                success=False,
-                data=None,
-                error=Error(code="VALIDATION_ERROR", message="수정할 인정 점수(score)가 필요합니다."),
-            ).model_dump(),
-        )
+        return error_response(400, "VALIDATION_ERROR", "수정할 인정 점수(score)가 필요합니다.")
 
     max_score = float(row["max_score"]) if row.get("max_score") is not None else float(row.get("item_max_score", 100.0))
     if score < 0 or score > max_score:
-        return JSONResponse(
-            status_code=400,
-            content=SrFormat(
-                status_code=400,
-                success=False,
-                data=None,
-                error=Error(code="VALIDATION_ERROR", message=f"인정 점수는 0 이상 {max_score} 이하이어야 합니다."),
-            ).model_dump(),
-        )
+        return error_response(400, "VALIDATION_ERROR", f"인정 점수는 0 이상 {max_score} 이하이어야 합니다.")
 
     # 2. 수정 사유(reason) 필수 입력 검증 (Tech_spec.md 3.4 & TODO.md 3.6)
     raw_reason = (
@@ -1243,19 +1005,9 @@ async def modify_submission_score(
         )
     )
     if not raw_reason or not raw_reason.strip():
-        return JSONResponse(
-            status_code=400,
-            content=SrFormat(
-                status_code=400,
-                success=False,
-                data=None,
-                error=Error(code="VALIDATION_ERROR", message="점수 수정 사유(reason)는 필수 입력 항목입니다."),
-            ).model_dump(),
-        )
+        return error_response(400, "VALIDATION_ERROR", "점수 수정 사유(reason)는 필수 입력 항목입니다.")
 
-    # 3. HTML XSS 방어 이스케이프
-    import html
-    comment = html.escape(raw_reason.strip())
+    comment = raw_reason.strip()
 
     reviewer_id = None
     async with conn.cursor(cursor=DictCursor) as cur:
@@ -1281,15 +1033,7 @@ async def modify_submission_score(
             )
             if cur.rowcount == 0:
                 await conn.rollback()
-                return JSONResponse(
-                    status_code=409,
-                    content=SrFormat(
-                        status_code=409,
-                        success=False,
-                        data=None,
-                        error=Error(code="CONFLICT", message="점수 수정 중 동시성 충돌이 발생했습니다."),
-                    ).model_dump(),
-                )
+                return error_response(409, "CONFLICT", "점수 수정 중 동시성 충돌이 발생했습니다.")
 
             await cur.execute(
                 """
@@ -1311,7 +1055,7 @@ async def modify_submission_score(
     # 4. 수정 후 학생 인증 현황 총점 자동 재계산 (Tech_spec.md & TODO.md 3.6)
     student_id = row["student_id"]
     year_id = row.get("year_id")
-    target_year = row.get("year", 2026)
+    target_year = row.get("year") or get_current_academic_year()
     student_totals = await _calculate_student_totals(student_id, year_id, target_year, conn)
 
     return SrFormat(

@@ -372,9 +372,8 @@ class TestSubmissionRejectionAPI(unittest.TestCase):
         self.assertEqual(data["statusCode"], 4)
         self.assertEqual(data["reviewerId"], 10)
 
-        # XSS 필터링 검증
-        self.assertNotIn("<img", data["teacherComment"])
-        self.assertIn("&lt;img", data["teacherComment"])
+        # 출력 시점 이스케이프 원칙에 따라 저장 시점 이중 이스케이프 없이 원문 보존 검증
+        self.assertIn("<img", data["teacherComment"])
 
         # studentTotals 반환 확인
         self.assertIn("studentTotals", data)

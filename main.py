@@ -12,6 +12,7 @@ import traceback
 
 logger = logging.getLogger("meister.main")
 
+import core.authorization as authz
 from core.storage import get_upload_base_dir, find_and_clean_orphan_files
 from core.security import (
     JWT_SECRET_KEY,
@@ -21,6 +22,8 @@ from core.security import (
     verify_and_consume_download_ticket,
     create_signed_download_token,
     verify_signed_download_token,
+    error_response,
+    normalize_role,
 )
 from database import init_db_pool, close_db_pool, init_redis_pool, close_redis_pool, get_db, get_redis
 try:
@@ -179,15 +182,7 @@ async def get_uploaded_file(
             user_uuid = ticket_user.get("uuid")
             user_role = ticket_user.get("role")
         else:
-            return JSONResponse(
-                status_code=401,
-                content=SrFormat(
-                    status_code=401,
-                    success=False,
-                    data=None,
-                    error=Error(code="UNAUTHORIZED", message="유효하지 않거나 이미 만료/소비된 일회용 다운로드 티켓입니다."),
-                ).model_dump(),
-            )
+            return error_response(401, "UNAUTHORIZED", "유효하지 않거나 이미 만료/소비된 일회용 다운로드 티켓입니다.")
 
     # (B) token 쿼리 파라미터 (단기 다운로드 서명 토큰 전용 검증, SEC-02: 레거시 장기 JWT 쿼리 토큰 전면 폐기)
     elif token:
@@ -196,15 +191,7 @@ async def get_uploaded_file(
             user_uuid = signed_user.get("uuid")
             user_role = signed_user.get("role")
         else:
-            return JSONResponse(
-                status_code=401,
-                content=SrFormat(
-                    status_code=401,
-                    success=False,
-                    data=None,
-                    error=Error(code="UNAUTHORIZED", message="유효하지 않거나 만료된 다운로드 서명 토큰입니다."),
-                ).model_dump(),
-            )
+            return error_response(401, "UNAUTHORIZED", "유효하지 않거나 만료된 다운로드 서명 토큰입니다.")
 
     # (C) Authorization Bearer 헤더 검증 (일반 Access Token만 허용, purpose=download 차단)
     elif not user_uuid:
@@ -214,113 +201,40 @@ async def get_uploaded_file(
             try:
                 payload = jwt.decode(jwt_token, JWT_SECRET_KEY, algorithms=[JWT_ALGORITHM])
                 if payload.get("purpose") == "download":
-                    return JSONResponse(
-                        status_code=401,
-                        content=SrFormat(
-                            status_code=401,
-                            success=False,
-                            data=None,
-                            error=Error(code="UNAUTHORIZED", message="다운로드 전용 서명 토큰은 Bearer 인증 헤더에 사용할 수 없습니다."),
-                        ).model_dump(),
-                    )
+                    return error_response(401, "UNAUTHORIZED", "다운로드 전용 서명 토큰은 Bearer 인증 헤더에 사용할 수 없습니다.")
                 jti = payload.get("jti")
                 if not jti:
-                    return JSONResponse(
-                        status_code=401,
-                        content=SrFormat(
-                            status_code=401,
-                            success=False,
-                            data=None,
-                            error=Error(code="UNAUTHORIZED", message="유효하지 않은 토큰 형식입니다 (jti 누락)."),
-                        ).model_dump(),
-                    )
+                    return error_response(401, "UNAUTHORIZED", "유효하지 않은 토큰 형식입니다 (jti 누락).")
                 if redis is not None:
                     try:
                         if await redis.get(f"blacklist:{jti}"):
-                            return JSONResponse(
-                                status_code=401,
-                                content=SrFormat(
-                                    status_code=401,
-                                    success=False,
-                                    data=None,
-                                    error=Error(code="UNAUTHORIZED", message="로그아웃되었거나 폐기된 토큰입니다."),
-                                ).model_dump(),
-                            )
+                            return error_response(401, "UNAUTHORIZED", "로그아웃되었거나 폐기된 토큰입니다.")
                     except Exception:
-                        return JSONResponse(
-                            status_code=503,
-                            content=SrFormat(
-                                status_code=503,
-                                success=False,
-                                data=None,
-                                error=Error(code="SERVICE_UNAVAILABLE", message="인증 세션 상태 확인 중 오류가 발생했습니다."),
-                            ).model_dump(),
-                        )
+                        return error_response(503, "SERVICE_UNAVAILABLE", "인증 세션 상태 확인 중 오류가 발생했습니다.")
                 user_uuid = payload.get("sub")
                 user_role = payload.get("role")
             except jwt.ExpiredSignatureError:
-                return JSONResponse(
-                    status_code=401,
-                    content=SrFormat(
-                        status_code=401,
-                        success=False,
-                        data=None,
-                        error=Error(code="UNAUTHORIZED", message="인증 토큰이 만료되었습니다."),
-                    ).model_dump(),
-                )
+                return error_response(401, "UNAUTHORIZED", "인증 토큰이 만료되었습니다.")
             except Exception:
-                return JSONResponse(
-                    status_code=401,
-                    content=SrFormat(
-                        status_code=401,
-                        success=False,
-                        data=None,
-                        error=Error(code="UNAUTHORIZED", message="유효하지 않은 인증 토큰입니다."),
-                    ).model_dump(),
-                )
+                return error_response(401, "UNAUTHORIZED", "유효하지 않은 인증 토큰입니다.")
 
     if not user_uuid:
-        return JSONResponse(
-            status_code=401,
-            content=SrFormat(
-                status_code=401,
-                success=False,
-                data=None,
-                error=Error(code="UNAUTHORIZED", message="파일 열람 권한이 없습니다. 유효한 인증 토큰 또는 일회용 티켓이 필요합니다."),
-            ).model_dump(),
-        )
+        return error_response(401, "UNAUTHORIZED", "파일 열람 권한이 없습니다. 유효한 인증 토큰 또는 일회용 티켓이 필요합니다.")
 
     # 3. 경로 탐색(Path Traversal) 공격 차단 및 디렉터리 경계 엄격화 (SECURITY_AND_AUDIT.md 1.4)
     try:
         if os.path.commonpath([upload_root, abs_file_path]) != upload_root or not os.path.isfile(abs_file_path):
-            return JSONResponse(
-                status_code=404,
-                content=SrFormat(
-                    status_code=404,
-                    success=False,
-                    data=None,
-                    error=Error(code="FILE_NOT_FOUND", message="요청한 파일을 찾을 수 없습니다."),
-                ).model_dump(),
-            )
+            return error_response(404, "FILE_NOT_FOUND", "요청한 파일을 찾을 수 없습니다.")
     except (ValueError, Exception):
-        return JSONResponse(
-            status_code=404,
-            content=SrFormat(
-                status_code=404,
-                success=False,
-                data=None,
-                error=Error(code="FILE_NOT_FOUND", message="요청한 파일을 찾을 수 없습니다."),
-            ).model_dump(),
-        )
+        return error_response(404, "FILE_NOT_FOUND", "요청한 파일을 찾을 수 없습니다.")
 
     # 4. SEC-01: 모든 학생 리소스에 동일한 교사 권한 범위 적용 (authorize_student_access)
-    from core.authorization import authorize_student_access
     db_web_path = f"/uploads/{clean_rel_path.replace(os.sep, '/')}"
     async with conn.cursor(cursor=DictCursor) as cur:
         await cur.execute(
             """
             SELECT s.submission_id, s.student_id, st.uuid AS student_uuid,
-                   COALESCE(ay.year, 2026) AS year
+                   COALESCE(ay.year, YEAR(CURDATE() - INTERVAL 2 MONTH)) AS year
             FROM submissions s
             JOIN students st ON s.student_id = st.student_id
             LEFT JOIN evaluation_items ei ON s.item_id = ei.item_id
@@ -335,19 +249,10 @@ async def get_uploaded_file(
 
     if not sub_row:
         # 활성 제출에 연결되지 않은 파일: 관리자만 접근 허용 (SEC-01)
-        if user_role not in ("admin", 2, "2"):
-            return JSONResponse(
-                status_code=403,
-                content=SrFormat(
-                    status_code=403,
-                    success=False,
-                    data=None,
-                    error=Error(code="FORBIDDEN", message="유효한 제출 이력에 연결되지 않은 파일에 접근할 수 없습니다."),
-                ).model_dump(),
-            )
+        if normalize_role(user_role) != "admin":
+            return error_response(403, "FORBIDDEN", "유효한 제출 이력에 연결되지 않은 파일에 접근할 수 없습니다.")
     else:
-        from core.authorization import authorize_submission_access
-        auth_error = await authorize_submission_access(
+        auth_error = await authz.authorize_submission_access(
             actor={"uuid": user_uuid, "role": user_role},
             submission_id=sub_row["submission_id"],
             conn=conn,
@@ -381,26 +286,17 @@ async def issue_download_ticket(
     clean_rel = os.path.normpath(raw_p).lstrip("/\\")
 
     if clean_rel.startswith("..") or os.path.isabs(clean_rel):
-        return JSONResponse(
-            status_code=400,
-            content=SrFormat(
-                status_code=400,
-                success=False,
-                data=None,
-                error=Error(code="INVALID_PATH", message="유효하지 않은 파일 경로입니다."),
-            ).model_dump(),
-        )
+        return error_response(400, "INVALID_PATH", "유효하지 않은 파일 경로입니다.")
 
     user_role = current_user.get("role")
     user_uuid = current_user.get("uuid")
 
-    from core.authorization import authorize_student_access
     db_web_path = f"/uploads/{clean_rel.replace(os.sep, '/')}"
     async with conn.cursor(cursor=DictCursor) as cur:
         await cur.execute(
             """
             SELECT s.submission_id, s.student_id, st.uuid AS student_uuid,
-                   COALESCE(ay.year, 2026) AS year
+                   COALESCE(ay.year, YEAR(CURDATE() - INTERVAL 2 MONTH)) AS year
             FROM submissions s
             JOIN students st ON s.student_id = st.student_id
             LEFT JOIN evaluation_items ei ON s.item_id = ei.item_id
@@ -414,19 +310,10 @@ async def issue_download_ticket(
         sub_row = await cur.fetchone()
 
     if not sub_row:
-        if user_role not in ("admin", 2, "2"):
-            return JSONResponse(
-                status_code=403,
-                content=SrFormat(
-                    status_code=403,
-                    success=False,
-                    data=None,
-                    error=Error(code="FORBIDDEN", message="유효한 제출에 연결된 파일에 대해서만 티켓을 발급받을 수 있습니다."),
-                ).model_dump(),
-            )
+        if normalize_role(user_role) != "admin":
+            return error_response(403, "FORBIDDEN", "유효한 제출에 연결된 파일에 대해서만 티켓을 발급받을 수 있습니다.")
     else:
-        from core.authorization import authorize_submission_access
-        auth_error = await authorize_submission_access(
+        auth_error = await authz.authorize_submission_access(
             actor=current_user,
             submission_id=sub_row["submission_id"],
             conn=conn,
@@ -442,7 +329,6 @@ async def issue_download_ticket(
         redis=redis,
         ttl_seconds=60,
     )
-    from core.security import create_signed_download_token
     signed_token = create_signed_download_token(
         user_uuid=user_uuid,
         role=str(user_role),
@@ -477,16 +363,8 @@ async def run_storage_garbage_collection(
     """
     데이터베이스와 디스크를 대조하여 고아 파일을 탐색 및 정리합니다 (관리자 전용).
     """
-    if current_user.get("role") not in ("admin", 2, "2"):
-        return JSONResponse(
-            status_code=403,
-            content=SrFormat(
-                status_code=403,
-                success=False,
-                data=None,
-                error=Error(code="FORBIDDEN", message="관리자만 저장소 GC를 실행할 수 있습니다."),
-            ).model_dump(),
-        )
+    if normalize_role(current_user.get("role")) != "admin":
+        return error_response(403, "FORBIDDEN", "관리자만 저장소 GC를 실행할 수 있습니다.")
     result = await find_and_clean_orphan_files(conn, dry_run=dry_run)
     return SrFormat(status_code=200, success=True, data=result).model_dump()
 
@@ -495,15 +373,7 @@ async def run_storage_garbage_collection(
 async def http_exception_handler(request: Request, exc: HTTPException):
     if isinstance(exc.detail, dict) and "status_code" in exc.detail:
         return JSONResponse(status_code=exc.status_code, content=exc.detail)
-    return JSONResponse(
-        status_code=exc.status_code,
-        content=SrFormat(
-            status_code=exc.status_code,
-            success=False,
-            data=None,
-            error=Error(code="HTTP_ERROR", message=str(exc.detail)),
-        ).model_dump(),
-    )
+    return error_response(exc.status_code, "HTTP_ERROR", str(exc.detail))
 
 
 @app.exception_handler(RequestValidationError)
@@ -511,18 +381,7 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
     first_error = exc.errors()[0] if exc.errors() else {}
     msg = first_error.get("msg", "입력 데이터 유효성 검증 실패")
     field = ".".join(str(x) for x in first_error.get("loc", []))
-    return JSONResponse(
-        status_code=400,
-        content=SrFormat(
-            status_code=400,
-            success=False,
-            data=None,
-            error=Error(
-                code="VALIDATION_ERROR",
-                message=f"[{field}] {msg}"
-            )
-        ).model_dump(),
-    )
+    return error_response(400, "VALIDATION_ERROR", f"[{field}] {msg}")
 
 
 @app.exception_handler(Exception)
@@ -532,15 +391,4 @@ async def global_exception_handler(request: Request, exc: Exception):
         f"[UNHANDLED_EXCEPTION] {request.method} {request.url.path} -> {type(exc).__name__}: {exc}\n"
         f"{traceback.format_exc()}"
     )
-    return JSONResponse(
-        status_code=500,
-        content=SrFormat(
-            status_code=500,
-            success=False,
-            data=None,
-            error=Error(
-                code="INTERNAL_SERVER_ERROR",
-                message="서버 내부 오류가 발생했습니다."
-            ),
-        ).model_dump(),
-    )
+    return error_response(500, "INTERNAL_SERVER_ERROR", "서버 내부 오류가 발생했습니다.")

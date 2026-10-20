@@ -32,7 +32,7 @@ from core.calculator import (
 )
 from core.academic import get_current_year, get_year_id_by_year
 from core.authorization import _expand_tokens, resolve_student_id
-from core.security import get_current_user
+from core.security import error_response, normalize_role, get_current_user
 from database import get_db
 from routers.students import SUBMISSION_STATUS_MAP
 from sr_format import Error, SrFormat
@@ -242,17 +242,9 @@ async def get_teacher_dashboard(
     user_role = current_user.get("role")
 
     # 1. 교사/관리자 RBAC 인가 검증
-    is_teacher_or_admin = user_role in ("teacher", "admin", "1", "2", 1, 2)
+    is_teacher_or_admin = normalize_role(user_role) in ("teacher", "admin")
     if not is_teacher_or_admin:
-        return JSONResponse(
-            status_code=status.HTTP_403_FORBIDDEN,
-            content=SrFormat(
-                status_code=status.HTTP_403_FORBIDDEN,
-                success=False,
-                data=None,
-                error=Error(code="FORBIDDEN", message="교사 또는 관리자 권한이 필요합니다."),
-            ).model_dump(),
-        )
+        return error_response(status.HTTP_403_FORBIDDEN, "FORBIDDEN", "교사 또는 관리자 권한이 필요합니다.")
 
     # 2. 교사 정보 및 담당 학급(Scope) 조회
     teacher_row = None
@@ -269,17 +261,9 @@ async def get_teacher_dashboard(
         teacher_row = await cur.fetchone()
 
     # 교사 테이블에 미등록된 관리자 계정 처리
-    is_admin = user_role in ("admin", "2", 2)
+    is_admin = normalize_role(user_role) == "admin"
     if not teacher_row and not is_admin:
-        return JSONResponse(
-            status_code=status.HTTP_404_NOT_FOUND,
-            content=SrFormat(
-                status_code=status.HTTP_404_NOT_FOUND,
-                success=False,
-                data=None,
-                error=Error(code="TEACHER_NOT_FOUND", message="교사 정보를 찾을 수 없습니다."),
-            ).model_dump(),
-        )
+        return error_response(status.HTTP_404_NOT_FOUND, "TEACHER_NOT_FOUND", "교사 정보를 찾을 수 없습니다.")
 
     # 담당 학급 범위(Scope Label) 및 필터링 조건 설정
     teacher_grade = teacher_row.get("grade") if teacher_row else None
@@ -566,18 +550,10 @@ async def get_teacher_students(
     user_uuid = current_user.get("uuid")
 
     # 1. 교사/관리자 RBAC 인가 검증
-    if user_role not in ("teacher", "admin", "1", "2", 1, 2):
-        return JSONResponse(
-            status_code=status.HTTP_403_FORBIDDEN,
-            content=SrFormat(
-                status_code=status.HTTP_403_FORBIDDEN,
-                success=False,
-                data=None,
-                error=Error(code="FORBIDDEN", message="교사 또는 관리자 권한이 필요합니다."),
-            ).model_dump(),
-        )
+    if normalize_role(user_role) not in ("teacher", "admin"):
+        return error_response(status.HTTP_403_FORBIDDEN, "FORBIDDEN", "교사 또는 관리자 권한이 필요합니다.")
 
-    is_admin = user_role in ("admin", "2", 2)
+    is_admin = normalize_role(user_role) == "admin"
 
     # 2. 교사 정보 및 담당 학급 범위 조회
     teacher_row = None
@@ -594,15 +570,7 @@ async def get_teacher_students(
         teacher_row = await cur.fetchone()
 
     if not teacher_row and not is_admin:
-        return JSONResponse(
-            status_code=status.HTTP_404_NOT_FOUND,
-            content=SrFormat(
-                status_code=status.HTTP_404_NOT_FOUND,
-                success=False,
-                data=None,
-                error=Error(code="TEACHER_NOT_FOUND", message="교사 정보를 찾을 수 없습니다."),
-            ).model_dump(),
-        )
+        return error_response(status.HTTP_404_NOT_FOUND, "TEACHER_NOT_FOUND", "교사 정보를 찾을 수 없습니다.")
 
     teacher_grade = teacher_row.get("grade") if teacher_row else None
     teacher_class = teacher_row.get("class_num") if teacher_row else None
@@ -636,29 +604,13 @@ async def get_teacher_students(
 
     if is_grade_head and not allow_cross_class:
         if grade is not None and grade != teacher_grade:
-            return JSONResponse(
-                status_code=status.HTTP_403_FORBIDDEN,
-                content=SrFormat(
-                    status_code=status.HTTP_403_FORBIDDEN,
-                    success=False,
-                    data=None,
-                    error=Error(code="FORBIDDEN", message=f"{teacher_grade}학년 학생의 데이터만 조회할 수 있습니다."),
-                ).model_dump(),
-            )
+            return error_response(status.HTTP_403_FORBIDDEN, "FORBIDDEN", f"{teacher_grade}학년 학생의 데이터만 조회할 수 있습니다.")
         target_grade = teacher_grade
         target_class = req_class
     elif has_homeroom and not allow_cross_class:
         # 클라이언트가 본인 담임 학급 이외의 학년 또는 반을 지정하여 우회 조회를 시도하는 경우 403 Forbidden 차단
         if (grade is not None and grade != teacher_grade) or (req_class is not None and req_class != teacher_class):
-            return JSONResponse(
-                status_code=status.HTTP_403_FORBIDDEN,
-                content=SrFormat(
-                    status_code=status.HTTP_403_FORBIDDEN,
-                    success=False,
-                    data=None,
-                    error=Error(code="FORBIDDEN", message="담당 학급 외의 학생 목록은 조회할 수 없습니다."),
-                ).model_dump(),
-            )
+            return error_response(status.HTTP_403_FORBIDDEN, "FORBIDDEN", "담당 학급 외의 학생 목록은 조회할 수 없습니다.")
         target_grade = teacher_grade
         target_class = teacher_class
     else:
@@ -937,18 +889,10 @@ async def get_teacher_student_detail(
     user_uuid = current_user.get("uuid")
 
     # 1. RBAC 검증: 교사 또는 관리자 권한 필수
-    if user_role not in ("teacher", "admin", "1", "2", 1, 2):
-        return JSONResponse(
-            status_code=status.HTTP_403_FORBIDDEN,
-            content=SrFormat(
-                status_code=status.HTTP_403_FORBIDDEN,
-                success=False,
-                data=None,
-                error=Error(code="FORBIDDEN", message="교사 또는 관리자 권한이 필요합니다."),
-            ).model_dump(),
-        )
+    if normalize_role(user_role) not in ("teacher", "admin"):
+        return error_response(status.HTTP_403_FORBIDDEN, "FORBIDDEN", "교사 또는 관리자 권한이 필요합니다.")
 
-    is_admin = user_role in ("admin", "2", 2)
+    is_admin = normalize_role(user_role) == "admin"
 
     # 2. 교사 프로필 및 담임 권한 범위 확인
     teacher_row = None
@@ -968,15 +912,7 @@ async def get_teacher_student_detail(
         teacher_row = await cur.fetchone()
 
     if not teacher_row and not is_admin:
-        return JSONResponse(
-            status_code=status.HTTP_404_NOT_FOUND,
-            content=SrFormat(
-                status_code=status.HTTP_404_NOT_FOUND,
-                success=False,
-                data=None,
-                error=Error(code="TEACHER_NOT_FOUND", message="교사 정보를 찾을 수 없습니다."),
-            ).model_dump(),
-        )
+        return error_response(status.HTTP_404_NOT_FOUND, "TEACHER_NOT_FOUND", "교사 정보를 찾을 수 없습니다.")
 
     if teacher_row:
         teacher_grade = teacher_row.get("grade")
@@ -996,15 +932,7 @@ async def get_teacher_student_detail(
     # 3. 대상 학생 존재 여부 확인
     real_student_id = await resolve_student_id(conn, student_id)
     if real_student_id is None:
-        return JSONResponse(
-            status_code=status.HTTP_404_NOT_FOUND,
-            content=SrFormat(
-                status_code=status.HTTP_404_NOT_FOUND,
-                success=False,
-                data=None,
-                error=Error(code="USER_NOT_FOUND", message="해당 학생을 찾을 수 없습니다."),
-            ).model_dump(),
-        )
+        return error_response(status.HTTP_404_NOT_FOUND, "USER_NOT_FOUND", "해당 학생을 찾을 수 없습니다.")
     student_id = real_student_id
 
     async with conn.cursor(cursor=DictCursor) as cur:
@@ -1021,30 +949,14 @@ async def get_teacher_student_detail(
         target_student = await cur.fetchone()
 
     if not target_student:
-        return JSONResponse(
-            status_code=status.HTTP_404_NOT_FOUND,
-            content=SrFormat(
-                status_code=status.HTTP_404_NOT_FOUND,
-                success=False,
-                data=None,
-                error=Error(code="USER_NOT_FOUND", message="해당 학생을 찾을 수 없습니다."),
-            ).model_dump(),
-        )
+        return error_response(status.HTTP_404_NOT_FOUND, "USER_NOT_FOUND", "해당 학생을 찾을 수 없습니다.")
 
     # 4. 학년도 및 학적 정보 확인
     target_year = year if year is not None else await get_current_year()
     year_id = await get_year_id_by_year(conn, target_year)
 
     if not year_id:
-        return JSONResponse(
-            status_code=status.HTTP_404_NOT_FOUND,
-            content=SrFormat(
-                status_code=status.HTTP_404_NOT_FOUND,
-                success=False,
-                data=None,
-                error=Error(code="ITEM_NOT_FOUND", message=f"{target_year} 학년도 정보가 시스템에 존재하지 않습니다."),
-            ).model_dump(),
-        )
+        return error_response(status.HTTP_404_NOT_FOUND, "ITEM_NOT_FOUND", f"{target_year} 학년도 정보가 시스템에 존재하지 않습니다.")
 
     async with conn.cursor(cursor=DictCursor) as cur:
         await cur.execute(
@@ -1059,15 +971,7 @@ async def get_teacher_student_detail(
         academic_record = await cur.fetchone()
 
     if not academic_record:
-        return JSONResponse(
-            status_code=status.HTTP_404_NOT_FOUND,
-            content=SrFormat(
-                status_code=status.HTTP_404_NOT_FOUND,
-                success=False,
-                data=None,
-                error=Error(code="USER_NOT_FOUND", message=f"{target_year} 학년도에 등록된 해당 학생의 학적 정보를 찾을 수 없습니다."),
-            ).model_dump(),
-        )
+        return error_response(status.HTTP_404_NOT_FOUND, "USER_NOT_FOUND", f"{target_year} 학년도에 등록된 해당 학생의 학적 정보를 찾을 수 없습니다.")
 
     st_grade = academic_record["grade"]
     st_class = academic_record["class_no"]
@@ -1076,26 +980,10 @@ async def get_teacher_student_detail(
     # 5. 담임/학년부장 권한 범위 검증 (Scope Isolation & IDOR 방어)
     if is_grade_head:
         if st_grade != teacher_grade:
-            return JSONResponse(
-                status_code=status.HTTP_403_FORBIDDEN,
-                content=SrFormat(
-                    status_code=status.HTTP_403_FORBIDDEN,
-                    success=False,
-                    data=None,
-                    error=Error(code="FORBIDDEN", message=f"{teacher_grade}학년 학생만 상세 조회할 수 있습니다."),
-                ).model_dump(),
-            )
+            return error_response(status.HTTP_403_FORBIDDEN, "FORBIDDEN", f"{teacher_grade}학년 학생만 상세 조회할 수 있습니다.")
     elif has_homeroom:
         if st_grade != teacher_grade or st_class != teacher_class:
-            return JSONResponse(
-                status_code=status.HTTP_403_FORBIDDEN,
-                content=SrFormat(
-                    status_code=status.HTTP_403_FORBIDDEN,
-                    success=False,
-                    data=None,
-                    error=Error(code="FORBIDDEN", message="담당 학급 학생만 상세 조회할 수 있습니다."),
-                ).model_dump(),
-            )
+            return error_response(status.HTTP_403_FORBIDDEN, "FORBIDDEN", "담당 학급 학생만 상세 조회할 수 있습니다.")
 
     # 6. 대상 학년/학년도 인증 영역, 학생 제출건, 상벌점 조회
     async with conn.cursor(cursor=DictCursor) as cur:
@@ -1112,18 +1000,7 @@ async def get_teacher_student_detail(
         areas = await cur.fetchall()
 
         if not areas:
-            return JSONResponse(
-                status_code=status.HTTP_404_NOT_FOUND,
-                content=SrFormat(
-                    status_code=status.HTTP_404_NOT_FOUND,
-                    success=False,
-                    data=None,
-                    error=Error(
-                        code="CRITERIA_NOT_CONFIGURED",
-                        message=f"{target_year} 학년도 {st_grade}학년 평가 기준이 설정되지 않았습니다.",
-                    ),
-                ).model_dump(),
-            )
+            return error_response(status.HTTP_404_NOT_FOUND, "CRITERIA_NOT_CONFIGURED", f"{target_year} 학년도 {st_grade}학년 평가 기준이 설정되지 않았습니다.")
 
         # (2) 학생 증빙 제출건 전체 조회 (최신 제출순 정렬)
         await cur.execute(

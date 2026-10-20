@@ -14,7 +14,6 @@ core/excel_parser.py - 학생 명단 일괄 등록용 XLSX / CSV 파서
 """
 
 import csv
-import html
 import io
 import re
 import zipfile
@@ -228,7 +227,7 @@ def parse_student_batch_file(
                 errors.append({"row": offset, "name": clean_name, "reason": "학생 성명은 20자를 초과할 수 없습니다."})
                 continue
 
-            name = html.escape(clean_name)
+            name = clean_name
 
             # 학년, 반, 번호 추출
             grade: Optional[int] = None
@@ -451,7 +450,7 @@ def parse_teacher_batch_file(
                 errors.append({"row": offset, "name": clean_name, "reason": "교사 성명은 20자를 초과할 수 없습니다."})
                 continue
 
-            name = html.escape(clean_name)
+            name = clean_name
 
             # 2) 담당교과
             subject: Optional[str] = None
@@ -461,7 +460,7 @@ def parse_teacher_batch_file(
                     if len(clean_subj) > 20:
                         errors.append({"row": offset, "name": clean_name, "reason": "담당교과명은 20자를 초과할 수 없습니다."})
                         continue
-                    subject = html.escape(clean_subj)
+                    subject = clean_subj
 
             # 2-1) 직책 (position: 정담임, 부담임, 임시담임, 학년부장, 부서부장 등) 및 소속 부서 (department)
             position: Optional[str] = None
@@ -471,7 +470,7 @@ def parse_teacher_batch_file(
                     if len(clean_pos) > 30:
                         errors.append({"row": offset, "name": clean_name, "reason": "직책명은 30자를 초과할 수 없습니다."})
                         continue
-                    position = html.escape(clean_pos)
+                    position = clean_pos
 
             department: Optional[str] = None
             if "department" in col_map and col_map["department"] < len(row) and row[col_map["department"]] is not None:
@@ -480,7 +479,7 @@ def parse_teacher_batch_file(
                     if len(clean_dept) > 40:
                         errors.append({"row": offset, "name": clean_name, "reason": "부서명은 40자를 초과할 수 없습니다."})
                         continue
-                    department = html.escape(clean_dept)
+                    department = clean_dept
 
             # 3) 담당학급 (담임/부담임/임시담임 배정)
             grade: Optional[int] = None

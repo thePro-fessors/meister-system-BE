@@ -379,9 +379,9 @@ class TestAdminAPI(unittest.TestCase):
         )
         self.assertEqual(res_area_neg.status_code, 400)
 
-    # 8. Stored XSS 이스케이프 검증
+    # 8. 출력 시점 이스케이프 원칙에 따른 원문 보존 검증 (이중 이스케이프 방지)
     def test_criteria_xss_escaping(self):
-        """영역 및 항목 이름 입력 시 HTML 태그가 정상 이스케이프되는지 검증"""
+        """영역 및 항목 이름 입력 시 저장 시점 이중 이스케이프 없이 원문이 보존되는지 검증"""
         xss_payload = "<script>alert('xss')</script>"
         res = self.client.post(
             "/api/criteria/areas/1/items",
@@ -389,7 +389,7 @@ class TestAdminAPI(unittest.TestCase):
         )
         self.assertEqual(res.status_code, 201)
         data = res.json()["data"]
-        self.assertEqual(data["name"], "&lt;script&gt;alert(&#x27;xss&#x27;)&lt;/script&gt;")
+        self.assertEqual(data["name"], xss_payload)
 
     # 9. 관리자 Overview 소프트 삭제 학생 집계 제외 검증
     def test_admin_overview_excludes_deleted_students(self):

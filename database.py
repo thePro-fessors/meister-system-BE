@@ -1,15 +1,4 @@
 import os
-import sys
-
-# 로컬 개발 환경에서 가상환경 미활성화 상태로 python3 직접 호출 시 로컬 .venv 자동 탐색
-if "VIRTUAL_ENV" not in os.environ:
-    _base_dir = os.path.dirname(os.path.abspath(__file__))
-    _venv_root = os.path.join(_base_dir, ".venv")
-    if os.path.isdir(_venv_root):
-        import glob
-        for _sp in glob.glob(os.path.join(_venv_root, "lib", "python*", "site-packages")):
-            if _sp not in sys.path:
-                sys.path.append(_sp)
 
 try:
     import asyncmy
@@ -34,7 +23,7 @@ REDIS_POOL_MAX = int(os.getenv("REDIS_POOL_MAX") or 30)
 DB_CONFIG = {
     "host": os.getenv("DATABASE_HOST") or "localhost",
     "port": int(os.getenv("DATABASE_PORT") or 3306),
-    "user": os.getenv("DATABASE_USER") or "root",
+    "user": os.getenv("DATABASE_USER") or "meister_app",
     "password": os.getenv("DATABASE_PASSWORD"),
     "database": os.getenv("DATABASE_NAME") or "swMeister",
     "autocommit": True,
@@ -51,11 +40,14 @@ async def init_db_pool():
     password = os.getenv("DATABASE_PASSWORD") or DB_CONFIG.get("password")
     if is_prod and not password:
         raise RuntimeError("[FATAL] 프로덕션 환경에서는 DATABASE_PASSWORD 환경변수가 반드시 설정되어야 합니다.")
+    admin_reg_code = (os.getenv("ADMIN_REGISTRATION_CODE") or "").strip()
+    if is_prod and (not admin_reg_code or admin_reg_code == "MEISTER_ADMIN_2026!"):
+        raise RuntimeError("[FATAL] 프로덕션 환경에서는 안전한 ADMIN_REGISTRATION_CODE 환경변수가 설정되어야 합니다.")
     
     # 런타임 환경변수 동적 동기화
     DB_CONFIG["host"] = os.getenv("DATABASE_HOST") or DB_CONFIG.get("host", "localhost")
     DB_CONFIG["port"] = int(os.getenv("DATABASE_PORT") or DB_CONFIG.get("port", 3306))
-    DB_CONFIG["user"] = os.getenv("DATABASE_USER") or DB_CONFIG.get("user", "root")
+    DB_CONFIG["user"] = os.getenv("DATABASE_USER") or DB_CONFIG.get("user", "meister_app")
     DB_CONFIG["password"] = password
     DB_CONFIG["database"] = os.getenv("DATABASE_NAME") or DB_CONFIG.get("database", "swMeister")
     DB_CONFIG["charset"] = os.getenv("DATABASE_CHARSET") or DB_CONFIG.get("charset", "utf8mb4")

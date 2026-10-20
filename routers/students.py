@@ -26,7 +26,6 @@ from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Upload
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
-import html
 from core.academic import (
     _YEAR_ID_CACHE,
     clear_year_cache,
@@ -39,7 +38,7 @@ from core.calculator import (
     calculate_area_grade,
     calculate_area_status,
 )
-from core.security import get_current_user, require_student
+from core.security import error_response, normalize_role, get_current_user, require_student
 from core.storage import delete_uploaded_file, save_upload_file
 from database import get_db, get_redis
 from sr_format import Error, SrFormat
@@ -154,15 +153,7 @@ async def get_certification_status(
 
     target_st_id = await resolve_student_id(conn, student_id)
     if target_st_id is None:
-        return JSONResponse(
-            status_code=status.HTTP_404_NOT_FOUND,
-            content=SrFormat(
-                status_code=status.HTTP_404_NOT_FOUND,
-                success=False,
-                data=None,
-                error=Error(code="STUDENT_NOT_FOUND", message="대상 학생 정보를 찾을 수 없습니다."),
-            ).model_dump(),
-        )
+        return error_response(status.HTTP_404_NOT_FOUND, "STUDENT_NOT_FOUND", "대상 학생 정보를 찾을 수 없습니다.")
     student_id = target_st_id
 
     async with conn.cursor(cursor=DictCursor) as cur:
@@ -181,18 +172,7 @@ async def get_certification_status(
         target_student = await cur.fetchone()
 
         if not target_student:
-            return JSONResponse(
-                status_code=status.HTTP_404_NOT_FOUND,
-                content=SrFormat(
-                    status_code=status.HTTP_404_NOT_FOUND,
-                    success=False,
-                    data=None,
-                    error=Error(
-                        code="USER_NOT_FOUND",
-                        message="해당 학생을 찾을 수 없습니다.",
-                    ),
-                ).model_dump(),
-            )
+            return error_response(status.HTTP_404_NOT_FOUND, "USER_NOT_FOUND", "해당 학생을 찾을 수 없습니다.")
 
         # ----------------------------------------------------------------------
         # 2. 학년도(Academic Year) 결정 및 year_id 확인
@@ -201,18 +181,7 @@ async def get_certification_status(
         year_id = await get_year_id_by_year(conn, query_year)
 
         if not year_id:
-            return JSONResponse(
-                status_code=status.HTTP_404_NOT_FOUND,
-                content=SrFormat(
-                    status_code=status.HTTP_404_NOT_FOUND,
-                    success=False,
-                    data=None,
-                    error=Error(
-                        code="ITEM_NOT_FOUND",
-                        message=f"{query_year} 학년도 정보가 시스템에 존재하지 않습니다.",
-                    ),
-                ).model_dump(),
-            )
+            return error_response(status.HTTP_404_NOT_FOUND, "ITEM_NOT_FOUND", f"{query_year} 학년도 정보가 시스템에 존재하지 않습니다.")
 
         # ----------------------------------------------------------------------
         # 3. RBAC 및 학생 리소스 인가 검증 (SEC-01)
@@ -242,18 +211,7 @@ async def get_certification_status(
         academic_record = await cur.fetchone()
 
         if not academic_record:
-            return JSONResponse(
-                status_code=status.HTTP_404_NOT_FOUND,
-                content=SrFormat(
-                    status_code=status.HTTP_404_NOT_FOUND,
-                    success=False,
-                    data=None,
-                    error=Error(
-                        code="USER_NOT_FOUND",
-                        message=f"{query_year} 학년도에 등록된 해당 학생의 학적 정보를 찾을 수 없습니다.",
-                    ),
-                ).model_dump(),
-            )
+            return error_response(status.HTTP_404_NOT_FOUND, "USER_NOT_FOUND", f"{query_year} 학년도에 등록된 해당 학생의 학적 정보를 찾을 수 없습니다.")
 
         st_grade = academic_record["grade"]
         st_class = academic_record["class_no"]
@@ -275,18 +233,7 @@ async def get_certification_status(
 
         # DATA-04: 학년 기준 누락 시 타 학년 데이터로 대체하지 않고 명시적 404 반환
         if not areas:
-            return JSONResponse(
-                status_code=status.HTTP_404_NOT_FOUND,
-                content=SrFormat(
-                    status_code=status.HTTP_404_NOT_FOUND,
-                    success=False,
-                    data=None,
-                    error=Error(
-                        code="CRITERIA_NOT_CONFIGURED",
-                        message=f"{query_year} 학년도 {st_grade}학년 평가 기준이 설정되지 않았습니다.",
-                    ),
-                ).model_dump(),
-            )
+            return error_response(status.HTTP_404_NOT_FOUND, "CRITERIA_NOT_CONFIGURED", f"{query_year} 학년도 {st_grade}학년 평가 기준이 설정되지 않았습니다.")
 
         # ----------------------------------------------------------------------
         # 6. 학생이 제출한 증빙자료(submissions) 및 평가 항목 메타데이터 조회
@@ -396,19 +343,8 @@ async def handle_submit_evidence(
     user_uuid = current_user.get("uuid")
 
     # 1. 호출 주체 권한(RBAC) 검증: 학생(student 또는 role=0)만 제출 가능
-    if user_role not in ("student", "0", 0):
-        return JSONResponse(
-            status_code=status.HTTP_403_FORBIDDEN,
-            content=SrFormat(
-                status_code=status.HTTP_403_FORBIDDEN,
-                success=False,
-                data=None,
-                error=Error(
-                    code="FORBIDDEN",
-                    message="학생만 증빙자료를 제출할 수 있습니다.",
-                ),
-            ).model_dump(),
-        )
+    if normalize_role(user_role) != "student":
+        return error_response(status.HTTP_403_FORBIDDEN, "FORBIDDEN", "학생만 증빙자료를 제출할 수 있습니다.")
 
 
     async with conn.cursor(cursor=DictCursor) as cur:
@@ -416,18 +352,7 @@ async def handle_submit_evidence(
         if student_id_param is not None:
             resolved_st_id = await resolve_student_id(conn, student_id_param)
             if resolved_st_id is None:
-                return JSONResponse(
-                    status_code=status.HTTP_404_NOT_FOUND,
-                    content=SrFormat(
-                        status_code=status.HTTP_404_NOT_FOUND,
-                        success=False,
-                        data=None,
-                        error=Error(
-                            code="USER_NOT_FOUND",
-                            message="해당 학생을 찾을 수 없습니다.",
-                        ),
-                    ).model_dump(),
-                )
+                return error_response(status.HTTP_404_NOT_FOUND, "USER_NOT_FOUND", "해당 학생을 찾을 수 없습니다.")
             await cur.execute(
                 """
                 SELECT student_id, uuid, name, email, is_deleted
@@ -439,32 +364,10 @@ async def handle_submit_evidence(
             )
             target_student = await cur.fetchone()
             if not target_student:
-                return JSONResponse(
-                    status_code=status.HTTP_404_NOT_FOUND,
-                    content=SrFormat(
-                        status_code=status.HTTP_404_NOT_FOUND,
-                        success=False,
-                        data=None,
-                        error=Error(
-                            code="USER_NOT_FOUND",
-                            message="해당 학생을 찾을 수 없습니다.",
-                        ),
-                    ).model_dump(),
-                )
+                return error_response(status.HTTP_404_NOT_FOUND, "USER_NOT_FOUND", "해당 학생을 찾을 수 없습니다.")
 
             if target_student["uuid"] != user_uuid:
-                return JSONResponse(
-                    status_code=status.HTTP_403_FORBIDDEN,
-                    content=SrFormat(
-                        status_code=status.HTTP_403_FORBIDDEN,
-                        success=False,
-                        data=None,
-                        error=Error(
-                            code="FORBIDDEN",
-                            message="본인의 증빙자료만 제출할 수 있습니다.",
-                        ),
-                    ).model_dump(),
-                )
+                return error_response(status.HTTP_403_FORBIDDEN, "FORBIDDEN", "본인의 증빙자료만 제출할 수 있습니다.")
             student_id = target_student["student_id"]
         else:
             await cur.execute(
@@ -478,152 +381,42 @@ async def handle_submit_evidence(
             )
             target_student = await cur.fetchone()
             if not target_student:
-                return JSONResponse(
-                    status_code=status.HTTP_404_NOT_FOUND,
-                    content=SrFormat(
-                        status_code=status.HTTP_404_NOT_FOUND,
-                        success=False,
-                        data=None,
-                        error=Error(
-                            code="USER_NOT_FOUND",
-                            message="해당 학생 계정의 학적 정보를 찾을 수 없습니다.",
-                        ),
-                    ).model_dump(),
-                )
+                return error_response(status.HTTP_404_NOT_FOUND, "USER_NOT_FOUND", "해당 학생 계정의 학적 정보를 찾을 수 없습니다.")
             student_id = target_student["student_id"]
 
         # 3. 필수 입력값 기본 유효성 검증
         if item_id_val is None:
-            return JSONResponse(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                content=SrFormat(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    success=False,
-                    data=None,
-                    error=Error(
-                        code="VALIDATION_ERROR",
-                        message="평가 항목 ID(item_id)는 필수입니다.",
-                    ),
-                ).model_dump(),
-            )
+            return error_response(status.HTTP_400_BAD_REQUEST, "VALIDATION_ERROR", "평가 항목 ID(item_id)는 필수입니다.")
 
         raw_detail = (detail_val or "").strip()
         if not raw_detail:
-            return JSONResponse(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                content=SrFormat(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    success=False,
-                    data=None,
-                    error=Error(
-                        code="VALIDATION_ERROR",
-                        message="세부 활동명 또는 자격명(detail)을 입력해주세요.",
-                    ),
-                ).model_dump(),
-            )
-        clean_detail = html.escape(raw_detail)
+            return error_response(status.HTTP_400_BAD_REQUEST, "VALIDATION_ERROR", "세부 활동명 또는 자격명(detail)을 입력해주세요.")
+        clean_detail = raw_detail
         if len(clean_detail) > 200:
-            return JSONResponse(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                content=SrFormat(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    success=False,
-                    data=None,
-                    error=Error(
-                        code="VALIDATION_ERROR",
-                        message="세부 활동명(detail)은 최대 200자까지 입력 가능합니다.",
-                    ),
-                ).model_dump(),
-            )
+            return error_response(status.HTTP_400_BAD_REQUEST, "VALIDATION_ERROR", "세부 활동명(detail)은 최대 200자까지 입력 가능합니다.")
 
         raw_description = (description_val or "").strip()
         if not raw_description:
-            return JSONResponse(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                content=SrFormat(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    success=False,
-                    data=None,
-                    error=Error(
-                        code="VALIDATION_ERROR",
-                        message="활동 설명(description)을 입력해주세요.",
-                    ),
-                ).model_dump(),
-            )
-        clean_description = html.escape(raw_description)
+            return error_response(status.HTTP_400_BAD_REQUEST, "VALIDATION_ERROR", "활동 설명(description)을 입력해주세요.")
+        clean_description = raw_description
 
         if not activity_date_val:
-            return JSONResponse(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                content=SrFormat(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    success=False,
-                    data=None,
-                    error=Error(
-                        code="VALIDATION_ERROR",
-                        message="활동 일자(activity_date)를 입력해주세요.",
-                    ),
-                ).model_dump(),
-            )
+            return error_response(status.HTTP_400_BAD_REQUEST, "VALIDATION_ERROR", "활동 일자(activity_date)를 입력해주세요.")
 
         try:
             parsed_date = datetime.strptime(str(activity_date_val).strip(), "%Y-%m-%d").date()
         except ValueError:
-            return JSONResponse(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                content=SrFormat(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    success=False,
-                    data=None,
-                    error=Error(
-                        code="VALIDATION_ERROR",
-                        message="활동 일자 형식이 올바르지 않습니다. (YYYY-MM-DD 형식 필요)",
-                    ),
-                ).model_dump(),
-            )
+            return error_response(status.HTTP_400_BAD_REQUEST, "VALIDATION_ERROR", "활동 일자 형식이 올바르지 않습니다. (YYYY-MM-DD 형식 필요)")
 
         if parsed_date > date.today():
-            return JSONResponse(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                content=SrFormat(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    success=False,
-                    data=None,
-                    error=Error(
-                        code="VALIDATION_ERROR",
-                        message="활동 일자는 미래 일자일 수 없습니다.",
-                    ),
-                ).model_dump(),
-            )
+            return error_response(status.HTTP_400_BAD_REQUEST, "VALIDATION_ERROR", "활동 일자는 미래 일자일 수 없습니다.")
 
         clean_link = (link_url_val or "").strip() or None
         if clean_link:
             if not is_valid_evidence_url(clean_link):
-                return JSONResponse(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    content=SrFormat(
-                        status_code=status.HTTP_400_BAD_REQUEST,
-                        success=False,
-                        data=None,
-                        error=Error(
-                            code="VALIDATION_ERROR",
-                            message="외부 링크는 http:// 또는 https:// 형식의 올바른 웹 주소(도메인 포함)여야 합니다.",
-                        ),
-                    ).model_dump(),
-                )
+                return error_response(status.HTTP_400_BAD_REQUEST, "VALIDATION_ERROR", "외부 링크는 http:// 또는 https:// 형식의 올바른 웹 주소(도메인 포함)여야 합니다.")
             if len(clean_link) > 500:
-                return JSONResponse(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    content=SrFormat(
-                        status_code=status.HTTP_400_BAD_REQUEST,
-                        success=False,
-                        data=None,
-                        error=Error(
-                            code="VALIDATION_ERROR",
-                            message="외부 링크는 최대 500자까지 입력 가능합니다.",
-                        ),
-                    ).model_dump(),
-                )
+                return error_response(status.HTTP_400_BAD_REQUEST, "VALIDATION_ERROR", "외부 링크는 최대 500자까지 입력 가능합니다.")
 
 
         # 4. 대상 평가 항목(evaluation_items) 및 소속 영역/학년도 검증
@@ -654,97 +447,31 @@ async def handle_submit_evidence(
         eval_item = await cur.fetchone()
 
         if not eval_item:
-            return JSONResponse(
-                status_code=status.HTTP_404_NOT_FOUND,
-                content=SrFormat(
-                    status_code=status.HTTP_404_NOT_FOUND,
-                    success=False,
-                    data=None,
-                    error=Error(
-                        code="ITEM_NOT_FOUND",
-                        message="해당 평가 항목을 찾을 수 없습니다.",
-                    ),
-                ).model_dump(),
-            )
+            return error_response(status.HTTP_404_NOT_FOUND, "ITEM_NOT_FOUND", "해당 평가 항목을 찾을 수 없습니다.")
 
         is_item_active = eval_item.get("is_active") in (1, True, "1")
         if not is_item_active:
-            return JSONResponse(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                content=SrFormat(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    success=False,
-                    data=None,
-                    error=Error(
-                        code="VALIDATION_ERROR",
-                        message="비활성화된 평가 항목에는 증빙자료를 제출할 수 없습니다.",
-                    ),
-                ).model_dump(),
-            )
+            return error_response(status.HTTP_400_BAD_REQUEST, "VALIDATION_ERROR", "비활성화된 평가 항목에는 증빙자료를 제출할 수 없습니다.")
 
         # DATA-04: 신규 제출은 활성화된 학년도에만 허용 (0, False, NULL, 누락값 모두 거부)
         is_year_active = eval_item.get("year_is_activated") in (1, True, "1")
         if not is_year_active:
-            return JSONResponse(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                content=SrFormat(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    success=False,
-                    data=None,
-                    error=Error(
-                        code="ACADEMIC_YEAR_INACTIVE",
-                        message="현재 활성화된 학년도에만 신규 증빙자료를 제출할 수 있습니다.",
-                    ),
-                ).model_dump(),
-            )
+            return error_response(status.HTTP_400_BAD_REQUEST, "ACADEMIC_YEAR_INACTIVE", "현재 활성화된 학년도에만 신규 증빙자료를 제출할 수 있습니다.")
 
         # 학년도 파라미터(year) 전달 시 평가 항목 학년도와 일치 여부 검증
         if year_val is not None:
             try:
                 parsed_year = int(year_val)
                 if parsed_year != eval_item["academic_year"]:
-                    return JSONResponse(
-                        status_code=status.HTTP_400_BAD_REQUEST,
-                        content=SrFormat(
-                            status_code=status.HTTP_400_BAD_REQUEST,
-                            success=False,
-                            data=None,
-                            error=Error(
-                                code="VALIDATION_ERROR",
-                                message=f"요청한 학년도({parsed_year})와 평가 항목의 대상 학년도({eval_item['academic_year']})가 일치하지 않습니다.",
-                            ),
-                        ).model_dump(),
-                    )
+                    return error_response(status.HTTP_400_BAD_REQUEST, "VALIDATION_ERROR", f"요청한 학년도({parsed_year})와 평가 항목의 대상 학년도({eval_item['academic_year']})가 일치하지 않습니다.")
             except (ValueError, TypeError):
-                return JSONResponse(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    content=SrFormat(
-                        status_code=status.HTTP_400_BAD_REQUEST,
-                        success=False,
-                        data=None,
-                        error=Error(
-                            code="VALIDATION_ERROR",
-                            message="학년도(year)는 유효한 정수여야 합니다.",
-                        ),
-                    ).model_dump(),
-                )
+                return error_response(status.HTTP_400_BAD_REQUEST, "VALIDATION_ERROR", "학년도(year)는 유효한 정수여야 합니다.")
 
         # 인증 영역 파라미터(area) 전달 시 평가 항목 영역과 일치 여부 검증
         if area_val is not None:
             clean_area = str(area_val).strip()
             if clean_area and clean_area != eval_item["area_name"] and clean_area != str(eval_item["area_id"]):
-                return JSONResponse(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    content=SrFormat(
-                        status_code=status.HTTP_400_BAD_REQUEST,
-                        success=False,
-                        data=None,
-                        error=Error(
-                            code="VALIDATION_ERROR",
-                            message=f"요청한 인증 영역({clean_area})과 평가 항목의 소속 영역({eval_item['area_name']})이 일치하지 않습니다.",
-                        ),
-                    ).model_dump(),
-                )
+                return error_response(status.HTTP_400_BAD_REQUEST, "VALIDATION_ERROR", f"요청한 인증 영역({clean_area})과 평가 항목의 소속 영역({eval_item['area_name']})이 일치하지 않습니다.")
 
         # 5. 학생의 해당 학년도 학적 정보 조회 및 대상 학년 일치 검증
 
@@ -760,50 +487,17 @@ async def handle_submit_evidence(
         academic_record = await cur.fetchone()
 
         if not academic_record:
-            return JSONResponse(
-                status_code=status.HTTP_404_NOT_FOUND,
-                content=SrFormat(
-                    status_code=status.HTTP_404_NOT_FOUND,
-                    success=False,
-                    data=None,
-                    error=Error(
-                        code="USER_NOT_FOUND",
-                        message=f"{eval_item['academic_year']} 학년도에 등록된 해당 학생의 학적 정보가 존재하지 않습니다.",
-                    ),
-                ).model_dump(),
-            )
+            return error_response(status.HTTP_404_NOT_FOUND, "USER_NOT_FOUND", f"{eval_item['academic_year']} 학년도에 등록된 해당 학생의 학적 정보가 존재하지 않습니다.")
 
         st_grade = academic_record["grade"]
         area_grade = eval_item["area_grade"]
         target_grade = eval_item["target_grade"]
 
         if area_grade and area_grade != 0 and area_grade != st_grade:
-            return JSONResponse(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                content=SrFormat(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    success=False,
-                    data=None,
-                    error=Error(
-                        code="VALIDATION_ERROR",
-                        message=f"해당 평가 항목은 {area_grade}학년 대상입니다. (현재 학생 학년: {st_grade}학년)",
-                    ),
-                ).model_dump(),
-            )
+            return error_response(status.HTTP_400_BAD_REQUEST, "VALIDATION_ERROR", f"해당 평가 항목은 {area_grade}학년 대상입니다. (현재 학생 학년: {st_grade}학년)")
 
         if target_grade and target_grade != 0 and target_grade != st_grade:
-            return JSONResponse(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                content=SrFormat(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    success=False,
-                    data=None,
-                    error=Error(
-                        code="VALIDATION_ERROR",
-                        message=f"해당 평가 항목은 {target_grade}학년 대상입니다. (현재 학생 학년: {st_grade}학년)",
-                    ),
-                ).model_dump(),
-            )
+            return error_response(status.HTTP_400_BAD_REQUEST, "VALIDATION_ERROR", f"해당 평가 항목은 {target_grade}학년 대상입니다. (현재 학생 학년: {st_grade}학년)")
 
         # 6. 증빙자료 필수 제출 요건 검증 (requires_evidence)
         has_file = file_val is not None and bool(file_val.filename and file_val.filename.strip())
@@ -811,18 +505,7 @@ async def handle_submit_evidence(
         requires_evidence = bool(eval_item["requires_evidence"])
 
         if requires_evidence and not (has_file or has_link):
-            return JSONResponse(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                content=SrFormat(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    success=False,
-                    data=None,
-                    error=Error(
-                        code="VALIDATION_ERROR",
-                        message="해당 평가 항목은 증빙자료(첨부파일 또는 외부 링크) 제출이 필수입니다.",
-                    ),
-                ).model_dump(),
-            )
+            return error_response(status.HTTP_400_BAD_REQUEST, "VALIDATION_ERROR", "해당 평가 항목은 증빙자료(첨부파일 또는 외부 링크) 제출이 필수입니다.")
 
         # 7. 동일 세부활동 및 일자 심사 대기 또는 기인정 건 중복 제출 방어 (DUPLICATE_SUBMISSION)
         await cur.execute(
@@ -847,18 +530,7 @@ async def handle_submit_evidence(
                 if duplicate_sub.get("status_code") == 3
                 else "동일한 세부 활동 및 일자의 증빙자료가 이미 심사 대기 중입니다."
             )
-            return JSONResponse(
-                status_code=status.HTTP_409_CONFLICT,
-                content=SrFormat(
-                    status_code=status.HTTP_409_CONFLICT,
-                    success=False,
-                    data=None,
-                    error=Error(
-                        code="DUPLICATE_SUBMISSION",
-                        message=dup_msg,
-                    ),
-                ).model_dump(),
-            )
+            return error_response(status.HTTP_409_CONFLICT, "DUPLICATE_SUBMISSION", dup_msg)
 
 
     # [동시성 3.5] TOCTOU 레이스 컨디션 방어: 검증 후 파일 저장 및 DB 삽입 구간 동시 요청 직렬화
@@ -868,18 +540,7 @@ async def handle_submit_evidence(
         try:
             lock_acquired = await redis.set(lock_key, "1", nx=True, ex=10)
             if not lock_acquired:
-                return JSONResponse(
-                    status_code=status.HTTP_409_CONFLICT,
-                    content=SrFormat(
-                        status_code=status.HTTP_409_CONFLICT,
-                        success=False,
-                        data=None,
-                        error=Error(
-                            code="DUPLICATE_SUBMISSION",
-                            message="동일한 증빙자료 제출 요청이 현재 처리 중입니다. 잠시 후 결과를 확인해주세요.",
-                        ),
-                    ).model_dump(),
-                )
+                return error_response(status.HTTP_409_CONFLICT, "DUPLICATE_SUBMISSION", "동일한 증빙자료 제출 요청이 현재 처리 중입니다. 잠시 후 결과를 확인해주세요.")
         except Exception:
             pass  # Redis 장애 시에도 DB 레벨 트랜잭션 무결성으로 Fallback
 
@@ -975,18 +636,7 @@ async def handle_submit_evidence(
             # 트랜잭션 실패 시 방금 생성된 디스크 파일 롤백 삭제 (고아 파일 방지)
             if saved_disk_path:
                 delete_uploaded_file(saved_disk_path)
-            return JSONResponse(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                content=SrFormat(
-                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                    success=False,
-                    data=None,
-                    error=Error(
-                        code="DATABASE_ERROR",
-                        message="증빙자료 제출 처리 중 데이터베이스 오류가 발생했습니다.",
-                    ),
-                ).model_dump(),
-            )
+            return error_response(status.HTTP_500_INTERNAL_SERVER_ERROR, "DATABASE_ERROR", "증빙자료 제출 처리 중 데이터베이스 오류가 발생했습니다.")
         finally:
             await conn.autocommit(True)
     finally:
@@ -1109,7 +759,7 @@ async def handle_get_submissions(
     """
     user_uuid = current_user.get("uuid")
     user_role = current_user.get("role")
-    is_student = (user_role in ("student", "0", 0))
+    is_student = normalize_role(user_role) == "student"
 
     target_student_id: Optional[int] = None
 
@@ -1122,52 +772,20 @@ async def handle_get_submissions(
             )
             student_row = await cur.fetchone()
             if not student_row:
-                return JSONResponse(
-                    status_code=status.HTTP_404_NOT_FOUND,
-                    content=SrFormat(
-                        status_code=status.HTTP_404_NOT_FOUND,
-                        success=False,
-                        data=None,
-                        error=Error(code="USER_NOT_FOUND", message="학생 정보를 찾을 수 없습니다."),
-                    ).model_dump(),
-                )
+                return error_response(status.HTTP_404_NOT_FOUND, "USER_NOT_FOUND", "학생 정보를 찾을 수 없습니다.")
             own_student_id = student_row["student_id"]
             if student_id_param is not None:
                 resolved_param = await resolve_student_id(conn, student_id_param)
                 if resolved_param != own_student_id:
-                    return JSONResponse(
-                        status_code=status.HTTP_403_FORBIDDEN,
-                        content=SrFormat(
-                            status_code=status.HTTP_403_FORBIDDEN,
-                            success=False,
-                            data=None,
-                            error=Error(code="FORBIDDEN", message="본인의 제출 내역만 조회할 수 있습니다."),
-                        ).model_dump(),
-                    )
+                    return error_response(status.HTTP_403_FORBIDDEN, "FORBIDDEN", "본인의 제출 내역만 조회할 수 있습니다.")
             target_student_id = own_student_id
         else:
             # 교사 및 관리자는 studentId 파라미터 필수
             if student_id_param is None:
-                return JSONResponse(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    content=SrFormat(
-                        status_code=status.HTTP_400_BAD_REQUEST,
-                        success=False,
-                        data=None,
-                        error=Error(code="VALIDATION_ERROR", message="조회 대상 학생 식별자(studentId)가 필요합니다."),
-                    ).model_dump(),
-                )
+                return error_response(status.HTTP_400_BAD_REQUEST, "VALIDATION_ERROR", "조회 대상 학생 식별자(studentId)가 필요합니다.")
             resolved_st_id = await resolve_student_id(conn, student_id_param)
             if resolved_st_id is None:
-                return JSONResponse(
-                    status_code=status.HTTP_404_NOT_FOUND,
-                    content=SrFormat(
-                        status_code=status.HTTP_404_NOT_FOUND,
-                        success=False,
-                        data=None,
-                        error=Error(code="USER_NOT_FOUND", message="해당 학생을 찾을 수 없습니다."),
-                    ).model_dump(),
-                )
+                return error_response(status.HTTP_404_NOT_FOUND, "USER_NOT_FOUND", "해당 학생을 찾을 수 없습니다.")
             target_student_id = resolved_st_id
 
         # SEC-01: 공통 인가 계층을 통한 교사 담당 범위 및 역할 검증
@@ -1231,7 +849,7 @@ async def handle_get_submissions(
 
         # [의심-03 결정 B] 비담임/타반 교사가 조회 시 본인이 심사 권한을 가진 평가항목 제출물만 필터링하되 0건이어도 빈 배열[](200 OK) 반환
         user_role = current_user.get("role")
-        if user_role in ("teacher", "1", 1):
+        if normalize_role(user_role) == "teacher":
             user_uuid = current_user.get("uuid")
             await cur.execute(
                 "SELECT teachers_id, grade, class, position, department, subject FROM teachers WHERE uuid = %s AND is_deleted = FALSE LIMIT 1",
@@ -1358,7 +976,7 @@ async def handle_get_points(
     """
     user_uuid = current_user.get("uuid")
     user_role = current_user.get("role")
-    is_student = (user_role in ("student", "0", 0))
+    is_student = normalize_role(user_role) == "student"
 
     target_student_id: Optional[int] = None
 
@@ -1371,51 +989,19 @@ async def handle_get_points(
             )
             student_row = await cur.fetchone()
             if not student_row:
-                return JSONResponse(
-                    status_code=status.HTTP_404_NOT_FOUND,
-                    content=SrFormat(
-                        status_code=status.HTTP_404_NOT_FOUND,
-                        success=False,
-                        data=None,
-                        error=Error(code="USER_NOT_FOUND", message="학생 정보를 찾을 수 없습니다."),
-                    ).model_dump(),
-                )
+                return error_response(status.HTTP_404_NOT_FOUND, "USER_NOT_FOUND", "학생 정보를 찾을 수 없습니다.")
             own_student_id = student_row["student_id"]
             if student_id_param is not None:
                 resolved_param = await resolve_student_id(conn, student_id_param)
                 if resolved_param != own_student_id:
-                    return JSONResponse(
-                        status_code=status.HTTP_403_FORBIDDEN,
-                        content=SrFormat(
-                            status_code=status.HTTP_403_FORBIDDEN,
-                            success=False,
-                            data=None,
-                            error=Error(code="FORBIDDEN", message="본인의 상벌점 내역만 조회할 수 있습니다."),
-                        ).model_dump(),
-                    )
+                    return error_response(status.HTTP_403_FORBIDDEN, "FORBIDDEN", "본인의 상벌점 내역만 조회할 수 있습니다.")
             target_student_id = own_student_id
         else:
             if student_id_param is None:
-                return JSONResponse(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    content=SrFormat(
-                        status_code=status.HTTP_400_BAD_REQUEST,
-                        success=False,
-                        data=None,
-                        error=Error(code="VALIDATION_ERROR", message="조회 대상 학생 식별자(studentId)가 필요합니다."),
-                    ).model_dump(),
-                )
+                return error_response(status.HTTP_400_BAD_REQUEST, "VALIDATION_ERROR", "조회 대상 학생 식별자(studentId)가 필요합니다.")
             resolved_st_id = await resolve_student_id(conn, student_id_param)
             if resolved_st_id is None:
-                return JSONResponse(
-                    status_code=status.HTTP_404_NOT_FOUND,
-                    content=SrFormat(
-                        status_code=status.HTTP_404_NOT_FOUND,
-                        success=False,
-                        data=None,
-                        error=Error(code="USER_NOT_FOUND", message="해당 학생을 찾을 수 없습니다."),
-                    ).model_dump(),
-                )
+                return error_response(status.HTTP_404_NOT_FOUND, "USER_NOT_FOUND", "해당 학생을 찾을 수 없습니다.")
             target_student_id = resolved_st_id
 
         # SEC-01: 공통 인가 계층을 통한 교사 담당 범위 및 역할 검증

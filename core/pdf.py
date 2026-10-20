@@ -33,10 +33,8 @@ def ensure_korean_font_registered() -> str:
         project_root = os.path.dirname(current_dir)
 
         font_candidate_paths = [
-            os.path.join(project_root, "fonts.ttf"),
-            os.path.join(project_root, "assets", "fonts", "fonts.ttf"),
-            os.path.join(current_dir, "fonts.ttf"),
             os.path.join(project_root, "assets", "fonts", "PretendardGOV.ttf"),
+            os.path.join(project_root, "assets", "fonts", "fonts.ttf"),
             "/Users/satellite/Library/Fonts/PretendardGOVVariable.ttf",
             "/Library/Fonts/PretendardGOVVariable.ttf",
             "/System/Library/Fonts/PretendardGOVVariable.ttf",

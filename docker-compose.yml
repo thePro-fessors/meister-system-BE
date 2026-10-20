@@ -17,8 +17,10 @@ services:
       - --collation-server=utf8mb4_unicode_ci
       - --sql-mode=STRICT_TRANS_TABLES,NO_ENGINE_SUBSTITUTION
     environment:
-      MYSQL_ROOT_PASSWORD: ${DATABASE_PASSWORD:?DATABASE_PASSWORD must be set in .env}
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-${DATABASE_PASSWORD:?DATABASE_PASSWORD must be set in .env}}
       MYSQL_DATABASE: ${DATABASE_NAME:-swMeister}
+      MYSQL_USER: ${DATABASE_USER:-meister_app}
+      MYSQL_PASSWORD: ${DATABASE_PASSWORD:?DATABASE_PASSWORD must be set in .env}
     volumes:
       - mysql_data:/var/lib/mysql
       - ./databases.sql:/docker-entrypoint-initdb.d/01_databases.sql:ro
@@ -81,11 +83,13 @@ services:
       DATABASE_HOST: mysql
       DATABASE_PORT: 3306
       DATABASE_NAME: ${DATABASE_NAME:-swMeister}
-      DATABASE_USER: ${DATABASE_USER:-root}
+      DATABASE_USER: ${DATABASE_USER:-meister_app}
       DATABASE_PASSWORD: ${DATABASE_PASSWORD}
+      ADMIN_REGISTRATION_CODE: ${ADMIN_REGISTRATION_CODE:?ADMIN_REGISTRATION_CODE must be set in .env}
       REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
       UPLOAD_DIR: /app/uploads
       TRUSTED_PROXIES: "127.0.0.1,nginx,172.16.0.0/12,192.168.0.0/16,10.0.0.0/8"
+      TRUST_CLOUDFLARE_HEADERS: ${TRUST_CLOUDFLARE_HEADERS:-false}
     volumes:
       - upload_data:/app/uploads
     depends_on:
@@ -114,8 +118,7 @@ services:
     volumes:
       - ./nginx/nginx.conf:/etc/nginx/conf.d/default.conf:ro
       - upload_data:/var/www/uploads:ro
-      # SSL 인증서 적용 시 아래 볼륨 활성화
-      # - ./nginx/certs:/etc/nginx/certs:ro
+      - ./nginx/certs:/etc/nginx/certs:ro
     depends_on:
       - backend
     networks:
@@ -127,8 +130,10 @@ services:
   frontend:
     image: meister-frontend:latest
     build:
-      context: ./fe
+      context: ${FE_BUILD_CONTEXT:-../FE}
       dockerfile: Dockerfile
+      args:
+        NEXT_PUBLIC_API_BASE_URL: ${NEXT_PUBLIC_API_BASE_URL:-}
     container_name: meister_frontend
     restart: unless-stopped
     environment:

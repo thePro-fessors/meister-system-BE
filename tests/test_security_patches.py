@@ -10,7 +10,7 @@ import shutil
 import tempfile
 import time
 import unittest
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from fastapi.testclient import TestClient
 
@@ -66,7 +66,7 @@ class MockRedis:
         return True
 
     async def ttl(self, key):
-        return self.ttls.get(key, 300)
+        return self.ttls.get(key, 300 if key in self.data else -2)
 
     async def delete(self, key):
         self.data.pop(key, None)
@@ -78,6 +78,10 @@ class MockRedis:
         return val
 
     async def eval(self, script, numkeys, *args):
+        if "INCR" in script:
+            return await self.incr(args[0])
+        if "remaining_uses" in script:
+            raise AttributeError("Use fallback in mock")
         key = args[0]
         req_path = args[1] if len(args) > 1 else ""
         raw = self.data.get(key)
@@ -280,11 +284,14 @@ class TestSecurityPatches(unittest.IsolatedAsyncioTestCase):
         # 체인 우측(10.0.0.2: 사설 프록시)을 건너뛰고 비신뢰 발신자 198.51.100.5를 추출해야 함
         self.assertEqual(get_client_ip(req_trusted_proxy), "198.51.100.5")
 
-        # (3) Cloudflare 경유 시 CF-Connecting-IP 신뢰
+        # (3) Cloudflare 경유 시 TRUST_CLOUDFLARE_HEADERS=true 일 때만 CF-Connecting-IP 신뢰
         req_cf = MagicMock()
         req_cf.client.host = "127.0.0.1"
         req_cf.headers = {"CF-Connecting-IP": "198.51.100.77"}
-        self.assertEqual(get_client_ip(req_cf), "198.51.100.77")
+        with patch.dict(os.environ, {"TRUST_CLOUDFLARE_HEADERS": "false"}):
+            self.assertEqual(get_client_ip(req_cf), "127.0.0.1")
+        with patch.dict(os.environ, {"TRUST_CLOUDFLARE_HEADERS": "true"}):
+            self.assertEqual(get_client_ip(req_cf), "198.51.100.77")
 
     # ==========================================================================
     # 2. 일회용 다운로드 티켓 (SECURITY_AND_AUDIT.md 1.2 & TODO.md 6.1 P1)
@@ -647,3 +654,82 @@ class TestSecurityPatches(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(res_locked.status_code, 409)
         self.assertEqual(res_locked.json()["error"]["code"], "CONCURRENT_REQUEST")
         await self.mock_redis.delete(lock_key)
+
+    # ==========================================================================
+    # 14. 추가 감사(Audit) 16대 항목 전수 검증
+    # ==========================================================================
+    async def test_audit_items_1_3_4_5_15(self):
+        """[보안 감사] 관리자 기본코드 제거(1), 삭제교사 상벌점 차단(3), 전역 토큰 무효화(4), 초대코드 원자적 차감(5), 학번/로그인ID 모호성 제거(15) 검증"""
+        from core.authorization import authorize_point_mutation
+        from core.security import revoke_all_user_tokens
+        from routers.auth import _consume_invitation_code_atomically
+
+        # (Item 1) ADMIN_REGISTRATION_CODE 미설정 시 정적 관리자 코드로 OTP 요청 차단 (403)
+        await self.mock_redis.delete("rate_limit:otp:ip:testclient")
+        with patch.dict(os.environ, {"ADMIN_REGISTRATION_CODE": ""}):
+            res_otp = self.client.post(
+                "/api/auth/send-otp",
+                json={"email": "attacker@gmail.com", "admin_code": "MEISTER_ADMIN_2026!"},
+            )
+            self.assertEqual(res_otp.status_code, 403)
+
+        # (Item 3) 교사 레코드가 없는(soft-deleted) 교사의 상벌점 수정/삭제 차단 (403)
+        class EmptyTeacherConn:
+            def cursor(self, *args, **kwargs):
+                return self
+            async def __aenter__(self):
+                return self
+            async def __aexit__(self, *args):
+                pass
+            async def execute(self, q, params=None):
+                pass
+            async def fetchone(self):
+                return None
+
+        mut_err = await authorize_point_mutation(
+            {"uuid": "deleted-teacher-uuid", "role": "teacher"},
+            {"merits_point_id": 1, "teachers_id": 99},
+            EmptyTeacherConn(),
+            action="modify",
+        )
+        self.assertIsNotNone(mut_err)
+        self.assertEqual(mut_err.status_code, 403)
+
+        # (Item 4) 사용자 전역 토큰 무효화(revoke_all_user_tokens) 시 기존 토큰 즉시 401 차단 및 면제 토큰 허용
+        old_token = create_access_token({"sub": "student-uuid-1", "id": "s1", "role": "student"})
+        new_token = create_access_token({"sub": "student-uuid-1", "id": "s1", "role": "student"})
+        import jwt as pyjwt
+        from core.security import JWT_ALGORITHM, JWT_SECRET_KEY
+        new_jti = pyjwt.decode(new_token, JWT_SECRET_KEY, algorithms=[JWT_ALGORITHM])["jti"]
+        await revoke_all_user_tokens(self.mock_redis, "student-uuid-1", exempt_jti=new_jti)
+
+        res_old = self.client.get("/api/submissions/101", headers={"Authorization": f"Bearer {old_token}"})
+        self.assertEqual(res_old.status_code, 401)
+        res_new = self.client.get("/api/submissions/101", headers={"Authorization": f"Bearer {new_token}"})
+        self.assertEqual(res_new.status_code, 200)
+        await self.mock_redis.delete("user_token_revoked_at:student-uuid-1")
+
+        # (Item 5) 1회용 초대코드 원자적 차감 검증 (첫 번째 성공, 두 번째 즉시 None 반환)
+        inv_code = "TCH-07EA-ABCDEF"
+        await self.mock_redis.set(
+            f"invitation_code:{inv_code}",
+            json.dumps({"code": inv_code, "role": "teacher", "target_role": 1, "remaining_uses": 1}),
+            ex=3600,
+        )
+        first_use = await _consume_invitation_code_atomically(self.mock_redis, inv_code)
+        self.assertIsNotNone(first_use)
+        second_use = await _consume_invitation_code_atomically(self.mock_redis, inv_code)
+        self.assertIsNone(second_use)
+
+        # (Item 15) 숫자로만 이루어진 로그인 ID 가입 차단 (400 VALIDATION_ERROR)
+        res_num_id = self.client.post(
+            "/api/auth/register",
+            json={
+                "id": "12345",
+                "email": "student1@bssm.hs.kr",
+                "password": "ValidPassword123!",
+                "register_token": "dummy_token",
+            },
+        )
+        self.assertEqual(res_num_id.status_code, 400)
+        self.assertEqual(res_num_id.json()["error"]["code"], "VALIDATION_ERROR")

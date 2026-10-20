@@ -378,6 +378,10 @@ class TestAITeacherServices(unittest.TestCase):
         os.environ.pop("TEACHER_AI_API_KEY", None)
         os.environ.pop("GEMINI_API_KEY", None)
         os.environ.pop("AI_API_KEY", None)
+        os.environ.pop("GEMINI_MODEL", None)
+        os.environ.pop("GEMINI_TEACHER_MODEL", None)
+        os.environ.pop("TEACHER_AI_MODEL", None)
+        os.environ.pop("AI_MODEL", None)
         os.environ.pop("GEMINI_TEACHER_MODEL", None)
 
     def tearDown(self):
@@ -848,6 +852,10 @@ class TestAITeacherServices(unittest.TestCase):
         os.environ.pop("TEACHER_AI_API_KEY", None)
         os.environ.pop("GEMINI_API_KEY", None)
         os.environ.pop("AI_API_KEY", None)
+        os.environ.pop("GEMINI_MODEL", None)
+        os.environ.pop("GEMINI_TEACHER_MODEL", None)
+        os.environ.pop("TEACHER_AI_MODEL", None)
+        os.environ.pop("AI_MODEL", None)
         k, m = get_teacher_ai_config()
         self.assertEqual(k, "")
         self.assertEqual(m, "gemini-3.5-flash-lite")
