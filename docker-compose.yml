@@ -88,7 +88,7 @@ services:
       ADMIN_REGISTRATION_CODE: ${ADMIN_REGISTRATION_CODE:?ADMIN_REGISTRATION_CODE must be set in .env}
       REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
       UPLOAD_DIR: /app/uploads
-      TRUSTED_PROXIES: "127.0.0.1,nginx,172.16.0.0/12,192.168.0.0/16,10.0.0.0/8"
+      TRUSTED_PROXIES: "127.0.0.1,nginx,172.16.0.0/12"
       TRUST_CLOUDFLARE_HEADERS: ${TRUST_CLOUDFLARE_HEADERS:-false}
     volumes:
       - upload_data:/app/uploads
@@ -161,3 +161,8 @@ volumes:
 networks:
   meister_network:
     driver: bridge
+    ipam:
+      driver: default
+      config:
+        - subnet: 172.28.0.0/16
+          gateway: 172.28.0.1
