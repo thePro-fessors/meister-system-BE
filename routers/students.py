@@ -303,6 +303,9 @@ async def get_certification_status(
         "pendingCount": calc_res["pendingCount"],
         "totalMeritScore": calc_res["totalMeritScore"],
         "pointTotal": calc_res.get("pointTotal", calc_res.get("totalMeritScore", 0.0)),
+        "isAllS": calc_res.get("isAllS", False),
+        "canPrintEvaluation": calc_res.get("canPrintEvaluation", False),
+        "unmetAreas": calc_res.get("unmetAreas", []),
     }
 
     return SrFormat(
@@ -768,6 +771,7 @@ SUBMISSION_STATUS_MAP: dict[int, str] = {
     3: "인정완료",
     4: "반려",
     5: "재제출요청",
+    6: "이의신청",
 }
 
 MERIT_TYPE_MAP: dict[str, str] = {

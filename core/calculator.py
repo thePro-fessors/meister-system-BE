@@ -163,6 +163,8 @@ def calculate_student_certification(
     area_results: List[Dict[str, Any]] = []
     total_score = 0.0
     all_areas_achieved = True if areas else False
+    is_all_s = True if areas else False
+    unmet_areas: List[Dict[str, Any]] = []
 
     for area in areas:
         aid = area["area_id"]
@@ -193,8 +195,18 @@ def calculate_student_certification(
         pending_cnt = area_pending_counts.get(aid, 0)
         status_str = calculate_area_status(grade_str, pending_cnt)
 
+        if grade_str != "S":
+            is_all_s = False
+
         if grade_str not in ("S", "A"):
             all_areas_achieved = False
+            unmet_areas.append({
+                "areaId": aid,
+                "area": aname,
+                "grade": grade_str,
+                "score": final_score,
+                "maxScore": amax,
+            })
 
         total_score += final_score
         area_results.append({
@@ -226,4 +238,7 @@ def calculate_student_certification(
         "pendingCount": total_pending_count,
         "totalMeritScore": round_decimal(total_merit_score, 1),
         "pointTotal": round_decimal(total_merit_score, 1),
+        "isAllS": is_all_s,
+        "canPrintEvaluation": bool(all_areas_achieved),
+        "unmetAreas": unmet_areas,
     }

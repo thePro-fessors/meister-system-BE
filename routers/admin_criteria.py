@@ -707,6 +707,7 @@ async def get_criteria(
                 scoring_type AS scoringType,
                 target_grade AS targetGrade,
                 requires_evidence AS requiresEvidence,
+                rule_config AS ruleConfig,
                 is_active AS isActive
             FROM evaluation_items
             WHERE area_id IN ({placeholders}) AND is_active = TRUE
@@ -754,6 +755,16 @@ async def get_criteria(
         it_id = it.get("itemId") or it.get("item_id")
         sc_type_code = it.get("scoringType") or it.get("scoring_type")
         sc_type_name = SCORING_TYPE_NAMES.get(sc_type_code, "고정점수형") if isinstance(sc_type_code, int) else str(sc_type_code or "고정점수형")
+        raw_rc = it.get("ruleConfig") or it.get("rule_config")
+        parsed_rc = None
+        if isinstance(raw_rc, (dict, list)):
+            parsed_rc = raw_rc
+        elif isinstance(raw_rc, str) and raw_rc.strip():
+            try:
+                parsed_rc = json.loads(raw_rc)
+            except Exception:
+                parsed_rc = None
+
         norm_it = {
             "itemId": it_id,
             "areaId": it_area_id,
@@ -765,6 +776,8 @@ async def get_criteria(
             "scoringTypeName": sc_type_name,
             "targetGrade": it.get("targetGrade") or it.get("target_grade"),
             "requiresEvidence": bool(it.get("requiresEvidence") if "requiresEvidence" in it else it.get("requires_evidence", False)),
+            "ruleConfig": parsed_rc,
+            "rule_config": parsed_rc,
             "isActive": bool(it.get("isActive") if "isActive" in it else it.get("is_active", True)),
             "teacherIds": item_teacher_ids_map.get(it_id, []),
             "assignedTeachers": item_teachers_map.get(it_id, []),
@@ -950,6 +963,9 @@ async def create_criteria_item(
         return error_response(400, "VALIDATION_ERROR", "담당 부서명은 최대 40자까지 가능합니다.")
     clean_dept = raw_dept if raw_dept else None
 
+    rule_config_val = req.rule_config if req.rule_config is not None else req.ruleConfig
+    rule_config_json = json.dumps(rule_config_val, ensure_ascii=False) if rule_config_val is not None else None
+
     async with conn.cursor(cursor=DictCursor) as cur:
         await cur.execute("SELECT area_id FROM certification_areas WHERE area_id = %s LIMIT 1", (area_id,))
         if not await cur.fetchone():
@@ -959,22 +975,33 @@ async def create_criteria_item(
             await cur.execute(
                 """
                 INSERT INTO evaluation_items (
-                    area_id, name, subject, department, max_score, scoring_type, target_grade, requires_evidence, is_active
+                    area_id, name, subject, department, max_score, scoring_type, target_grade, requires_evidence, rule_config, is_active
                 )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, TRUE)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, TRUE)
                 """,
-                (area_id, clean_name, clean_subj, clean_dept, max_score, scoring_type, target_grade, requires_ev),
+                (area_id, clean_name, clean_subj, clean_dept, max_score, scoring_type, target_grade, requires_ev, rule_config_json),
             )
         except Exception:
-            await cur.execute(
-                """
-                INSERT INTO evaluation_items (
-                    area_id, name, department, max_score, scoring_type, target_grade, requires_evidence, is_active
+            try:
+                await cur.execute(
+                    """
+                    INSERT INTO evaluation_items (
+                        area_id, name, department, max_score, scoring_type, target_grade, requires_evidence, rule_config, is_active
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, TRUE)
+                    """,
+                    (area_id, clean_name, clean_dept, max_score, scoring_type, target_grade, requires_ev, rule_config_json),
                 )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, TRUE)
-                """,
-                (area_id, clean_name, clean_dept, max_score, scoring_type, target_grade, requires_ev),
-            )
+            except Exception:
+                await cur.execute(
+                    """
+                    INSERT INTO evaluation_items (
+                        area_id, name, department, max_score, scoring_type, target_grade, requires_evidence, is_active
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, TRUE)
+                    """,
+                    (area_id, clean_name, clean_dept, max_score, scoring_type, target_grade, requires_ev),
+                )
         await cur.execute("SELECT LAST_INSERT_ID() AS last_id")
         last_row = await cur.fetchone()
         item_id = last_row[0] if isinstance(last_row, (list, tuple)) else last_row["last_id"]
@@ -1044,6 +1071,8 @@ async def create_criteria_item(
                 "scoringType": scoring_type,
                 "targetGrade": target_grade,
                 "requiresEvidence": requires_ev,
+                "ruleConfig": rule_config_val,
+                "rule_config": rule_config_val,
                 "teacherIds": assigned_teacher_ids,
                 "assignedTeachers": assigned_teachers,
             },
@@ -1108,6 +1137,25 @@ async def update_criteria_item(
         new_req_ev = req.requires_evidence if req.requires_evidence is not None else (req.requiresEvidence if req.requiresEvidence is not None else existing.get("requires_evidence", existing.get("requiresEvidence", True)))
         new_active = req.is_active if req.is_active is not None else (req.isActive if req.isActive is not None else existing.get("is_active", existing.get("isActive", True)))
 
+        rule_config_val = req.rule_config if req.rule_config is not None else req.ruleConfig
+        if rule_config_val is not None:
+            new_rule_config_json = json.dumps(rule_config_val, ensure_ascii=False)
+            effective_rule_config = rule_config_val
+        else:
+            raw_ex_rc = existing.get("rule_config")
+            if isinstance(raw_ex_rc, (dict, list)):
+                new_rule_config_json = json.dumps(raw_ex_rc, ensure_ascii=False)
+                effective_rule_config = raw_ex_rc
+            elif isinstance(raw_ex_rc, str) and raw_ex_rc.strip():
+                new_rule_config_json = raw_ex_rc
+                try:
+                    effective_rule_config = json.loads(raw_ex_rc)
+                except Exception:
+                    effective_rule_config = None
+            else:
+                new_rule_config_json = None
+                effective_rule_config = None
+
         try:
             await cur.execute(
                 """
@@ -1119,26 +1167,44 @@ async def update_criteria_item(
                     scoring_type = %s,
                     target_grade = %s,
                     requires_evidence = %s,
+                    rule_config = %s,
                     is_active = %s
                 WHERE item_id = %s
                 """,
-                (new_name, new_subj, new_dept, new_max_score, new_type, new_grade, new_req_ev, new_active, item_id),
+                (new_name, new_subj, new_dept, new_max_score, new_type, new_grade, new_req_ev, new_rule_config_json, new_active, item_id),
             )
         except Exception:
-            await cur.execute(
-                """
-                UPDATE evaluation_items
-                SET name = %s,
-                    department = %s,
-                    max_score = %s,
-                    scoring_type = %s,
-                    target_grade = %s,
-                    requires_evidence = %s,
-                    is_active = %s
-                WHERE item_id = %s
-                """,
-                (new_name, new_dept, new_max_score, new_type, new_grade, new_req_ev, new_active, item_id),
-            )
+            try:
+                await cur.execute(
+                    """
+                    UPDATE evaluation_items
+                    SET name = %s,
+                        department = %s,
+                        max_score = %s,
+                        scoring_type = %s,
+                        target_grade = %s,
+                        requires_evidence = %s,
+                        rule_config = %s,
+                        is_active = %s
+                    WHERE item_id = %s
+                    """,
+                    (new_name, new_dept, new_max_score, new_type, new_grade, new_req_ev, new_rule_config_json, new_active, item_id),
+                )
+            except Exception:
+                await cur.execute(
+                    """
+                    UPDATE evaluation_items
+                    SET name = %s,
+                        department = %s,
+                        max_score = %s,
+                        scoring_type = %s,
+                        target_grade = %s,
+                        requires_evidence = %s,
+                        is_active = %s
+                    WHERE item_id = %s
+                    """,
+                    (new_name, new_dept, new_max_score, new_type, new_grade, new_req_ev, new_active, item_id),
+                )
 
         tids = req.teacher_ids if req.teacher_ids is not None else req.teacherIds
         if tids is not None:
@@ -1203,6 +1269,8 @@ async def update_criteria_item(
             "scoringType": new_type,
             "targetGrade": new_grade,
             "requiresEvidence": bool(new_req_ev),
+            "ruleConfig": effective_rule_config,
+            "rule_config": effective_rule_config,
             "isActive": bool(new_active),
             "teacherIds": assigned_teacher_ids,
             "assignedTeachers": assigned_teachers,

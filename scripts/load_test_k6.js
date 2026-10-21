@@ -4,7 +4,7 @@
  * 시나리오:
  * 1. 500명의 가상 학생(VUs)이 3분 동안 단계적으로 동시 유입 (Ramping VUs)
  * 2. 학생 로그인 (POST /api/auth/login)
- * 3. 마이스터 취득 현황 대시보드 조회 (GET /api/students/me)
+ * 3. 내 정보 및 세션 검증 조회 (GET /api/auth/me)
  * 4. 내 제출 내역 목록 조회 (GET /api/submissions)
  * 5. 마감 직전 증빙자료 동시 제출 (POST /api/submissions)
  * 
@@ -71,10 +71,10 @@ export default function () {
     'Authorization': `Bearer ${token}`,
   };
 
-  // 2. 대시보드 조회
-  const meRes = http.get(`${BASE_URL}/api/students/me`, { headers: authHeaders });
+  // 2. 내 정보 및 세션 검증 조회
+  const meRes = http.get(`${BASE_URL}/api/auth/me`, { headers: authHeaders });
   check(meRes, {
-    'dashboard status is 200': (r) => r.status === 200,
+    'auth me status is 200': (r) => r.status === 200,
   });
 
   // 3. 제출 내역 조회
