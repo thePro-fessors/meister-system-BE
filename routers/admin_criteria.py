@@ -695,27 +695,50 @@ async def get_criteria(
                 "assignedTeachers": area_teachers_map.get(a_id, []),
             })
 
-        await cur.execute(
-            f"""
-            SELECT 
-                item_id AS itemId,
-                area_id AS areaId,
-                name,
-                subject,
-                department,
-                max_score AS maxScore,
-                scoring_type AS scoringType,
-                target_grade AS targetGrade,
-                requires_evidence AS requiresEvidence,
-                rule_config AS ruleConfig,
-                is_active AS isActive
-            FROM evaluation_items
-            WHERE area_id IN ({placeholders}) AND is_active = TRUE
-            ORDER BY item_id ASC
-            """,
-            tuple(area_ids),
-        )
-        items = await cur.fetchall() or []
+        try:
+            await cur.execute(
+                f"""
+                SELECT 
+                    item_id AS itemId,
+                    area_id AS areaId,
+                    name,
+                    subject,
+                    department,
+                    max_score AS maxScore,
+                    scoring_type AS scoringType,
+                    target_grade AS targetGrade,
+                    requires_evidence AS requiresEvidence,
+                    rule_config AS ruleConfig,
+                    is_active AS isActive
+                FROM evaluation_items
+                WHERE area_id IN ({placeholders}) AND is_active = TRUE
+                ORDER BY item_id ASC
+                """,
+                tuple(area_ids),
+            )
+            items = await cur.fetchall() or []
+        except Exception:
+            await cur.execute(
+                f"""
+                SELECT 
+                    item_id AS itemId,
+                    area_id AS areaId,
+                    name,
+                    subject,
+                    department,
+                    max_score AS maxScore,
+                    scoring_type AS scoringType,
+                    target_grade AS targetGrade,
+                    requires_evidence AS requiresEvidence,
+                    NULL AS ruleConfig,
+                    is_active AS isActive
+                FROM evaluation_items
+                WHERE area_id IN ({placeholders}) AND is_active = TRUE
+                ORDER BY item_id ASC
+                """,
+                tuple(area_ids),
+            )
+            items = await cur.fetchall() or []
 
         # 항목 전담 교사 N명 매핑 조회
         item_teachers_map: Dict[int, List[Dict[str, Any]]] = {}
