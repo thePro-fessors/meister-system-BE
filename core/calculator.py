@@ -4,7 +4,7 @@ core/calculator.py - 역량인증제 평가 점수 및 성취 등급/인증 상�
 """
 
 from decimal import Decimal, ROUND_HALF_UP
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 
 def round_decimal(value: float | Decimal, places: int = 1) -> float:
@@ -37,6 +37,66 @@ def calculate_area_status(grade: str, pending_count: int) -> str:
     return "보완 필요"
 
 
+def evaluate_composite_rule(
+    scores: List[float],
+    rule_config: Optional[Dict[str, Any]],
+    item_max_limit: Optional[float],
+    scoring_type: Optional[int] = None,
+) -> float:
+    """
+    복합 배점 룰(Composite Rules)에 따라 항목 점수를 산출합니다.
+    - rule_config 지원 유형:
+      1) "BEST_WITH_BONUS":
+         최상위 1건(100%) + 추가 건수당 bonus_per_extra점 가산 (최대 bonus_cap점 한도)
+      2) "TIERED_DECAY":
+         점수 내림차순 정렬 후 순위별 감쇄 비율 적용 (예: 1위 1.0, 2위 0.5, 3위 0.25 등)
+      3) 기본값:
+         scoring_type == 8 이면 최고 점수(max), 그 외에는 단순 누적(sum)
+    - 최종 점수는 item_max_limit 초과 시 클램핑됩니다.
+    """
+    if not scores:
+        return 0.0
+
+    sorted_scores = sorted(scores, reverse=True)
+
+    if rule_config and isinstance(rule_config, dict):
+        rule_type = rule_config.get("type", "").upper()
+
+        if rule_type == "BEST_WITH_BONUS":
+            best = sorted_scores[0]
+            extra_count = len(sorted_scores) - 1
+            bonus_per_extra = float(rule_config.get("bonus_per_extra", 2.0))
+            bonus_cap = float(rule_config.get("bonus_cap", 4.0))
+
+            extra_bonus = min(extra_count * bonus_per_extra, bonus_cap)
+            total = best + extra_bonus
+            if item_max_limit is not None:
+                total = min(total, item_max_limit)
+            return round_decimal(total, 1)
+
+        elif rule_type == "TIERED_DECAY":
+            decay_rates = rule_config.get("decay_rates", [1.0, 0.5, 0.25])
+            total = 0.0
+            for idx, sc in enumerate(sorted_scores):
+                rate = float(decay_rates[idx]) if idx < len(decay_rates) else 0.0
+                total += sc * rate
+            if item_max_limit is not None:
+                total = min(total, item_max_limit)
+            return round_decimal(total, 1)
+
+    # 기본 평가 분기
+    if scoring_type == 8:  # 8: 최상위인정형
+        best = sorted_scores[0]
+        if item_max_limit is not None:
+            best = min(best, item_max_limit)
+        return round_decimal(best, 1)
+    else:  # 일반 누적 합산형
+        item_sum = sum(sorted_scores)
+        if item_max_limit is not None:
+            item_sum = min(item_sum, item_max_limit)
+        return round_decimal(item_sum, 1)
+
+
 def calculate_student_certification(
     areas: List[Dict[str, Any]],
     submissions: List[Dict[str, Any]],
@@ -66,6 +126,7 @@ def calculate_student_certification(
             area_item_meta[iid] = {
                 "scoring_type": sc_type,
                 "item_max_score": item_max,
+                "rule_config": sub.get("rule_config"),
             }
 
         # 상태 코드 1(제출완료) 또는 2(검토중) -> 심사 대기
@@ -116,16 +177,9 @@ def calculate_student_certification(
             sc_type = meta.get("scoring_type")
             item_max_limit = meta.get("item_max_score")
 
-            if sc_type == 8:  # 8: 최상위인정형
-                best = max(scores) if scores else 0.0
-                if item_max_limit is not None:
-                    best = min(best, item_max_limit)
-                area_raw_score += best
-            else:  # 일반 누적 합산형
-                item_sum = sum(scores)
-                if item_max_limit is not None:
-                    item_sum = min(item_sum, item_max_limit)
-                area_raw_score += item_sum
+            rule_cfg = meta.get("rule_config")
+            item_score = evaluate_composite_rule(scores, rule_cfg, item_max_limit, sc_type)
+            area_raw_score += item_score
 
         # 상벌점 가산/감점 반영
         merit_adj = area_merit_points.get(aname, 0.0)

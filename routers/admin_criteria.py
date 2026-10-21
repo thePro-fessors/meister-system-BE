@@ -115,6 +115,8 @@ class CreateItemRequest(BaseModel):
     requiresEvidence: Optional[bool] = None
     teacher_ids: Optional[List[int]] = None
     teacherIds: Optional[List[int]] = None
+    rule_config: Optional[Dict[str, Any]] = None
+    ruleConfig: Optional[Dict[str, Any]] = None
 
 
 class UpdateItemRequest(BaseModel):
@@ -128,6 +130,9 @@ class UpdateItemRequest(BaseModel):
     target_grade: Optional[int] = None
     targetGrade: Optional[int] = None
     requires_evidence: Optional[bool] = None
+    requiresEvidence: Optional[bool] = None
+    rule_config: Optional[Dict[str, Any]] = None
+    ruleConfig: Optional[Dict[str, Any]] = None
     requiresEvidence: Optional[bool] = None
     is_active: Optional[bool] = None
     isActive: Optional[bool] = None

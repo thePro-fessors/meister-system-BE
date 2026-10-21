@@ -63,6 +63,7 @@ CREATE TABLE evaluation_items
   department        VARCHAR(40)  NULL     COMMENT '3순위: 평가 담당 부서 (NULL이면 상위 영역 상속)',
   scoring_type      TINYINT      NOT NULL COMMENT '점수 산정 방식',
   requires_evidence BOOL         NOT NULL DEFAULT TRUE,
+  rule_config       JSON         NULL     COMMENT '복합 배점 룰 설정 (가산점 캡, 감쇄비율 등)',
   is_active         BOOL         NULL     DEFAULT FALSE COMMENT '활성 상태',
   PRIMARY KEY (item_id)
 ) COMMENT '세부 평가 항목 테이블';
@@ -413,5 +414,18 @@ INSERT INTO submissions_status (status_code, description) VALUES
   (2, '검토중'),
   (3, '인정완료'),
   (4, '반려'),
-  (5, '재제출요청')
+  (5, '재제출요청'),
+  (6, '이의신청')
 ON DUPLICATE KEY UPDATE description = VALUES(description);
+
+-- ============================================================================
+-- 대량 동시 접속(500명) 및 심사 대시보드 쿼리 가속 인덱스 (P1 2.5)
+-- ============================================================================
+CREATE INDEX idx_submissions_student_item_perf
+  ON submissions (student_id, item_id, is_deleted);
+
+CREATE INDEX idx_submissions_status_review_perf
+  ON submissions (status_code, is_deleted);
+
+CREATE INDEX idx_sar_year_grade_class_perf
+  ON student_academic_records (year_id, grade, class_no);

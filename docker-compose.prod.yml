@@ -1,0 +1,170 @@
+# ==============================================================================
+# docker-compose.prod.yml - 마이스터 역량인증제 프로덕션 원클릭 배포 오케스트레이션
+# ==============================================================================
+version: "3.8"
+
+services:
+  # ----------------------------------------------------------------------------
+  # 1. MySQL 8.0 Database Service (Production Hardened)
+  # ----------------------------------------------------------------------------
+  mysql:
+    image: mysql:8.0
+    container_name: meister_prod_mysql
+    restart: always
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "10"
+    command:
+      - --default-authentication-plugin=mysql_native_password
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+      - --sql-mode=STRICT_TRANS_TABLES,NO_ENGINE_SUBSTITUTION
+      - --max_connections=500
+    environment:
+      MYSQL_ROOT_PASSWORD: ${DATABASE_PASSWORD:?DATABASE_PASSWORD must be set in .env.production}
+      MYSQL_DATABASE: ${DATABASE_NAME:-swMeister}
+      MYSQL_USER: ${DATABASE_USER:-meister_app}
+      MYSQL_PASSWORD: ${DATABASE_PASSWORD:?DATABASE_PASSWORD must be set in .env.production}
+    volumes:
+      - mysql_prod_data:/var/lib/mysql
+      - ./databases.sql:/docker-entrypoint-initdb.d/01_databases.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -u root -p$${MYSQL_ROOT_PASSWORD}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    networks:
+      - meister_prod_net
+
+  # ----------------------------------------------------------------------------
+  # 2. Redis 7.0 In-Memory Cache & Session Lock (Protected Mode & Auth)
+  # ----------------------------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    container_name: meister_prod_redis
+    restart: always
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "20m"
+        max-file: "5"
+    command: >
+      sh -c 'redis-server --requirepass "${REDIS_PASSWORD:?REDIS_PASSWORD must be set in .env.production}"
+      --maxmemory 512mb --maxmemory-policy allkeys-lru --save 900 1 --save 300 10'
+    volumes:
+      - redis_prod_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - meister_prod_net
+
+  # ----------------------------------------------------------------------------
+  # 3. FastAPI Backend Application (Gunicorn + Uvicorn Workers)
+  # ----------------------------------------------------------------------------
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: meister_prod_backend
+    restart: always
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "10"
+    environment:
+      ENVIRONMENT: production
+      PROD: "true"
+      DATABASE_HOST: mysql
+      DATABASE_PORT: 3306
+      DATABASE_USER: ${DATABASE_USER:-meister_app}
+      DATABASE_PASSWORD: ${DATABASE_PASSWORD:?DATABASE_PASSWORD must be set}
+      DATABASE_NAME: ${DATABASE_NAME:-swMeister}
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET must be set}
+      ADMIN_REGISTRATION_CODE: ${ADMIN_REGISTRATION_CODE:?ADMIN_REGISTRATION_CODE must be set}
+      NEIS_API_KEY: ${NEIS_API_KEY:-}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      AI_PROVIDER: ${AI_PROVIDER:-gemini}
+      STORAGE_BACKEND: ${STORAGE_BACKEND:-local}
+    volumes:
+      - meister_prod_uploads:/app/uploads
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python -c 'import urllib.request; urllib.request.urlopen(\"http://127.0.0.1:8000/api/health\")' || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    networks:
+      - meister_prod_net
+
+  # ----------------------------------------------------------------------------
+  # 4. Next.js Frontend Application (Standalone Node Runner)
+  # ----------------------------------------------------------------------------
+  frontend:
+    build:
+      context: ./fe
+      dockerfile: Dockerfile
+      args:
+        NEXT_PUBLIC_API_BASE_URL: ""
+    container_name: meister_prod_frontend
+    restart: always
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "20m"
+        max-file: "5"
+    environment:
+      NODE_ENV: production
+      PORT: 3000
+    depends_on:
+      - backend
+    networks:
+      - meister_prod_net
+
+  # ----------------------------------------------------------------------------
+  # 5. Nginx Reverse Proxy (SSL Termination & Gzip Compression)
+  # ----------------------------------------------------------------------------
+  nginx:
+    image: nginx:1.25-alpine
+    container_name: meister_prod_nginx
+    restart: always
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/conf.d:/etc/nginx/conf.d:ro
+      - ./nginx/ssl:/etc/nginx/ssl:ro
+      - meister_prod_uploads:/app/uploads:ro
+    depends_on:
+      - backend
+      - frontend
+    networks:
+      - meister_prod_net
+
+# ------------------------------------------------------------------------------
+# Persistent Volumes & Private Network
+# ------------------------------------------------------------------------------
+volumes:
+  mysql_prod_data:
+    driver: local
+  redis_prod_data:
+    driver: local
+  meister_prod_uploads:
+    driver: local
+
+networks:
+  meister_prod_net:
+    driver: bridge
