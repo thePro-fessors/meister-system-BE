@@ -75,6 +75,7 @@ class CreateYearRequest(BaseModel):
     is_activated: Optional[bool] = None
     isActivated: Optional[bool] = None
     active: Optional[bool] = None
+    status: Optional[str] = None
 
     model_config = {"populate_by_name": True}
 
@@ -83,6 +84,7 @@ class PatchYearRequest(BaseModel):
     is_activated: Optional[bool] = None
     isActivated: Optional[bool] = None
     active: Optional[bool] = None
+    status: Optional[str] = None
 
     model_config = {"populate_by_name": True}
 
@@ -196,18 +198,31 @@ async def get_all_years(
     current_user: Dict[str, Any] = Depends(get_current_user),
 ):
     async with conn.cursor(cursor=DictCursor) as cur:
-        await cur.execute(
-            """
-            SELECT year_id AS yearId, year, is_activated AS isActivated
-            FROM academic_years
-            ORDER BY year DESC
-            """
-        )
-        rows = await cur.fetchall()
+        try:
+            await cur.execute(
+                """
+                SELECT year_id AS yearId, year, is_activated AS isActivated, status
+                FROM academic_years
+                ORDER BY year DESC
+                """
+            )
+            rows = await cur.fetchall()
+        except Exception:
+            # status 컬럼 미존재 시 구버전 폴백
+            await cur.execute(
+                """
+                SELECT year_id AS yearId, year, is_activated AS isActivated
+                FROM academic_years
+                ORDER BY year DESC
+                """
+            )
+            rows = await cur.fetchall()
 
     for r in rows:
         val = r.get("isActivated") if "isActivated" in r else r.get("is_activated")
         r["isActivated"] = bool(val)
+        if "status" not in r or not r["status"]:
+            r["status"] = "ACTIVE" if r["isActivated"] else "CLOSED"
 
     return SrFormat(status_code=200, success=True, data=rows).model_dump()
 
@@ -226,6 +241,13 @@ async def create_year(
         return error_response(400, "VALIDATION_ERROR", "유효하지 않은 학년도입니다 (1900~2100).")
 
     is_act = req.is_activated if req.is_activated is not None else (req.isActivated if req.isActivated is not None else (req.active if req.active is not None else False))
+    req_status = (req.status or "").upper().strip() if req.status else None
+    if req_status and req_status not in ("ACTIVE", "GRACE_PERIOD", "CLOSED"):
+        return error_response(400, "VALIDATION_ERROR", "status는 'ACTIVE', 'GRACE_PERIOD', 'CLOSED' 중 하나여야 합니다.")
+    if req_status:
+        is_act = (req_status == "ACTIVE")
+    else:
+        req_status = "ACTIVE" if is_act else "CLOSED"
 
     try:
         await conn.autocommit(False)
@@ -237,11 +259,22 @@ async def create_year(
             # 단일 활성 학년도 상호 배타성 강제 (SECURITY_AND_AUDIT.md 3.9)
             if is_act:
                 await cur.execute("UPDATE academic_years SET is_activated = FALSE")
+                try:
+                    await cur.execute("UPDATE academic_years SET status = 'CLOSED' WHERE status = 'ACTIVE'")
+                except Exception:
+                    pass
 
             await cur.execute(
                 "INSERT INTO academic_years (year, is_activated) VALUES (%s, %s)",
                 (req.year, is_act),
             )
+            try:
+                await cur.execute(
+                    "UPDATE academic_years SET status = %s WHERE year = %s",
+                    (req_status, req.year),
+                )
+            except Exception:
+                pass
             await cur.execute("SELECT LAST_INSERT_ID() AS last_id")
             last_row = await cur.fetchone()
             year_id = last_row[0] if isinstance(last_row, (list, tuple)) else last_row["last_id"]
@@ -259,7 +292,7 @@ async def create_year(
         content=SrFormat(
             status_code=201,
             success=True,
-            data={"yearId": year_id, "year": req.year, "isActivated": is_act},
+            data={"yearId": year_id, "year": req.year, "isActivated": is_act, "status": req_status},
         ).model_dump(),
     )
 
@@ -279,6 +312,13 @@ async def toggle_year_active(
         return error_response(400, "VALIDATION_ERROR", "유효하지 않은 학년도입니다 (1900~2100).")
 
     is_act = req.is_activated if req.is_activated is not None else (req.isActivated if req.isActivated is not None else (req.active if req.active is not None else True))
+    req_status = (req.status or "").upper().strip() if req.status else None
+    if req_status and req_status not in ("ACTIVE", "GRACE_PERIOD", "CLOSED"):
+        return error_response(400, "VALIDATION_ERROR", "status는 'ACTIVE', 'GRACE_PERIOD', 'CLOSED' 중 하나여야 합니다.")
+    if req_status:
+        is_act = (req_status == "ACTIVE")
+    else:
+        req_status = "ACTIVE" if is_act else "CLOSED"
 
     try:
         await conn.autocommit(False)
@@ -290,11 +330,22 @@ async def toggle_year_active(
             # 단일 활성 학년도 상호 배타성 강제 (SECURITY_AND_AUDIT.md 3.9)
             if is_act:
                 await cur.execute("UPDATE academic_years SET is_activated = FALSE WHERE year != %s", (year,))
+                try:
+                    await cur.execute("UPDATE academic_years SET status = 'CLOSED' WHERE year != %s AND status = 'ACTIVE'", (year,))
+                except Exception:
+                    pass
 
             await cur.execute(
                 "UPDATE academic_years SET is_activated = %s WHERE year = %s",
                 (is_act, year),
             )
+            try:
+                await cur.execute(
+                    "UPDATE academic_years SET status = %s WHERE year = %s",
+                    (req_status, year),
+                )
+            except Exception:
+                pass
 
         await conn.commit()
         clear_year_cache()
@@ -307,7 +358,7 @@ async def toggle_year_active(
     return SrFormat(
         status_code=200,
         success=True,
-        data={"year": year, "isActivated": is_act},
+        data={"year": year, "isActivated": is_act, "status": req_status},
     ).model_dump()
 
 

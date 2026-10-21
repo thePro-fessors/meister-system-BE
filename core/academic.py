@@ -16,12 +16,14 @@ except (ImportError, ModuleNotFoundError):
     DictCursor = Any  # type: ignore
 
 _YEAR_ID_CACHE: Dict[int, int] = {}
+_YEAR_STATUS_CACHE: Dict[int, str] = {}
 
 
 def clear_year_cache() -> None:
     """학년도 캐시 무효화 (관리자 학년도 변경 시 호출)"""
-    global _YEAR_ID_CACHE
+    global _YEAR_ID_CACHE, _YEAR_STATUS_CACHE
     _YEAR_ID_CACHE.clear()
+    _YEAR_STATUS_CACHE.clear()
 
 
 async def get_current_academic_year(target_date: Optional[datetime] = None) -> int:
@@ -70,3 +72,50 @@ async def get_year_id_by_year(conn: Any, year: Any) -> Optional[int]:
 
 # 별칭 지원
 get_year_id = get_year_id_by_year
+
+
+async def get_year_status_by_id(conn: Any, year_id: int) -> str:
+    """학년도 ID로 상태(ACTIVE / GRACE_PERIOD / CLOSED)를 조회합니다."""
+    global _YEAR_STATUS_CACHE
+    try:
+        y_int = int(year_id)
+    except (TypeError, ValueError):
+        return "CLOSED"
+
+    if y_int in _YEAR_STATUS_CACHE:
+        return _YEAR_STATUS_CACHE[y_int]
+
+    async with conn.cursor(cursor=DictCursor) as cur:
+        try:
+            await cur.execute(
+                "SELECT status, is_activated FROM academic_years WHERE year_id = %s LIMIT 1",
+                (y_int,)
+            )
+            row = await cur.fetchone()
+        except Exception:
+            # status 컬럼이 아직 없는 구버전 스키마 호환
+            await cur.execute(
+                "SELECT is_activated FROM academic_years WHERE year_id = %s LIMIT 1",
+                (y_int,)
+            )
+            row = await cur.fetchone()
+
+        if row:
+            st = row.get("status") if isinstance(row, dict) else None
+            if not st:
+                is_act = row.get("is_activated") if isinstance(row, dict) else row[0]
+                st = "ACTIVE" if is_act in (1, True, "1") else "CLOSED"
+            _YEAR_STATUS_CACHE[y_int] = st
+            return st
+    return "CLOSED"
+
+
+def is_submission_writable(status: str) -> bool:
+    """신규 증빙자료 제출은 ACTIVE 학년도에만 허용됩니다."""
+    return (status or "").upper() == "ACTIVE"
+
+
+def is_review_writable(status: str) -> bool:
+    """심사 승인/반려 및 보완 재제출은 ACTIVE 및 GRACE_PERIOD 학년도에 허용됩니다."""
+    return (status or "").upper() in ("ACTIVE", "GRACE_PERIOD")
+

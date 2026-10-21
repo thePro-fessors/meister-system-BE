@@ -4,7 +4,8 @@ CREATE TABLE academic_years
 (
   year_id      INT  NOT NULL AUTO_INCREMENT COMMENT '학년도 ID',
   year         INT  NOT NULL COMMENT '대상 연도',
-  is_activated BOOL NULL     DEFAULT FALSE COMMENT '학년도 활성 여부',
+  is_activated BOOL NULL     DEFAULT FALSE COMMENT '학년도 활성 여부 (ACTIVE 시 TRUE)',
+  status       ENUM('ACTIVE', 'GRACE_PERIOD', 'CLOSED') NOT NULL DEFAULT 'CLOSED' COMMENT '학년도 운영 상태',
   PRIMARY KEY (year_id)
 ) COMMENT '학년도 관리 테이블';
 
@@ -156,6 +157,9 @@ CREATE TABLE submissions
   reviewer_id       INT          NULL     COMMENT '검토 교사 ID',
   reviewed_at       DATETIME     NULL     COMMENT '교사 검토 일시',
   teacher_comment   TEXT         NULL     COMMENT '교사 의견',
+  appeal_reason     TEXT         NULL     COMMENT '학생 이의신청 사유',
+  appeal_submitted_at DATETIME   NULL     COMMENT '이의신청 접수 일시',
+  appeal_reviewer_id INT         NULL     COMMENT '2차 재심사 교사 ID',
   created_at        DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at        DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '최종 수정일시',
   is_deleted        BOOL         NULL     DEFAULT FALSE COMMENT 'Soft Delete',

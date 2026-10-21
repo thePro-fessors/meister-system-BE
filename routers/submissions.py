@@ -35,7 +35,21 @@ SUBMISSION_STATUS_MAP = {
     3: "인정완료",
     4: "반려",
     5: "재제출요청",
+    6: "이의신청",
 }
+
+
+class AppealSubmissionRequest(BaseModel):
+    appeal_reason: Optional[str] = None
+    appealReason: Optional[str] = None
+    reason: Optional[str] = None
+
+
+class ReviewAppealRequest(BaseModel):
+    decision: str  # "APPROVE" 또는 "REJECT"
+    granted_score: Optional[float] = None
+    grantedScore: Optional[float] = None
+    comment: Optional[str] = None
 
 
 class ApproveSubmissionRequest(BaseModel):
@@ -197,20 +211,42 @@ async def resubmit_evidence(
     try:
         # 1. 기존 제출 건 조회
         async with conn.cursor(cursor=DictCursor) as cur:
-            await cur.execute(
-                """
-                SELECT s.submission_id, s.student_id, s.status_code, s.granted_score, s.file_path, s.link_url, s.description, st.uuid
-                FROM submissions s
-                JOIN students st ON s.student_id = st.student_id
-                WHERE s.submission_id = %s AND s.is_deleted = FALSE
-                LIMIT 1
-                """,
-                (submission_id,),
-            )
-            existing = await cur.fetchone()
+            try:
+                await cur.execute(
+                    """
+                    SELECT s.submission_id, s.student_id, s.status_code, s.granted_score, s.file_path, s.link_url, s.description, st.uuid,
+                           ay.status AS year_status, ay.is_activated AS year_is_activated
+                    FROM submissions s
+                    JOIN students st ON s.student_id = st.student_id
+                    JOIN evaluation_items ei ON s.item_id = ei.item_id
+                    JOIN certification_areas ca ON ei.area_id = ca.area_id
+                    JOIN academic_years ay ON ca.year_id = ay.year_id
+                    WHERE s.submission_id = %s AND s.is_deleted = FALSE
+                    LIMIT 1
+                    """,
+                    (submission_id,),
+                )
+                existing = await cur.fetchone()
+            except Exception:
+                await cur.execute(
+                    """
+                    SELECT s.submission_id, s.student_id, s.status_code, s.granted_score, s.file_path, s.link_url, s.description, st.uuid
+                    FROM submissions s
+                    JOIN students st ON s.student_id = st.student_id
+                    WHERE s.submission_id = %s AND s.is_deleted = FALSE
+                    LIMIT 1
+                    """,
+                    (submission_id,),
+                )
+                existing = await cur.fetchone()
 
         if not existing:
             return error_response(404, "NOT_FOUND", "해당 증빙자료를 찾을 수 없습니다.")
+
+        # 학년도 마감 상태 검증 (CLOSED 학년도는 보완 제출 불가, ACTIVE 및 GRACE_PERIOD는 허용)
+        yr_st = existing.get("year_status") or ("ACTIVE" if existing.get("year_is_activated") in (1, True, "1") else None)
+        if yr_st == "CLOSED":
+            return error_response(400, "ACADEMIC_YEAR_CLOSED", "해당 학년도는 마감되어 증빙자료를 재제출할 수 없습니다.")
 
         # 2. 소유권 검증 (IDOR 방어)
         if existing["uuid"] != user_uuid:
@@ -1072,6 +1108,229 @@ async def modify_submission_score(
             "teacherComment": comment,
             "reviewedAt": datetime.now().isoformat(),
             "reviewerId": reviewer_id,
+            "studentTotals": student_totals,
+        },
+    ).model_dump()
+
+
+# ==============================================================================
+# 공식 이의신청(Appeal) 및 2차 재심사 라우트 (Phase 2 P1)
+# ==============================================================================
+
+@router.post(
+    "/{submission_id}/appeal",
+    summary="반려 건 공식 이의신청 접수 API (Phase 2 P1)",
+    response_model=SrFormat,
+)
+async def submit_submission_appeal(
+    submission_id: int,
+    req: AppealSubmissionRequest,
+    conn: Any = Depends(get_db),
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """
+    학생 전용: 반려(4) 상태의 증빙자료에 대해 공식 이의신청을 접수합니다. (상태 6: 이의신청)
+    """
+    user_uuid = current_user.get("uuid") or current_user.get("sub")
+    reason = (req.appeal_reason or req.appealReason or req.reason or "").strip()
+
+    if not reason:
+        return error_response(400, "VALIDATION_ERROR", "이의신청 사유(appeal_reason)를 상세히 작성해주세요.")
+    if len(reason) > 1000:
+        return error_response(400, "VALIDATION_ERROR", "이의신청 사유는 최대 1000자까지 작성 가능합니다.")
+
+    async with conn.cursor(cursor=DictCursor) as cur:
+        await cur.execute(
+            """
+            SELECT s.submission_id, s.student_id, s.status_code, st.uuid
+            FROM submissions s
+            JOIN students st ON s.student_id = st.student_id
+            WHERE s.submission_id = %s AND s.is_deleted = FALSE
+            LIMIT 1
+            """,
+            (submission_id,),
+        )
+        row = await cur.fetchone()
+
+    if not row:
+        return error_response(404, "ITEM_NOT_FOUND", "증빙자료를 찾을 수 없습니다.")
+
+    if row["uuid"] != user_uuid:
+        return error_response(403, "FORBIDDEN", "본인이 제출한 반려 건에 대해서만 이의신청이 가능합니다.")
+
+    if row["status_code"] != 4:
+        return error_response(400, "INVALID_STATUS", "반려(4) 상태의 증빙자료에 대해서만 이의신청을 접수할 수 있습니다.")
+
+    try:
+        await conn.autocommit(False)
+        async with conn.cursor(cursor=DictCursor) as cur:
+            try:
+                await cur.execute(
+                    """
+                    UPDATE submissions
+                    SET status_code = 6, appeal_reason = %s, appeal_submitted_at = NOW()
+                    WHERE submission_id = %s
+                    """,
+                    (reason, submission_id),
+                )
+            except Exception:
+                await cur.execute(
+                    """
+                    UPDATE submissions
+                    SET status_code = 6
+                    WHERE submission_id = %s
+                    """,
+                    (submission_id,),
+                )
+
+            await cur.execute(
+                """
+                INSERT INTO submissions_logs (submission_id, modifier_uuid, action_type, old_status_code, new_status_code, comment, created_at)
+                VALUES (%s, %s, 'APPEAL_SUBMIT', 4, 6, %s, NOW())
+                """,
+                (submission_id, user_uuid, reason),
+            )
+        await conn.commit()
+    except Exception:
+        await conn.rollback()
+        raise
+    finally:
+        await conn.autocommit(True)
+
+    return SrFormat(
+        status_code=200,
+        success=True,
+        data={
+            "submissionId": submission_id,
+            "statusCode": 6,
+            "status": "이의신청",
+            "appealReason": reason,
+            "submittedAt": datetime.now().isoformat(),
+        },
+    ).model_dump()
+
+
+@router.patch(
+    "/{submission_id}/review-appeal",
+    summary="이의신청 2차 재심사 판정 API (부장교사/관리자 전용)",
+    response_model=SrFormat,
+)
+async def review_submission_appeal(
+    submission_id: int,
+    req: ReviewAppealRequest,
+    conn: Any = Depends(get_db),
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """
+    부장교사 및 관리자 전용: 이의신청(6) 건에 대해 승인(3) 또는 기각(4)을 최종 판정합니다.
+    """
+    user_role = normalize_role(current_user.get("role"))
+    user_uuid = current_user.get("uuid") or current_user.get("sub")
+
+    decision = (req.decision or "").upper().strip()
+    if decision not in ("APPROVE", "REJECT"):
+        return error_response(400, "VALIDATION_ERROR", "decision은 'APPROVE' 또는 'REJECT'여야 합니다.")
+
+    async with conn.cursor(cursor=DictCursor) as cur:
+        # 교사 정보 조회
+        await cur.execute("SELECT teachers_id, position, department FROM teachers WHERE uuid = %s AND is_deleted = FALSE LIMIT 1", (user_uuid,))
+        teacher_row = await cur.fetchone()
+
+        if user_role != "admin":
+            if not teacher_row:
+                return error_response(403, "FORBIDDEN", "교사 또는 관리자만 이의신청을 재심사할 수 있습니다.")
+            pos = teacher_row.get("position") or ""
+            dept = teacher_row.get("department") or ""
+            if "부장" not in pos and "마이스터" not in dept and user_role not in ("admin", "master"):
+                return error_response(403, "FORBIDDEN", "이의신청 2차 재심사는 부장 교사 또는 관리자 권한이 필요합니다.")
+
+        reviewer_id = teacher_row["teachers_id"] if teacher_row else None
+
+        await cur.execute(
+            """
+            SELECT s.submission_id, s.student_id, s.status_code, ei.max_score, ca.year_id, ay.year
+            FROM submissions s
+            JOIN evaluation_items ei ON s.item_id = ei.item_id
+            JOIN certification_areas ca ON ei.area_id = ca.area_id
+            JOIN academic_years ay ON ca.year_id = ay.year_id
+            WHERE s.submission_id = %s AND s.is_deleted = FALSE
+            LIMIT 1
+            """,
+            (submission_id,),
+        )
+        row = await cur.fetchone()
+
+    if not row:
+        return error_response(404, "ITEM_NOT_FOUND", "증빙자료를 찾을 수 없습니다.")
+
+    if row["status_code"] != 6:
+        return error_response(400, "INVALID_STATUS", "이의신청(6) 접수 상태의 증빙자료만 2차 재심사를 수행할 수 있습니다.")
+
+    max_score = float(row.get("max_score") or 100.0)
+    new_status = 3 if decision == "APPROVE" else 4
+    action_type = "APPEAL_APPROVE" if decision == "APPROVE" else "APPEAL_REJECT"
+
+    score = None
+    if decision == "APPROVE":
+        raw_score = req.granted_score if req.granted_score is not None else req.grantedScore
+        score = float(raw_score) if raw_score is not None else max_score
+        if score < 0 or score > max_score:
+            return error_response(400, "VALIDATION_ERROR", f"부여 점수는 0 이상 {max_score} 이하이어야 합니다.")
+
+    comment = (req.comment or "").strip() or None
+
+    try:
+        await conn.autocommit(False)
+        async with conn.cursor(cursor=DictCursor) as cur:
+            try:
+                await cur.execute(
+                    """
+                    UPDATE submissions
+                    SET status_code = %s, granted_score = %s, teacher_comment = %s,
+                        appeal_reviewer_id = %s, reviewed_at = NOW()
+                    WHERE submission_id = %s
+                    """,
+                    (new_status, score, comment, reviewer_id, submission_id),
+                )
+            except Exception:
+                await cur.execute(
+                    """
+                    UPDATE submissions
+                    SET status_code = %s, granted_score = %s, teacher_comment = %s, reviewed_at = NOW()
+                    WHERE submission_id = %s
+                    """,
+                    (new_status, score, comment, submission_id),
+                )
+
+            await cur.execute(
+                """
+                INSERT INTO submissions_logs (submission_id, modifier_uuid, action_type, old_status_code, new_status_code, new_score, comment, created_at)
+                VALUES (%s, %s, %s, 6, %s, %s, %s, NOW())
+                """,
+                (submission_id, user_uuid, action_type, new_status, score, comment),
+            )
+        await conn.commit()
+    except Exception:
+        await conn.rollback()
+        raise
+    finally:
+        await conn.autocommit(True)
+
+    student_id = row["student_id"]
+    year_id = row.get("year_id")
+    target_year = row.get("year") or get_current_academic_year()
+    student_totals = await _calculate_student_totals(student_id, year_id, target_year, conn)
+
+    return SrFormat(
+        status_code=200,
+        success=True,
+        data={
+            "submissionId": submission_id,
+            "statusCode": new_status,
+            "status": SUBMISSION_STATUS_MAP.get(new_status, "완료"),
+            "decision": decision,
+            "score": score,
+            "comment": comment,
             "studentTotals": student_totals,
         },
     ).model_dump()

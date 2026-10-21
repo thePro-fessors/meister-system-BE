@@ -8,8 +8,9 @@ except (ImportError, ModuleNotFoundError):
     DictCursor = None  # type: ignore
 import dotenv
 import redis.asyncio as aioredis
-from typing import AsyncGenerator
+from typing import AsyncGenerator, Any
 import logging
+from core.circuit_breaker import SafeRedisWrapper, redis_circuit_breaker
 
 logger = logging.getLogger("meister.database")
 
@@ -112,9 +113,10 @@ async def close_redis_pool():
         await redis_pool.disconnect()
         redis_pool = None
 
-async def get_redis() -> AsyncGenerator[aioredis.Redis, None]:
-    """싱글톤 Redis 클라이언트를 재사용하여 연결 오버헤드를 최소화합니다."""
+async def get_redis() -> AsyncGenerator[Any, None]:
+    """서킷 브레이커가 적용된 싱글톤 Redis 클라이언트를 재사용하여 연결 오버헤드를 최소화합니다."""
     global redis_client
     if redis_client is None:
         await init_redis_pool()
-    yield redis_client
+    safe_client = SafeRedisWrapper(redis_client, redis_circuit_breaker)
+    yield safe_client

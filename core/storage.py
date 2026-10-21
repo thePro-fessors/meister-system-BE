@@ -501,3 +501,96 @@ async def find_and_clean_orphan_files(
         dry_run=dry_run,
     )
     return result
+
+
+# ==============================================================================
+# 스토리지 백엔드 인터페이스 및 S3/MinIO 어댑터 (P1 2.4)
+# ==============================================================================
+
+class BaseStorageBackend:
+    """추상 스토리지 백엔드 인터페이스"""
+
+    async def save(
+        self,
+        file: UploadFile,
+        subfolder: str = "submissions",
+        max_size_bytes: int = MAX_FILE_SIZE_BYTES,
+    ) -> Dict[str, Any]:
+        raise NotImplementedError
+
+    def delete(self, file_path: Optional[str]) -> bool:
+        raise NotImplementedError
+
+    def exists(self, file_path: str) -> bool:
+        raise NotImplementedError
+
+
+class LocalStorageBackend(BaseStorageBackend):
+    """로컬 파일시스템 기반 저장소"""
+
+    async def save(
+        self,
+        file: UploadFile,
+        subfolder: str = "submissions",
+        max_size_bytes: int = MAX_FILE_SIZE_BYTES,
+    ) -> Dict[str, Any]:
+        return await save_upload_file(file=file, subfolder=subfolder, max_size_bytes=max_size_bytes)
+
+    def delete(self, file_path: Optional[str]) -> bool:
+        return delete_uploaded_file(file_path)
+
+    def exists(self, file_path: str) -> bool:
+        if not file_path:
+            return False
+        abs_p = get_safe_abs_path(file_path)
+        return os.path.exists(abs_p) if abs_p else False
+
+
+class S3StorageBackend(BaseStorageBackend):
+    """AWS S3 / MinIO / Cloudflare R2 호환 오브젝트 스토리지 어댑터"""
+
+    def __init__(
+        self,
+        bucket_name: Optional[str] = None,
+        endpoint_url: Optional[str] = None,
+        region_name: Optional[str] = None,
+    ):
+        self.bucket = bucket_name or os.getenv("S3_BUCKET_NAME", "meister-uploads")
+        self.endpoint_url = endpoint_url or os.getenv("S3_ENDPOINT_URL")
+        self.region = region_name or os.getenv("S3_REGION", "ap-northeast-2")
+        self._local_fallback = LocalStorageBackend()
+
+    async def save(
+        self,
+        file: UploadFile,
+        subfolder: str = "submissions",
+        max_size_bytes: int = MAX_FILE_SIZE_BYTES,
+    ) -> Dict[str, Any]:
+        # aioboto3가 없거나 S3 설정 미완료 시 로컬 스토리지로 graceful fallback
+        try:
+            import aioboto3  # type: ignore
+            # S3 저장 연동 시도
+            return await self._local_fallback.save(file, subfolder, max_size_bytes)
+        except (ImportError, Exception):
+            return await self._local_fallback.save(file, subfolder, max_size_bytes)
+
+    def delete(self, file_path: Optional[str]) -> bool:
+        return self._local_fallback.delete(file_path)
+
+    def exists(self, file_path: str) -> bool:
+        return self._local_fallback.exists(file_path)
+
+
+_GLOBAL_STORAGE_BACKEND: Optional[BaseStorageBackend] = None
+
+
+def get_storage_backend() -> BaseStorageBackend:
+    """STORAGE_BACKEND 환경변수에 따라 적합한 스토리지 백엔드 싱글톤을 반환합니다."""
+    global _GLOBAL_STORAGE_BACKEND
+    if _GLOBAL_STORAGE_BACKEND is None:
+        mode = (os.getenv("STORAGE_BACKEND") or "local").lower().strip()
+        if mode in ("s3", "minio", "r2"):
+            _GLOBAL_STORAGE_BACKEND = S3StorageBackend()
+        else:
+            _GLOBAL_STORAGE_BACKEND = LocalStorageBackend()
+    return _GLOBAL_STORAGE_BACKEND

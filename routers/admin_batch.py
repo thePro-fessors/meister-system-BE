@@ -13,8 +13,8 @@ import re
 import uuid
 from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional, Tuple, Union
-from fastapi import APIRouter, Depends, File, Form, Query, Request, UploadFile, status
-from fastapi.responses import JSONResponse, Response
+from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, Query, Request, UploadFile, status
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
 import redis.asyncio as aioredis
 
@@ -24,6 +24,7 @@ except (ImportError, ModuleNotFoundError):
     DictCursor = Any  # type: ignore
 
 from core.academic import clear_year_cache, get_current_academic_year, get_current_year
+from core.batch_manager import batch_task_manager
 from core.calculator import calculate_student_certification
 from core.excel_parser import (
     EMAIL_REGEX,
@@ -859,5 +860,307 @@ async def batch_register_teachers(
             },
         },
     ).model_dump()
+
+
+# ==============================================================================
+# 5. 비동기 대량 등록 및 SSE 진행률 스트리밍 API (Async Batch & SSE)
+# ==============================================================================
+
+async def _run_student_batch_job(
+    task_id: str,
+    valid_records: List[Dict[str, Any]],
+    parsing_errors: List[Dict[str, Any]],
+    target_year: int,
+    target_year_id: int,
+    is_overwrite: bool,
+    should_validate_neis: bool,
+    existing_conn: Any = None,
+) -> None:
+    """백그라운드에서 실행되는 학생 대량 등록 작업 워커"""
+    import database
+    from routers.auth import hash_password
+
+    conn_context = None
+    if existing_conn is not None:
+        conn = existing_conn
+    elif database.pool is not None:
+        conn_context = database.pool.acquire()
+        conn = await conn_context.__aenter__()
+    else:
+        batch_task_manager.fail_task(task_id, "데이터베이스 커넥션 풀을 찾을 수 없습니다.")
+        return
+
+    try:
+        total = len(valid_records)
+        created_count = 0
+        updated_count = 0
+        skipped_count = 0
+
+        # 1. NEIS 학급 실시간 검증
+        final_to_insert = []
+        neis_validated_classes: Dict[Tuple[int, int], bool] = {}
+
+        if should_validate_neis and valid_records:
+            distinct_classes = set((st["grade"], st["class_no"]) for st in valid_records)
+            for g, c in distinct_classes:
+                is_valid, err_msg = await validate_class_against_neis(target_year, g, c)
+                neis_validated_classes[(g, c)] = is_valid
+                if not is_valid:
+                    for st in valid_records:
+                        if st["grade"] == g and st["class_no"] == c:
+                            parsing_errors.append({
+                                "row": st.get("row_number", 0),
+                                "name": st["name"],
+                                "reason": err_msg or f"NEIS 미인가 학급 ({g}학년 {c}반)",
+                            })
+
+            for st in valid_records:
+                if neis_validated_classes.get((st["grade"], st["class_no"]), True):
+                    final_to_insert.append(st)
+        else:
+            final_to_insert = valid_records
+
+        # 2. 50건 청크 단위 트랜잭션 적재 및 진행률 통지
+        chunk_size = 50
+        for i in range(0, len(final_to_insert), chunk_size):
+            chunk = final_to_insert[i:i + chunk_size]
+            await conn.autocommit(False)
+            async with conn.cursor(cursor=DictCursor) as cur:
+                for st in chunk:
+                    email = st.get("email")
+                    name = st["name"]
+                    grade = st["grade"]
+                    class_no = st["class_no"]
+                    student_no = st["student_no"]
+
+                    await cur.execute("SELECT student_id, uuid FROM students WHERE email = %s LIMIT 1", (email,))
+                    ex_st = await cur.fetchone()
+
+                    if ex_st:
+                        s_id = ex_st["student_id"] if isinstance(ex_st, dict) else ex_st[0]
+                        if is_overwrite:
+                            await cur.execute("UPDATE students SET name = %s WHERE student_id = %s", (name, s_id))
+                            updated_count += 1
+                        else:
+                            skipped_count += 1
+                    else:
+                        new_uuid = str(uuid.uuid4())
+                        init_pw = f"bssm{target_year}!"
+                        pw_hash = hash_password(init_pw)
+                        await cur.execute(
+                            "INSERT INTO users (uuid, email, password_hash, role) VALUES (%s, %s, %s, 'student')",
+                            (new_uuid, email, pw_hash),
+                        )
+                        await cur.execute(
+                            "INSERT INTO students (uuid, name, email) VALUES (%s, %s, %s)",
+                            (new_uuid, name, email),
+                        )
+                        await cur.execute("SELECT LAST_INSERT_ID() AS last_id")
+                        last_row = await cur.fetchone()
+                        s_id = last_row[0] if isinstance(last_row, (list, tuple)) else last_row["last_id"]
+                        created_count += 1
+
+                    # 학적(student_academic_records) 동기화
+                    await cur.execute(
+                        """
+                        INSERT INTO student_academic_records (student_id, year_id, grade, class_no, student_no)
+                        VALUES (%s, %s, %s, %s, %s)
+                        ON DUPLICATE KEY UPDATE grade = VALUES(grade), class_no = VALUES(class_no), student_no = VALUES(student_no)
+                        """,
+                        (s_id, target_year_id, grade, class_no, student_no),
+                    )
+
+            await conn.commit()
+            processed_so_far = min(total, i + len(chunk))
+            batch_task_manager.update_progress(
+                task_id=task_id,
+                processed_count=processed_so_far,
+                created_count=created_count,
+                updated_count=updated_count,
+                skipped_count=skipped_count,
+            )
+
+        batch_task_manager.complete_task(
+            task_id=task_id,
+            created_count=created_count,
+            updated_count=updated_count,
+            skipped_count=skipped_count,
+            parsing_errors=parsing_errors,
+        )
+    except Exception as e:
+        if conn:
+            try:
+                await conn.rollback()
+            except Exception:
+                pass
+        batch_task_manager.fail_task(task_id, f"배치 처리 중 오류 발생: {str(e)}")
+    finally:
+        if conn:
+            try:
+                await conn.autocommit(True)
+            except Exception:
+                pass
+        if conn_context is not None:
+            await conn_context.__aexit__(None, None, None)
+
+
+@admin_router.post("/students/batch/async", summary="학생 명단 비동기 일괄 등록 (SSE 진행률 연동)", response_model=SrFormat)
+async def batch_register_students_async(
+    background_tasks: BackgroundTasks,
+    request: Request,
+    file: Optional[UploadFile] = File(None),
+    year: Optional[int] = Form(None),
+    overwrite: Optional[bool] = Form(False),
+    validate_with_neis: Optional[bool] = Form(None),
+    default_email_domain: Optional[str] = Form("bssm.hs.kr"),
+    conn: Any = Depends(get_db),
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """
+    학생 명단 비동기 일괄 등록 엔드포인트
+    - 대량 등록 시 HTTP 504 타임아웃 방어 (202 Accepted 반환)
+    - BackgroundTasks 워커로 적재 실행
+    - 반환된 taskId로 /api/admin/batch/tasks/{taskId}/progress SSE 구독 가능
+    """
+    admin_err = check_admin_access(current_user)
+    if admin_err:
+        return admin_err
+
+    query_params = request.query_params
+    target_year = year if year is not None else (int(query_params.get("year")) if query_params.get("year") else None)
+    is_overwrite = bool(overwrite if overwrite is not None else query_params.get("overwrite", False))
+    should_validate_neis = validate_with_neis if validate_with_neis is not None else True
+    email_domain = default_email_domain or query_params.get("default_email_domain", "bssm.hs.kr")
+
+    if file is None:
+        return error_response(400, "VALIDATION_ERROR", "업로드할 엑셀/CSV 파일(file)이 필요합니다.")
+
+    file_bytes = await file.read()
+    if len(file_bytes) > 10 * 1024 * 1024:
+        return error_response(400, "FILE_TOO_LARGE", "파일 크기는 최대 10MB까지 허용됩니다.")
+
+    try:
+        valid_records, parsing_errors = parse_student_batch_file(
+            file_bytes=file_bytes,
+            filename=file.filename or "students.xlsx",
+            default_email_domain=email_domain,
+        )
+    except Exception as e:
+        return error_response(400, "FILE_PARSE_ERROR", f"파일 파싱 실패: {str(e)}")
+
+    async with conn.cursor(cursor=DictCursor) as cur:
+        if target_year is None:
+            await cur.execute("SELECT year_id, year FROM academic_years ORDER BY is_activated DESC, year DESC LIMIT 1")
+            y_row = await cur.fetchone()
+            if not y_row:
+                return error_response(404, "ITEM_NOT_FOUND", "등록된 학년도가 없습니다.")
+            target_year_id = y_row["year_id"]
+            target_year = y_row["year"]
+        else:
+            await cur.execute("SELECT year_id FROM academic_years WHERE year = %s LIMIT 1", (target_year,))
+            y_row = await cur.fetchone()
+            if not y_row:
+                return error_response(404, "ITEM_NOT_FOUND", f"{target_year} 학년도가 시스템에 존재하지 않습니다.")
+            target_year_id = y_row["year_id"]
+
+    total_count = len(valid_records) + len(parsing_errors)
+    task_id = batch_task_manager.create_task(
+        mode="students",
+        total_count=total_count,
+        filename=file.filename,
+    )
+
+    # 백그라운드 태스크 등록
+    background_tasks.add_task(
+        _run_student_batch_job,
+        task_id=task_id,
+        valid_records=valid_records,
+        parsing_errors=parsing_errors,
+        target_year=target_year,
+        target_year_id=target_year_id,
+        is_overwrite=is_overwrite,
+        should_validate_neis=should_validate_neis,
+        existing_conn=conn,
+    )
+
+    return JSONResponse(
+        status_code=status.HTTP_202_ACCEPTED,
+        content=SrFormat(
+            status_code=202,
+            success=True,
+            data={
+                "taskId": task_id,
+                "status": "PROCESSING",
+                "totalCount": total_count,
+                "message": "학생 명단 일괄 등록 작업이 시작되었습니다. SSE 진행률 스트림을 통해 실시간 진행 상태를 확인할 수 있습니다.",
+                "progressUrl": f"/api/admin/batch/tasks/{task_id}/progress",
+                "reportUrl": f"/api/admin/batch/tasks/{task_id}/report/download",
+            },
+        ).model_dump(),
+    )
+
+
+@admin_router.get("/batch/tasks/{task_id}/progress", summary="대량 등록 작업 SSE 실시간 진행률 스트림")
+async def stream_batch_progress(
+    task_id: str,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """
+    대량 등록 작업 실시간 SSE 스트림
+    - media_type: text/event-stream
+    - 3초마다 Keep-Alive 핑 유지
+    - 상태 변경 시 progress, processedCount, status 즉시 이벤트 푸시
+    """
+    admin_err = check_admin_access(current_user)
+    if admin_err:
+        return admin_err
+
+    return StreamingResponse(
+        batch_task_manager.subscribe_progress(task_id),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@admin_router.get("/batch/tasks/{task_id}", summary="대량 등록 작업 상태 단건 조회", response_model=SrFormat)
+async def get_batch_task_status(
+    task_id: str,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """대량 등록 작업 상태 JSON 단건 조회"""
+    admin_err = check_admin_access(current_user)
+    if admin_err:
+        return admin_err
+
+    task = batch_task_manager.get_task(task_id)
+    if not task:
+        return error_response(404, "TASK_NOT_FOUND", "해당 배치 작업을 찾을 수 없습니다.")
+
+    return SrFormat(status_code=200, success=True, data=task).model_dump()
+
+
+@admin_router.get("/batch/tasks/{task_id}/report/download", summary="대량 등록 실패 행 상세 리포트 CSV 다운로드")
+async def download_batch_error_report(
+    task_id: str,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """배치 작업 실패 행 리포트 CSV 다운로드"""
+    admin_err = check_admin_access(current_user)
+    if admin_err:
+        return admin_err
+
+    csv_content = batch_task_manager.generate_csv_report(task_id)
+    filename = f"batch_error_report_{task_id}.csv"
+    return Response(
+        content=csv_content,
+        media_type="text/csv; charset=utf-8",
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+        },
+    )
 
 

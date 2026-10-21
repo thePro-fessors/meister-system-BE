@@ -629,11 +629,12 @@ description: {sanitized_desc}
             llm_result.is_fallback = True
             if not llm_result.fallback_reason:
                 llm_result.fallback_reason = "LLM 추천 항목 비어있음 또는 파싱 실패 (규칙 기반 폴백)"
+        from core.text_analyzer import match_keywords_with_morphology
         for area, meta in KEYWORD_AREA_MAP.items():
             kws = meta["keywords"]
-            matched = [kw for kw in kws if kw in text_lower]
+            matched, sim_score = match_keywords_with_morphology(text_lower, kws)
             if matched:
-                confidence = min(0.95, round(0.5 + (len(matched) * 0.15), 2))
+                confidence = max(sim_score, min(0.95, round(0.5 + (len(matched) * 0.15), 2)))
                 item_id = meta["default_item"]["itemId"]
                 item_name = meta["default_item"]["itemName"]
 

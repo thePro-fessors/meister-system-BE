@@ -420,31 +420,59 @@ async def handle_submit_evidence(
 
 
         # 4. 대상 평가 항목(evaluation_items) 및 소속 영역/학년도 검증
-        await cur.execute(
-            """
-            SELECT 
-                ei.item_id,
-                ei.area_id,
-                ei.name AS item_name,
-                ei.target_grade,
-                ei.max_score AS item_max_score,
-                ei.scoring_type,
-                ei.requires_evidence,
-                ei.is_active,
-                ca.year_id,
-                ca.grade AS area_grade,
-                ca.name AS area_name,
-                ay.year AS academic_year,
-                ay.is_activated AS year_is_activated
-            FROM evaluation_items ei
-            JOIN certification_areas ca ON ei.area_id = ca.area_id
-            JOIN academic_years ay ON ca.year_id = ay.year_id
-            WHERE ei.item_id = %s
-            LIMIT 1
-            """,
-            (item_id_val,),
-        )
-        eval_item = await cur.fetchone()
+        try:
+            await cur.execute(
+                """
+                SELECT 
+                    ei.item_id,
+                    ei.area_id,
+                    ei.name AS item_name,
+                    ei.target_grade,
+                    ei.max_score AS item_max_score,
+                    ei.scoring_type,
+                    ei.requires_evidence,
+                    ei.is_active,
+                    ca.year_id,
+                    ca.grade AS area_grade,
+                    ca.name AS area_name,
+                    ay.year AS academic_year,
+                    ay.is_activated AS year_is_activated,
+                    ay.status AS year_status
+                FROM evaluation_items ei
+                JOIN certification_areas ca ON ei.area_id = ca.area_id
+                JOIN academic_years ay ON ca.year_id = ay.year_id
+                WHERE ei.item_id = %s
+                LIMIT 1
+                """,
+                (item_id_val,),
+            )
+            eval_item = await cur.fetchone()
+        except Exception:
+            await cur.execute(
+                """
+                SELECT 
+                    ei.item_id,
+                    ei.area_id,
+                    ei.name AS item_name,
+                    ei.target_grade,
+                    ei.max_score AS item_max_score,
+                    ei.scoring_type,
+                    ei.requires_evidence,
+                    ei.is_active,
+                    ca.year_id,
+                    ca.grade AS area_grade,
+                    ca.name AS area_name,
+                    ay.year AS academic_year,
+                    ay.is_activated AS year_is_activated
+                FROM evaluation_items ei
+                JOIN certification_areas ca ON ei.area_id = ca.area_id
+                JOIN academic_years ay ON ca.year_id = ay.year_id
+                WHERE ei.item_id = %s
+                LIMIT 1
+                """,
+                (item_id_val,),
+            )
+            eval_item = await cur.fetchone()
 
         if not eval_item:
             return error_response(status.HTTP_404_NOT_FOUND, "ITEM_NOT_FOUND", "해당 평가 항목을 찾을 수 없습니다.")
@@ -453,10 +481,12 @@ async def handle_submit_evidence(
         if not is_item_active:
             return error_response(status.HTTP_400_BAD_REQUEST, "VALIDATION_ERROR", "비활성화된 평가 항목에는 증빙자료를 제출할 수 없습니다.")
 
-        # DATA-04: 신규 제출은 활성화된 학년도에만 허용 (0, False, NULL, 누락값 모두 거부)
-        is_year_active = eval_item.get("year_is_activated") in (1, True, "1")
-        if not is_year_active:
-            return error_response(status.HTTP_400_BAD_REQUEST, "ACADEMIC_YEAR_INACTIVE", "현재 활성화된 학년도에만 신규 증빙자료를 제출할 수 있습니다.")
+        # DATA-04: 신규 제출은 ACTIVE 상태의 학년도에만 허용 (GRACE_PERIOD는 정산 전용)
+        yr_st = eval_item.get("year_status") or ("ACTIVE" if eval_item.get("year_is_activated") in (1, True, "1") else "CLOSED")
+        if yr_st == "GRACE_PERIOD":
+            return error_response(status.HTTP_400_BAD_REQUEST, "ACADEMIC_YEAR_GRACE_PERIOD", "해당 학년도는 정산 마감 유예 기간으로, 신규 증빙 제출이 마감되었습니다. 기존 제출 건의 보완만 가능합니다.")
+        if yr_st != "ACTIVE":
+            return error_response(status.HTTP_400_BAD_REQUEST, "ACADEMIC_YEAR_INACTIVE", "현재 운영 중인 활성 학년도에만 신규 증빙자료를 제출할 수 있습니다.")
 
         # 학년도 파라미터(year) 전달 시 평가 항목 학년도와 일치 여부 검증
         if year_val is not None:

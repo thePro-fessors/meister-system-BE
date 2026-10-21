@@ -13,11 +13,12 @@ import ipaddress
 import json
 import os
 import secrets
+import time
 import uuid
 
 from datetime import datetime, timedelta, timezone
 from enum import StrEnum
-from typing import Any, Callable, Dict, Optional, Sequence
+from typing import Any, Callable, Dict, Optional, Sequence, Tuple
 
 import jwt
 from fastapi import Depends, HTTPException, Request
@@ -160,6 +161,9 @@ def get_client_ip(request: Request) -> str:
 # ==============================================================================
 # 미디어 열람 및 다운로드 일회용 티켓 / 서명 토큰 보안 모듈 (P1 1.2)
 # ==============================================================================
+_MEMORY_TICKET_STORE: Dict[str, Tuple[float, str]] = {}
+
+
 async def create_download_ticket(
     user_uuid: str,
     role: str,
@@ -170,6 +174,7 @@ async def create_download_ticket(
     """
     미디어 및 파일의 안전한 1회용 열람/다운로드를 위한 단기 유효 일회용 티켓(Single-use Ticket)을 발급합니다.
     URL 쿼리 스트링에 장기 유효 Access Token이 노출되는 취약점을 원천 해소합니다.
+    Redis 장애 시 인메모리 티켓 캐시로 자동 Fallback합니다.
     (SECURITY_AND_AUDIT.md 1.2 & TODO.md 6.1 P1)
     """
     ticket_id = secrets.token_urlsafe(32)
@@ -180,7 +185,18 @@ async def create_download_ticket(
         "created_at": datetime.now(timezone.utc).isoformat(),
     })
     ticket_key = f"download_ticket:{ticket_id}"
-    await redis.setex(ticket_key, ttl_seconds, ticket_payload)
+
+    saved_redis = False
+    if redis:
+        try:
+            saved_redis = bool(await redis.setex(ticket_key, ttl_seconds, ticket_payload))
+        except Exception:
+            saved_redis = False
+
+    if not saved_redis:
+        # Redis 실패 시 인메모리 안전 Fallback
+        _MEMORY_TICKET_STORE[ticket_id] = (time.time() + ttl_seconds, ticket_payload)
+
     return ticket_id
 
 
@@ -260,7 +276,19 @@ async def verify_and_consume_download_ticket(
                 "role": data.get("role"),
             }
         else:
-            raw_data = await redis.get(ticket_key)
+            raw_data = None
+            if redis:
+                try:
+                    raw_data = await redis.get(ticket_key)
+                except Exception:
+                    raw_data = None
+
+            # Redis 미스 또는 장애 시 인메모리 티켓 스토어 확인
+            if not raw_data and ticket_id in _MEMORY_TICKET_STORE:
+                exp_ts, mem_payload = _MEMORY_TICKET_STORE.pop(ticket_id, (0, ""))
+                if time.time() <= exp_ts:
+                    raw_data = mem_payload
+
             if not raw_data:
                 return None
             try:
