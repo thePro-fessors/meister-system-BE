@@ -115,7 +115,7 @@ services:
   # ----------------------------------------------------------------------------
   frontend:
     build:
-      context: ./fe
+      context: ../FE
       dockerfile: Dockerfile
       args:
         NEXT_PUBLIC_API_BASE_URL: ""
