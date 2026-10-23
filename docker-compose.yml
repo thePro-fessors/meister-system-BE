@@ -19,7 +19,7 @@ services:
     environment:
       MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-${DATABASE_PASSWORD:?DATABASE_PASSWORD must be set in .env}}
       MYSQL_DATABASE: ${DATABASE_NAME:-swMeister}
-      MYSQL_USER: ${DATABASE_USER:-meister_app}
+      MYSQL_USER: ${MYSQL_APP_USER:-meister_app}
       MYSQL_PASSWORD: ${DATABASE_PASSWORD:?DATABASE_PASSWORD must be set in .env}
     volumes:
       - mysql_data:/var/lib/mysql

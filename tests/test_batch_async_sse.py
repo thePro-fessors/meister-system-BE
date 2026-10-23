@@ -14,7 +14,7 @@ import unittest
 from fastapi.testclient import TestClient
 
 from core.batch_manager import batch_task_manager
-from core.security import get_current_user
+from core.security import get_current_user, get_current_user_with_query_token
 from database import get_db, get_redis
 from main import app
 
@@ -81,6 +81,7 @@ class TestBatchAsyncSSE(unittest.TestCase):
 
         app.dependency_overrides[get_db] = override_get_db
         app.dependency_overrides[get_current_user] = override_get_current_user
+        app.dependency_overrides[get_current_user_with_query_token] = override_get_current_user
         self.client = TestClient(app)
 
     def tearDown(self):

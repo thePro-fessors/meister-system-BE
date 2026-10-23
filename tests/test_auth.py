@@ -3,10 +3,14 @@ tests/test_auth.py - 인증, 로그인, OTP, 비밀번호 복잡도 및 보안 �
 SECURITY_AND_AUDIT.md 및 TODO.md 명세 검증 스위트
 """
 
-import glob
-import json
 import os
 import sys
+
+# 테스트 환경 내 실제 SMTP 발송 방지 (로컬 프로세스 메모리 한정)
+os.environ["EMAIL_PROVIDER"] = "console"
+
+import glob
+import json
 import unittest
 from datetime import datetime
 from unittest.mock import MagicMock

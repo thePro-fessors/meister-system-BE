@@ -359,6 +359,75 @@ class TestAdminStudentBatchAPI(unittest.TestCase):
         self.assertEqual(res.status_code, 200)
         self.assertEqual(res.json()["data"]["successCount"], 1)
 
+    # 11. SSE 실시간 진행률 스트림 Query 파라미터(?token=...) 인증 검증
+    def test_stream_batch_progress_query_token_auth(self):
+        from core.security import create_access_token, get_current_user_with_query_token
+        from core.batch_manager import batch_task_manager
+
+        # 임시 관리자 토큰 생성
+        admin_token = create_access_token(data={"sub": "admin-uuid", "role": "admin", "id": "admin"})
+
+        # 토큰 없이 호출 시 401 검증 (SSE 401 방지 제어 확인)
+        res_no_token = self.client.get("/api/admin/batch/tasks/test-task-1/progress")
+        self.assertEqual(res_no_token.status_code, 401)
+        self.assertIn("인증 토큰이 누락", res_no_token.json()["error"]["message"])
+
+        # query parameter (?token=...) 로 호출 시 인증 성공 (401 없이 스트림 진입)
+        task_id = batch_task_manager.create_task("TEST_TASK", total_count=1)
+        batch_task_manager.complete_task(task_id, 1, 0, 0)
+        res_with_token = self.client.get(f"/api/admin/batch/tasks/{task_id}/progress?token={admin_token}")
+        self.assertEqual(res_with_token.status_code, 200)
+        self.assertIn("text/event-stream", res_with_token.headers.get("content-type", ""))
+        self.assertIn("COMPLETED", res_with_token.text)
+
+        # Authorization Bearer 헤더로 호출 시에도 인증 성공 검증
+        task_id2 = batch_task_manager.create_task("TEST_TASK_2", total_count=1)
+        batch_task_manager.complete_task(task_id2, 1, 0, 0)
+        res_bearer = self.client.get(
+            f"/api/admin/batch/tasks/{task_id2}/progress",
+            headers={"Authorization": f"Bearer {admin_token}"},
+        )
+        self.assertEqual(res_bearer.status_code, 200)
+        self.assertIn("text/event-stream", res_bearer.headers.get("content-type", ""))
+
+    # 12. 리포트 다운로드 및 상태 조회 Query 파라미터(?token=...) 인증 및 공백 허용 검증
+    def test_batch_report_download_and_status_query_token_auth(self):
+        from core.security import create_access_token
+        from core.batch_manager import batch_task_manager
+
+        admin_token = create_access_token(data={"sub": "admin-uuid", "role": "admin", "id": "admin"})
+        student_token = create_access_token(data={"sub": "student-uuid", "role": "student", "id": "student1"})
+
+        task_id = batch_task_manager.create_task("TEST_REPORT_TASK", total_count=2)
+        batch_task_manager.complete_task(
+            task_id, 1, 0, 1, parsing_errors=[{"row": 2, "name": "김철수", "reason": "오류 사유 테스트"}]
+        )
+
+        # 1) 토큰 누락 시 401
+        res_no_tok = self.client.get(f"/api/admin/batch/tasks/{task_id}/report/download")
+        self.assertEqual(res_no_tok.status_code, 401)
+
+        # 2) 학생 토큰 시 403
+        res_stud = self.client.get(f"/api/admin/batch/tasks/{task_id}/report/download?token={student_token}")
+        self.assertEqual(res_stud.status_code, 403)
+
+        # 3) 쿼리 토큰으로 CSV 리포트 다운로드 성공 (200 OK & text/csv)
+        res_csv = self.client.get(f"/api/admin/batch/tasks/{task_id}/report/download?token={admin_token}")
+        self.assertEqual(res_csv.status_code, 200)
+        self.assertIn("text/csv", res_csv.headers.get("content-type", ""))
+        self.assertIn("attachment; filename=", res_csv.headers.get("content-disposition", ""))
+        self.assertIn("오류 사유 테스트", res_csv.text)
+
+        # 4) 앞뒤 공백 포함 토큰도 정상 통과 검증
+        res_ws = self.client.get(f"/api/admin/batch/tasks/{task_id}/report/download?token=%20{admin_token}%20")
+        self.assertEqual(res_ws.status_code, 200)
+
+        # 5) 상태 단건 조회 쿼리 토큰 성공 검증
+        res_status = self.client.get(f"/api/admin/batch/tasks/{task_id}?token={admin_token}")
+        self.assertEqual(res_status.status_code, 200)
+        self.assertEqual(res_status.json()["data"]["taskId"], task_id)
+
 
 if __name__ == "__main__":
     unittest.main()
+

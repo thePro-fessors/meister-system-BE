@@ -225,25 +225,32 @@ async def send_otp_email(to_email: str, otp_code: str, user_name: str = "사용�
     if not validate_email_format(to_email):
         raise ValueError(f"유효하지 않은 이메일 형식입니다: {to_email}")
 
+    # 테스트/더미 도메인은 실제 외부 SMTP 발송 차단 (스팸/반송 방지)
+    dummy_domains = ("@school.kr", "@example.com", "@test.com", "@test.kr")
+    if any(to_email.lower().endswith(d) for d in dummy_domains):
+        log_otp(to_email, otp_code)
+        return
+
     subject = f"[{SMTP_FROM_NAME}] 본인인증 번호 안내"
     html_content = _create_otp_html(otp_code, user_name)
 
-    if EMAIL_PROVIDER == "console":
+    provider = os.getenv("EMAIL_PROVIDER", EMAIL_PROVIDER).lower()
+    if provider == "console":
         log_otp(to_email, otp_code)
         return
 
     try:
-        if EMAIL_PROVIDER == "smtp":
+        if provider == "smtp":
             await _send_via_smtp(to_email, subject, html_content)
             return
 
-        if EMAIL_PROVIDER == "brevo":
+        if provider == "brevo":
             await _send_via_brevo(to_email, subject, html_content)
             return
 
-        raise ValueError(f"지원하지 않는 EMAIL_PROVIDER입니다: {EMAIL_PROVIDER}")
+        raise ValueError(f"지원하지 않는 EMAIL_PROVIDER입니다: {provider}")
     except Exception as exc:
         logger.critical(
-            f"[MAIL_DISPATCH_FAILURE] 이메일 발송 실패: to={to_email}, provider={EMAIL_PROVIDER}, error={exc}",
-            extra={"extra_data": {"type": "MAIL_FAILURE", "to": to_email, "provider": EMAIL_PROVIDER, "error": str(exc)}}
+            f"[MAIL_DISPATCH_FAILURE] 이메일 발송 실패: to={to_email}, provider={provider}, error={exc}",
+            extra={"extra_data": {"type": "MAIL_FAILURE", "to": to_email, "provider": provider, "error": str(exc)}}
         )

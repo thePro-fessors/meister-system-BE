@@ -417,7 +417,8 @@ class TestAuditV2SecurityAndPermissions(unittest.IsolatedAsyncioTestCase):
     # =========================================================================
     async def test_email_otp_subject_no_plaintext_otp(self):
         """이메일 발송 시 제목에 평문 OTP({otp_code})가 노출되지 않는지 검증"""
-        with patch("core.email._send_via_smtp", new_callable=AsyncMock) as mock_send, \
+        with patch.dict(os.environ, {"EMAIL_PROVIDER": "smtp"}), \
+             patch("core.email._send_via_smtp", new_callable=AsyncMock) as mock_send, \
              patch("core.email.EMAIL_PROVIDER", "smtp"):
             mock_send.return_value = True
             otp = "847291"

@@ -45,7 +45,7 @@ from core.neis import (
     NEIS_SCHOOL_CODE,
     NEIS_SCHOOL_NAME,
 )
-from core.security import error_response, get_current_user, normalize_role
+from core.security import error_response, get_current_user, get_current_user_with_query_token, normalize_role
 from database import get_db, get_redis
 from sr_format import Error, SrFormat
 
@@ -1103,7 +1103,7 @@ async def batch_register_students_async(
 @admin_router.get("/batch/tasks/{task_id}/progress", summary="대량 등록 작업 SSE 실시간 진행률 스트림")
 async def stream_batch_progress(
     task_id: str,
-    current_user: Dict[str, Any] = Depends(get_current_user),
+    current_user: Dict[str, Any] = Depends(get_current_user_with_query_token),
 ):
     """
     대량 등록 작업 실시간 SSE 스트림
@@ -1129,7 +1129,7 @@ async def stream_batch_progress(
 @admin_router.get("/batch/tasks/{task_id}", summary="대량 등록 작업 상태 단건 조회", response_model=SrFormat)
 async def get_batch_task_status(
     task_id: str,
-    current_user: Dict[str, Any] = Depends(get_current_user),
+    current_user: Dict[str, Any] = Depends(get_current_user_with_query_token),
 ):
     """대량 등록 작업 상태 JSON 단건 조회"""
     admin_err = check_admin_access(current_user)
@@ -1146,7 +1146,7 @@ async def get_batch_task_status(
 @admin_router.get("/batch/tasks/{task_id}/report/download", summary="대량 등록 실패 행 상세 리포트 CSV 다운로드")
 async def download_batch_error_report(
     task_id: str,
-    current_user: Dict[str, Any] = Depends(get_current_user),
+    current_user: Dict[str, Any] = Depends(get_current_user_with_query_token),
 ):
     """배치 작업 실패 행 리포트 CSV 다운로드"""
     admin_err = check_admin_access(current_user)

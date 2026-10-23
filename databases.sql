@@ -428,4 +428,4 @@ CREATE INDEX idx_submissions_status_review_perf
   ON submissions (status_code, is_deleted);
 
 CREATE INDEX idx_sar_year_grade_class_perf
-  ON student_academic_records (year_id, grade, class_no);
+  ON student_academic_records (year_id, grade, class);

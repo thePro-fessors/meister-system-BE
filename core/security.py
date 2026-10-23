@@ -21,7 +21,7 @@ from enum import StrEnum
 from typing import Any, Callable, Dict, Optional, Sequence, Tuple
 
 import jwt
-from fastapi import Depends, HTTPException, Request
+from fastapi import Depends, HTTPException, Query, Request
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 import redis.asyncio as aioredis
 from dotenv import load_dotenv
@@ -407,30 +407,14 @@ def create_access_token(data: dict, expires_delta: timedelta | None = None) -> s
     return jwt.encode(to_encode, JWT_SECRET_KEY, algorithm=JWT_ALGORITHM)
 
 
-async def get_current_user(
-    credentials: HTTPAuthorizationCredentials | None = Depends(security),
-    redis: aioredis.Redis = Depends(get_redis),
+async def verify_access_token(
+    token: str,
+    redis: aioredis.Redis,
 ) -> Dict[str, Any]:
     """
-    FastAPI 의존성 주입용: 요청 헤더의 JWT 토큰을 파싱하고 유효성 및 블랙리스트 등록 여부를 검증합니다.
+    JWT Access Token 유효성 검증 및 Redis 블랙리스트/세션 상태 검증 공통 함수
     (SEC-02: purpose=access 필수 검증, download 토큰 차단, Redis 장애 시 503 반환)
     """
-    if not credentials or not credentials.credentials:
-        raise HTTPException(
-            status_code=401,
-            detail=SrFormat(
-                status_code=401,
-                success=False,
-                data=None,
-                error=Error(
-                    code="UNAUTHORIZED",
-                    message="인증 토큰이 누락되었거나 Bearer 형식이 아닙니다.",
-                ),
-            ).model_dump(),
-        )
-
-    token = credentials.credentials
-
     try:
         payload = jwt.decode(token, JWT_SECRET_KEY, algorithms=[JWT_ALGORITHM])
     except jwt.ExpiredSignatureError:
@@ -540,6 +524,57 @@ async def get_current_user(
         "exp": payload.get("exp"),
         "token": token,
     }
+
+
+async def get_current_user(
+    credentials: HTTPAuthorizationCredentials | None = Depends(security),
+    redis: aioredis.Redis = Depends(get_redis),
+) -> Dict[str, Any]:
+    """
+    FastAPI 의존성 주입용: 요청 헤더의 JWT 토큰을 파싱하고 유효성 및 블랙리스트 등록 여부를 검증합니다.
+    """
+    if not credentials or not credentials.credentials:
+        raise HTTPException(
+            status_code=401,
+            detail=SrFormat(
+                status_code=401,
+                success=False,
+                data=None,
+                error=Error(
+                    code="UNAUTHORIZED",
+                    message="인증 토큰이 누락되었거나 Bearer 형식이 아닙니다.",
+                ),
+            ).model_dump(),
+        )
+
+    return await verify_access_token(credentials.credentials, redis)
+
+
+async def get_current_user_with_query_token(
+    token: Optional[str] = Query(None, description="EventSource/SSE 전용 인증 토큰"),
+    credentials: HTTPAuthorizationCredentials | None = Depends(security),
+    redis: aioredis.Redis = Depends(get_redis),
+) -> Dict[str, Any]:
+    """
+    SSE/EventSource 등 헤더 커스텀이 불가능한 연결을 위해 Query 파라미터(?token=...)를 지원하는 인증 의존성
+    (Bearer 헤더 우선, 없을 시 Query 파라미터 토큰 검증)
+    """
+    raw_token = credentials.credentials if (credentials and credentials.credentials) else token
+    if not raw_token or not raw_token.strip():
+        raise HTTPException(
+            status_code=401,
+            detail=SrFormat(
+                status_code=401,
+                success=False,
+                data=None,
+                error=Error(
+                    code="UNAUTHORIZED",
+                    message="인증 토큰이 누락되었거나 Bearer 형식이 아닙니다.",
+                ),
+            ).model_dump(),
+        )
+
+    return await verify_access_token(raw_token.strip(), redis)
 
 
 async def revoke_all_user_tokens(
