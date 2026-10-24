@@ -40,7 +40,7 @@ from core.neis import (
     NEIS_SCHOOL_CODE,
     NEIS_SCHOOL_NAME,
 )
-from core.security import error_response, get_current_user, normalize_role
+from core.security import error_response, get_current_user, normalize_role, revoke_all_user_tokens
 from database import get_db, get_redis
 from sr_format import Error, SrFormat
 
@@ -1418,6 +1418,446 @@ async def revoke_invitation_code(
         success=True,
         data={"revokedCode": clean_code},
     ).model_dump()
+
+
+# ==============================================================================
+# 전체 유저 탐색 및 관리 (소프트 삭제, 복원, 영구 삭제)
+# ==============================================================================
+
+@admin_router.get("/users")
+async def list_admin_users(
+    search: Optional[str] = Query(None, description="아이디, 이름, 이메일 검색"),
+    role: Optional[str] = Query("all", description="student, teacher, admin, all"),
+    status_filter: Optional[str] = Query("all", alias="status", description="active, deleted, all"),
+    page: int = Query(1, ge=1, description="페이지 번호"),
+    limit: int = Query(20, ge=1, le=100, description="페이지당 개수"),
+    current_user: Dict[str, Any] = Depends(get_current_user),
+    conn = Depends(get_db),
+):
+    admin_guard = check_admin_access(current_user)
+    if admin_guard:
+        return admin_guard
+
+    offset = (page - 1) * limit
+    where_clauses: List[str] = []
+    params: List[Any] = []
+
+    # 1. role 필터
+    clean_role = (role or "all").strip().lower()
+    if clean_role in ("student", "0"):
+        where_clauses.append("u.role = %s")
+        params.append(0)
+    elif clean_role in ("teacher", "1"):
+        where_clauses.append("u.role = %s")
+        params.append(1)
+    elif clean_role in ("admin", "2"):
+        where_clauses.append("u.role = %s")
+        params.append(2)
+    elif clean_role != "all":
+        return error_response(status.HTTP_400_BAD_REQUEST, "INVALID_ROLE", "유효하지 않은 역할 필터입니다. (all, student, teacher, admin)")
+
+    # 2. status 필터
+    clean_status = (status_filter or "all").strip().lower()
+    if clean_status == "active":
+        where_clauses.append("u.is_deleted = FALSE")
+    elif clean_status == "deleted":
+        where_clauses.append("u.is_deleted = TRUE")
+    elif clean_status != "all":
+        return error_response(status.HTTP_400_BAD_REQUEST, "INVALID_STATUS", "유효하지 않은 상태 필터입니다. (all, active, deleted)")
+
+    # 3. search 필터
+    if search and search.strip():
+        kw = f"%{search.strip()}%"
+        where_clauses.append("(u.id LIKE %s OR u.email LIKE %s OR st.name LIKE %s OR t.name LIKE %s)")
+        params.extend([kw, kw, kw, kw])
+
+    where_sql = ("WHERE " + " AND ".join(where_clauses)) if where_clauses else ""
+
+    async with conn.cursor(cursor=DictCursor) as cur:
+        # 전체 필터 일치 수
+        count_sql = f"""
+            SELECT COUNT(DISTINCT u.uuid) AS total
+            FROM users u
+            LEFT JOIN students st ON st.uuid = u.uuid
+            LEFT JOIN teachers t ON t.uuid = u.uuid
+            {where_sql}
+        """
+        await cur.execute(count_sql, tuple(params))
+        total_row = await cur.fetchone()
+        total = total_row["total"] if total_row else 0
+
+        # 삭제 대기 인원 총 수 (전체 시스템 기준)
+        await cur.execute("SELECT COUNT(*) AS deleted_count FROM users WHERE is_deleted = TRUE")
+        del_row = await cur.fetchone()
+        deleted_count = del_row["deleted_count"] if del_row else 0
+
+        # 유저 목록 조회
+        data_sql = f"""
+            SELECT 
+                u.uuid,
+                u.id,
+                u.email,
+                u.role,
+                u.created_at,
+                u.is_deleted,
+                st.student_id,
+                st.name AS student_name,
+                sar.grade AS student_grade,
+                sar.class AS student_class,
+                sar.number AS student_number,
+                t.teachers_id,
+                t.name AS teacher_name,
+                t.grade AS teacher_grade,
+                t.class AS teacher_class,
+                t.subject AS teacher_subject,
+                t.department AS teacher_department,
+                t.position AS teacher_position
+            FROM users u
+            LEFT JOIN students st ON st.uuid = u.uuid
+            LEFT JOIN (
+                SELECT sar1.student_id, sar1.grade, sar1.class, sar1.number
+                FROM student_academic_records sar1
+                INNER JOIN (
+                    SELECT student_id, MAX(record_id) AS max_rec
+                    FROM student_academic_records
+                    GROUP BY student_id
+                ) sar_max ON sar1.student_id = sar_max.student_id AND sar1.record_id = sar_max.max_rec
+            ) sar ON sar.student_id = st.student_id
+            LEFT JOIN teachers t ON t.uuid = u.uuid
+            {where_sql}
+            ORDER BY u.created_at DESC, u.uuid DESC
+            LIMIT %s OFFSET %s
+        """
+        await cur.execute(data_sql, tuple(params + [limit, offset]))
+        rows = await cur.fetchall()
+
+    users_list = []
+    for r in (rows or []):
+        u_role = r.get("role")
+        role_str = "student" if u_role == 0 else ("teacher" if u_role == 1 else "admin")
+
+        st_name = r.get("student_name")
+        t_name = r.get("teacher_name")
+        if u_role == 0 and st_name:
+            name = st_name
+        elif u_role in (1, 2) and t_name:
+            name = t_name
+        else:
+            name = st_name or t_name or r.get("id") or "사용자"
+
+        extra: Dict[str, Any] = {}
+        if u_role == 0:
+            extra = {
+                "studentId": r.get("student_id"),
+                "grade": r.get("student_grade"),
+                "class": r.get("student_class"),
+                "number": r.get("student_number"),
+            }
+        elif u_role == 1:
+            extra = {
+                "teachersId": r.get("teachers_id"),
+                "grade": r.get("teacher_grade"),
+                "class": r.get("teacher_class"),
+                "subject": r.get("teacher_subject"),
+                "department": r.get("teacher_department"),
+                "position": r.get("teacher_position"),
+            }
+        elif u_role == 2:
+            if r.get("teachers_id"):
+                extra = {
+                    "teachersId": r.get("teachers_id"),
+                    "grade": r.get("teacher_grade"),
+                    "class": r.get("teacher_class"),
+                    "subject": r.get("teacher_subject"),
+                    "department": r.get("teacher_department"),
+                    "position": r.get("teacher_position"),
+                }
+
+        raw_created = r.get("created_at")
+        if isinstance(raw_created, datetime):
+            created_str = raw_created.isoformat()
+        elif raw_created:
+            created_str = str(raw_created)
+        else:
+            created_str = ""
+
+        is_del = bool(r.get("is_deleted"))
+
+        users_list.append({
+            "uuid": r.get("uuid"),
+            "id": r.get("id"),
+            "name": name,
+            "email": r.get("email"),
+            "role": role_str,
+            "role_code": u_role,
+            "is_deleted": is_del,
+            "isDeleted": is_del,
+            "created_at": created_str,
+            "createdAt": created_str,
+            "extra": extra,
+        })
+
+    return SrFormat(
+        status_code=200,
+        success=True,
+        data={
+            "users": users_list,
+            "total": total,
+            "deletedCount": deleted_count,
+            "deleted_count": deleted_count,
+            "page": page,
+            "limit": limit,
+        },
+    ).model_dump()
+
+
+@admin_router.patch("/users/{user_uuid}/soft-delete")
+async def soft_delete_user(
+    user_uuid: str,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+    conn = Depends(get_db),
+    redis: aioredis.Redis = Depends(get_redis),
+):
+    admin_guard = check_admin_access(current_user)
+    if admin_guard:
+        return admin_guard
+
+    caller_uuid = current_user.get("uuid") or current_user.get("sub")
+    clean_uuid = (user_uuid or "").strip()
+    if caller_uuid and str(caller_uuid).strip() == clean_uuid:
+        return error_response(
+            status.HTTP_400_BAD_REQUEST,
+            "SELF_DELETION_PROHIBITED",
+            "관리자 본인의 계정은 삭제할 수 없습니다.",
+        )
+
+    async with conn.cursor(cursor=DictCursor) as cur:
+        await cur.execute("SELECT uuid, id, role, is_deleted FROM users WHERE uuid = %s LIMIT 1", (clean_uuid,))
+        target_user = await cur.fetchone()
+
+    if not target_user:
+        return error_response(status.HTTP_404_NOT_FOUND, "USER_NOT_FOUND", "해당 유저를 찾을 수 없습니다.")
+
+    caller_id = current_user.get("id") or current_user.get("user_id")
+    if caller_id and caller_id == target_user.get("id"):
+        return error_response(
+            status.HTTP_400_BAD_REQUEST,
+            "SELF_DELETION_PROHIBITED",
+            "관리자 본인의 계정은 삭제할 수 없습니다.",
+        )
+
+    try:
+        if hasattr(conn, "autocommit"):
+            await conn.autocommit(False)
+        async with conn.cursor(cursor=DictCursor) as cur:
+            await cur.execute("UPDATE users SET is_deleted = TRUE WHERE uuid = %s", (clean_uuid,))
+            await cur.execute("UPDATE students SET is_deleted = TRUE WHERE uuid = %s", (clean_uuid,))
+            await cur.execute("UPDATE teachers SET is_deleted = TRUE WHERE uuid = %s", (clean_uuid,))
+        if hasattr(conn, "commit"):
+            await conn.commit()
+    except Exception:
+        if hasattr(conn, "rollback"):
+            await conn.rollback()
+        raise
+    finally:
+        if hasattr(conn, "autocommit"):
+            await conn.autocommit(True)
+
+    try:
+        await revoke_all_user_tokens(redis, clean_uuid)
+    except Exception:
+        pass
+
+    return SrFormat(
+        status_code=200,
+        success=True,
+        data={
+            "uuid": clean_uuid,
+            "is_deleted": True,
+            "isDeleted": True,
+            "message": "유저가 삭제 대기 상태로 변경되었습니다.",
+        },
+    ).model_dump()
+
+
+@admin_router.patch("/users/{user_uuid}/restore")
+async def restore_user(
+    user_uuid: str,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+    conn = Depends(get_db),
+):
+    admin_guard = check_admin_access(current_user)
+    if admin_guard:
+        return admin_guard
+
+    clean_uuid = (user_uuid or "").strip()
+    async with conn.cursor(cursor=DictCursor) as cur:
+        await cur.execute("SELECT uuid, id, role, is_deleted FROM users WHERE uuid = %s LIMIT 1", (clean_uuid,))
+        target_user = await cur.fetchone()
+
+    if not target_user:
+        return error_response(status.HTTP_404_NOT_FOUND, "USER_NOT_FOUND", "해당 유저를 찾을 수 없습니다.")
+
+    try:
+        if hasattr(conn, "autocommit"):
+            await conn.autocommit(False)
+        async with conn.cursor(cursor=DictCursor) as cur:
+            await cur.execute("UPDATE users SET is_deleted = FALSE WHERE uuid = %s", (clean_uuid,))
+            await cur.execute("UPDATE students SET is_deleted = FALSE WHERE uuid = %s", (clean_uuid,))
+            await cur.execute("UPDATE teachers SET is_deleted = FALSE WHERE uuid = %s", (clean_uuid,))
+        if hasattr(conn, "commit"):
+            await conn.commit()
+    except Exception:
+        if hasattr(conn, "rollback"):
+            await conn.rollback()
+        raise
+    finally:
+        if hasattr(conn, "autocommit"):
+            await conn.autocommit(True)
+
+    return SrFormat(
+        status_code=200,
+        success=True,
+        data={
+            "uuid": clean_uuid,
+            "is_deleted": False,
+            "isDeleted": False,
+            "message": "유저가 성공적으로 복구되었습니다.",
+        },
+    ).model_dump()
+
+
+@admin_router.delete("/users/purge-deleted")
+async def purge_deleted_users(
+    user_uuid: Optional[str] = Query(None, description="특정 유저 단건 영구 삭제 시 UUID"),
+    current_user: Dict[str, Any] = Depends(get_current_user),
+    conn = Depends(get_db),
+    redis: aioredis.Redis = Depends(get_redis),
+):
+    admin_guard = check_admin_access(current_user)
+    if admin_guard:
+        return admin_guard
+
+    caller_uuid = current_user.get("uuid") or current_user.get("sub")
+    caller_id = current_user.get("id") or current_user.get("user_id")
+
+    async with conn.cursor(cursor=DictCursor) as cur:
+        if user_uuid and user_uuid.strip():
+            clean_uuid = user_uuid.strip()
+            if caller_uuid and str(caller_uuid).strip() == clean_uuid:
+                return error_response(
+                    status.HTTP_400_BAD_REQUEST,
+                    "SELF_DELETION_PROHIBITED",
+                    "관리자 본인의 계정은 영구 삭제할 수 없습니다.",
+                )
+            await cur.execute("SELECT uuid, id, is_deleted FROM users WHERE uuid = %s LIMIT 1", (clean_uuid,))
+            target = await cur.fetchone()
+            if not target:
+                return error_response(status.HTTP_404_NOT_FOUND, "USER_NOT_FOUND", "해당 유저를 찾을 수 없습니다.")
+            if caller_id and target.get("id") == caller_id:
+                return error_response(
+                    status.HTTP_400_BAD_REQUEST,
+                    "SELF_DELETION_PROHIBITED",
+                    "관리자 본인의 계정은 영구 삭제할 수 없습니다.",
+                )
+            if not target.get("is_deleted"):
+                return error_response(
+                    status.HTTP_400_BAD_REQUEST,
+                    "NOT_DELETED_USER",
+                    "삭제 대기(소프트 삭제) 상태인 유저만 완전 삭제할 수 있습니다.",
+                )
+            target_uuids = [clean_uuid]
+        else:
+            await cur.execute("SELECT uuid, id FROM users WHERE is_deleted = TRUE")
+            rows = await cur.fetchall()
+            target_uuids = [
+                r["uuid"]
+                for r in (rows or [])
+                if r.get("uuid")
+                and (not caller_uuid or str(r["uuid"]).strip() != str(caller_uuid).strip())
+                and (not caller_id or r.get("id") != caller_id)
+            ]
+
+    if not target_uuids:
+        return SrFormat(
+            status_code=200,
+            success=True,
+            data={
+                "purgedCount": 0,
+                "purged_count": 0,
+                "purgedUuids": [],
+                "message": "영구 삭제할 대상 유저가 없습니다.",
+            },
+        ).model_dump()
+
+    CHUNK_SIZE = 500
+    try:
+        if hasattr(conn, "autocommit"):
+            await conn.autocommit(False)
+        async with conn.cursor(cursor=DictCursor) as cur:
+            for i in range(0, len(target_uuids), CHUNK_SIZE):
+                chunk = target_uuids[i : i + CHUNK_SIZE]
+                format_placeholders = ",".join(["%s"] * len(chunk))
+
+                # 1. chat_messages 삭제
+                chat_msg_sql = f"""
+                    DELETE cm FROM chat_messages cm
+                    JOIN chat_conversations cc ON cm.conversation_id = cc.conversation_id
+                    WHERE cc.user_uuid IN ({format_placeholders})
+                """
+                await cur.execute(chat_msg_sql, tuple(chunk))
+
+                # 2. chat_conversations 삭제
+                chat_conv_sql = f"DELETE FROM chat_conversations WHERE user_uuid IN ({format_placeholders})"
+                await cur.execute(chat_conv_sql, tuple(chunk))
+
+                # 3. submissions_logs의 modifier_uuid = NULL
+                sl_sql = f"UPDATE submissions_logs SET modifier_uuid = NULL WHERE modifier_uuid IN ({format_placeholders})"
+                await cur.execute(sl_sql, tuple(chunk))
+
+                # 4. merits_log의 modifier_uuid = NULL
+                ml_sql = f"UPDATE merits_log SET modifier_uuid = NULL WHERE modifier_uuid IN ({format_placeholders})"
+                await cur.execute(ml_sql, tuple(chunk))
+
+                # 5. students의 uuid = NULL
+                st_sql = f"UPDATE students SET uuid = NULL WHERE uuid IN ({format_placeholders})"
+                await cur.execute(st_sql, tuple(chunk))
+
+                # 6. teachers의 uuid = NULL
+                tch_sql = f"UPDATE teachers SET uuid = NULL WHERE uuid IN ({format_placeholders})"
+                await cur.execute(tch_sql, tuple(chunk))
+
+                # 7. users 영구 삭제 (is_deleted = TRUE 인 건만 안전 삭제)
+                del_users_sql = f"DELETE FROM users WHERE uuid IN ({format_placeholders}) AND is_deleted = TRUE"
+                await cur.execute(del_users_sql, tuple(chunk))
+
+        if hasattr(conn, "commit"):
+            await conn.commit()
+    except Exception:
+        if hasattr(conn, "rollback"):
+            await conn.rollback()
+        raise
+    finally:
+        if hasattr(conn, "autocommit"):
+            await conn.autocommit(True)
+
+    try:
+        for u in target_uuids:
+            await revoke_all_user_tokens(redis, u)
+    except Exception:
+        pass
+
+    return SrFormat(
+        status_code=200,
+        success=True,
+        data={
+            "purgedCount": len(target_uuids),
+            "purged_count": len(target_uuids),
+            "purgedUuids": target_uuids,
+            "message": f"{len(target_uuids)}명의 유저가 영구 삭제되었습니다.",
+        },
+    ).model_dump()
+
 
 
 

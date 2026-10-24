@@ -96,7 +96,7 @@ CREATE TABLE merits_log
 (
   log_id          INT          NOT NULL AUTO_INCREMENT COMMENT '기록 고유 ID',
   merits_point_id INT          NOT NULL COMMENT '수정할 사안 ID',
-  modifier_uuid   VARCHAR(36)  NOT NULL COMMENT '변경자의 UUID',
+  modifier_uuid   VARCHAR(36)  NULL     COMMENT '변경자의 UUID',
   action_type     VARCHAR(20)  NOT NULL COMMENT '수정 / 삭제 구분자',
   old_points      DECIMAL(5,2) NULL     COMMENT '변경 전 점수',
   new_points      DECIMAL(5,2) NULL     COMMENT '변경 후 점수',
@@ -171,7 +171,7 @@ CREATE TABLE submissions_logs
 (
   log_id          INT          NOT NULL AUTO_INCREMENT COMMENT '기록 고유 ID',
   submission_id   INT          NOT NULL COMMENT '수정할 항목 ID',
-  modifier_uuid   VARCHAR(36)  NOT NULL COMMENT '수정자 UUID',
+  modifier_uuid   VARCHAR(36)  NULL     COMMENT '수정자 UUID',
   action_type     VARCHAR(20)  NOT NULL COMMENT '행위 구분',
   old_status_code TINYINT      NULL     COMMENT '변경 전 상태 코드',
   new_status_code TINYINT      NOT NULL COMMENT '변경 후 상태 코드',
