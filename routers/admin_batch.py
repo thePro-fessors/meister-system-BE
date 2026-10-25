@@ -874,16 +874,13 @@ async def _run_student_batch_job(
     target_year_id: int,
     is_overwrite: bool,
     should_validate_neis: bool,
-    existing_conn: Any = None,
 ) -> None:
     """백그라운드에서 실행되는 학생 대량 등록 작업 워커"""
     import database
-    from routers.auth import hash_password
 
+    conn = None
     conn_context = None
-    if existing_conn is not None:
-        conn = existing_conn
-    elif database.pool is not None:
+    if database.pool is not None:
         conn_context = database.pool.acquire()
         conn = await conn_context.__aenter__()
     else:
@@ -891,7 +888,7 @@ async def _run_student_batch_job(
         return
 
     try:
-        total = len(valid_records)
+        total = len(valid_records) + len(parsing_errors)
         created_count = 0
         updated_count = 0
         skipped_count = 0
@@ -926,6 +923,53 @@ async def _run_student_batch_job(
             chunk = final_to_insert[i:i + chunk_size]
             await conn.autocommit(False)
             async with conn.cursor(cursor=DictCursor) as cur:
+                chunk_emails = list({st["email"] for st in chunk if st.get("email")})
+                existing_teacher_emails: Set[str] = set()
+                existing_students_map: Dict[str, Dict[str, Any]] = {}
+                existing_records_map: Dict[int, Dict[str, Any]] = {}
+
+                if chunk_emails:
+                    t_placeholders = ", ".join(["%s"] * len(chunk_emails))
+                    await cur.execute(
+                        f"SELECT email FROM teachers WHERE email IN ({t_placeholders}) AND is_deleted = FALSE",
+                        tuple(chunk_emails),
+                    )
+                    t_rows = await cur.fetchall() or []
+                    for tr in t_rows:
+                        em = tr["email"] if isinstance(tr, dict) else tr[0]
+                        if em:
+                            existing_teacher_emails.add(em)
+
+                    s_placeholders = ", ".join(["%s"] * len(chunk_emails))
+                    await cur.execute(
+                        f"SELECT student_id, name, email, is_deleted FROM students WHERE email IN ({s_placeholders})",
+                        tuple(chunk_emails),
+                    )
+                    s_rows = await cur.fetchall() or []
+                    for sr in s_rows:
+                        em = sr["email"] if isinstance(sr, dict) else sr[2]
+                        if em:
+                            existing_students_map[em] = sr
+
+                    ex_sids = [
+                        (sr["student_id"] if isinstance(sr, dict) else sr[0])
+                        for sr in existing_students_map.values()
+                    ]
+                    if ex_sids:
+                        sid_placeholders = ", ".join(["%s"] * len(ex_sids))
+                        await cur.execute(
+                            f"""
+                            SELECT record_id, student_id, grade, class, number
+                            FROM student_academic_records
+                            WHERE year_id = %s AND student_id IN ({sid_placeholders})
+                            """,
+                            (target_year_id, *ex_sids),
+                        )
+                        r_rows = await cur.fetchall() or []
+                        for rr in r_rows:
+                            sid = rr["student_id"] if isinstance(rr, dict) else rr[1]
+                            existing_records_map[sid] = rr
+
                 for st in chunk:
                     email = st.get("email")
                     name = st["name"]
@@ -933,42 +977,81 @@ async def _run_student_batch_job(
                     class_no = st["class_no"]
                     student_no = st["student_no"]
 
-                    await cur.execute("SELECT student_id, uuid FROM students WHERE email = %s LIMIT 1", (email,))
-                    ex_st = await cur.fetchone()
+                    if email in existing_teacher_emails:
+                        parsing_errors.append({
+                            "row": st.get("row_number", 0),
+                            "name": name,
+                            "reason": f"교사 명단에 이미 등록된 이메일({email})이므로 학생으로 등록할 수 없습니다.",
+                        })
+                        skipped_count += 1
+                        continue
 
+                    ex_st = existing_students_map.get(email)
                     if ex_st:
                         s_id = ex_st["student_id"] if isinstance(ex_st, dict) else ex_st[0]
-                        if is_overwrite:
-                            await cur.execute("UPDATE students SET name = %s WHERE student_id = %s", (name, s_id))
+                        ex_name = ex_st["name"] if isinstance(ex_st, dict) else ex_st[1]
+                        is_del = ex_st.get("is_deleted", False) if isinstance(ex_st, dict) else (ex_st[3] if len(ex_st) > 3 else False)
+                        if is_overwrite and (ex_name != name or is_del):
+                            await cur.execute(
+                                "UPDATE students SET name = %s, is_deleted = FALSE WHERE student_id = %s",
+                                (name, s_id),
+                            )
                             updated_count += 1
                         else:
                             skipped_count += 1
                     else:
-                        new_uuid = str(uuid.uuid4())
-                        init_pw = f"bssm{target_year}!"
-                        pw_hash = hash_password(init_pw)
                         await cur.execute(
-                            "INSERT INTO users (uuid, email, password_hash, role) VALUES (%s, %s, %s, 'student')",
-                            (new_uuid, email, pw_hash),
+                            "INSERT INTO students (name, email, status, is_deleted) VALUES (%s, %s, 0, FALSE)",
+                            (name, email),
                         )
-                        await cur.execute(
-                            "INSERT INTO students (uuid, name, email) VALUES (%s, %s, %s)",
-                            (new_uuid, name, email),
-                        )
-                        await cur.execute("SELECT LAST_INSERT_ID() AS last_id")
-                        last_row = await cur.fetchone()
-                        s_id = last_row[0] if isinstance(last_row, (list, tuple)) else last_row["last_id"]
+                        s_id = cur.lastrowid
+                        if not s_id:
+                            await cur.execute("SELECT LAST_INSERT_ID() AS last_id")
+                            last_row = await cur.fetchone()
+                            s_id = last_row[0] if isinstance(last_row, (list, tuple)) else last_row["last_id"]
                         created_count += 1
+                        existing_students_map[email] = {
+                            "student_id": s_id,
+                            "name": name,
+                            "email": email,
+                            "is_deleted": False,
+                        }
 
-                    # 학적(student_academic_records) 동기화
-                    await cur.execute(
-                        """
-                        INSERT INTO student_academic_records (student_id, year_id, grade, class_no, student_no)
-                        VALUES (%s, %s, %s, %s, %s)
-                        ON DUPLICATE KEY UPDATE grade = VALUES(grade), class_no = VALUES(class_no), student_no = VALUES(student_no)
-                        """,
-                        (s_id, target_year_id, grade, class_no, student_no),
-                    )
+                    ex_rec = existing_records_map.get(s_id)
+                    if ex_rec:
+                        r_id = ex_rec["record_id"] if isinstance(ex_rec, dict) else ex_rec[0]
+                        if is_overwrite:
+                            await cur.execute(
+                                """
+                                UPDATE student_academic_records
+                                SET grade = %s, class = %s, number = %s
+                                WHERE record_id = %s
+                                """,
+                                (grade, class_no, student_no, r_id),
+                            )
+                            updated_count += 1
+                        else:
+                            skipped_count += 1
+                    else:
+                        await cur.execute(
+                            """
+                            INSERT INTO student_academic_records (student_id, year_id, grade, class, number)
+                            VALUES (%s, %s, %s, %s, %s)
+                            """,
+                            (s_id, target_year_id, grade, class_no, student_no),
+                        )
+                        r_id = cur.lastrowid
+                        if not r_id:
+                            await cur.execute("SELECT LAST_INSERT_ID() AS last_id")
+                            last_row = await cur.fetchone()
+                            r_id = last_row[0] if isinstance(last_row, (list, tuple)) else last_row["last_id"]
+                        existing_records_map[s_id] = {
+                            "record_id": r_id,
+                            "student_id": s_id,
+                            "grade": grade,
+                            "class": class_no,
+                            "number": student_no,
+                        }
 
             await conn.commit()
             processed_so_far = min(total, i + len(chunk))
@@ -1080,7 +1163,6 @@ async def batch_register_students_async(
         target_year_id=target_year_id,
         is_overwrite=is_overwrite,
         should_validate_neis=should_validate_neis,
-        existing_conn=conn,
     )
 
     return JSONResponse(
@@ -1136,7 +1218,7 @@ async def get_batch_task_status(
     if admin_err:
         return admin_err
 
-    task = batch_task_manager.get_task(task_id)
+    task = await batch_task_manager.get_task_async(task_id)
     if not task:
         return error_response(404, "TASK_NOT_FOUND", "해당 배치 작업을 찾을 수 없습니다.")
 
@@ -1153,7 +1235,7 @@ async def download_batch_error_report(
     if admin_err:
         return admin_err
 
-    csv_content = batch_task_manager.generate_csv_report(task_id)
+    csv_content = await batch_task_manager.generate_csv_report_async(task_id)
     filename = f"batch_error_report_{task_id}.csv"
     return Response(
         content=csv_content,

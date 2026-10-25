@@ -75,19 +75,19 @@ async def seed_data(
             year_row = await cur.fetchone()
             if not year_row:
                 # 기존 다른 활성 학년도 비활성화
-                await cur.execute("UPDATE academic_years SET is_activated = FALSE")
+                await cur.execute("UPDATE academic_years SET is_activated = FALSE, status = 'CLOSED'")
                 await cur.execute(
-                    "INSERT INTO academic_years (year, is_activated) VALUES (%s, TRUE)",
+                    "INSERT INTO academic_years (year, is_activated, status) VALUES (%s, TRUE, 'ACTIVE')",
                     (target_year,),
                 )
                 year_id = cur.lastrowid
                 print(f"  [+] {target_year} 학년도 신규 생성 및 활성화 완료 (year_id: {year_id})")
             else:
                 year_id = year_row["year_id"]
-                if not year_row.get("is_activated"):
-                    await cur.execute("UPDATE academic_years SET is_activated = FALSE")
-                    await cur.execute("UPDATE academic_years SET is_activated = TRUE WHERE year_id = %s", (year_id,))
-                    print(f"  [*] 기존 {target_year} 학년도를 활성 상태로 갱신 (year_id: {year_id})")
+                if not year_row.get("is_activated") or year_row.get("status") != "ACTIVE":
+                    await cur.execute("UPDATE academic_years SET is_activated = FALSE, status = 'CLOSED'")
+                    await cur.execute("UPDATE academic_years SET is_activated = TRUE, status = 'ACTIVE' WHERE year_id = %s", (year_id,))
+                    print(f"  [*] 기존 {target_year} 학년도를 활성 상태(ACTIVE)로 갱신 (year_id: {year_id})")
                 else:
                     print(f"  [=] 이미 {target_year} 학년도가 활성 상태입니다 (year_id: {year_id})")
 

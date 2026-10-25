@@ -197,6 +197,20 @@ async def create_point(
                 (point_id, user_uuid, norm_score, escaped_reason),
             )
         await conn.commit()
+
+        try:
+            from core.audit import record_audit_log
+            await record_audit_log(
+                conn=conn,
+                actor=current_user,
+                action_type="POINT_ADD",
+                target_type="MERIT",
+                target_id=point_id,
+                target_name=f"{norm_type} {norm_score}점 ({rel_area or '기본'})",
+                details={"student_id": target_student_id, "type": norm_type, "points": norm_score, "reason": escaped_reason},
+            )
+        except Exception:
+            pass
     except Exception:
         await conn.rollback()
         raise
@@ -392,6 +406,20 @@ async def update_point(
                 }]
 
         await conn.commit()
+
+        try:
+            from core.audit import record_audit_log
+            await record_audit_log(
+                conn=conn,
+                actor=current_user,
+                action_type="POINT_DELETE",
+                target_type="MERIT",
+                target_id=point_id,
+                target_name=f"{existing['type']} {existing['points']}점 삭제",
+                details={"student_id": existing["student_id"], "points": existing["points"], "reason": del_reason},
+            )
+        except Exception:
+            pass
     except Exception:
         await conn.rollback()
         raise
@@ -472,6 +500,20 @@ async def delete_point(
                 (point_id, user_uuid, existing["points"], del_reason),
             )
         await conn.commit()
+
+        try:
+            from core.audit import record_audit_log
+            await record_audit_log(
+                conn=conn,
+                actor=current_user,
+                action_type="POINT_DELETE",
+                target_type="MERIT",
+                target_id=point_id,
+                target_name=f"{existing['type']} {existing['points']}점 삭제",
+                details={"student_id": existing["student_id"], "points": existing["points"], "reason": del_reason},
+            )
+        except Exception:
+            pass
     except Exception:
         await conn.rollback()
         raise

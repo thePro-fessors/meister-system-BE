@@ -3,8 +3,30 @@ core/calculator.py - 역량인증제 평가 점수 및 성취 등급/인증 상�
 (SCORE-01: 서버 계산 계약 확정 및 학생/교사 화면 계산 코드 단일화)
 """
 
+import re
 from decimal import Decimal, ROUND_HALF_UP
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
+
+# 8대 배점 기준 유형 상수
+SCORING_TYPE_FIXED = 1       # 고정점수형 (자격증 취득 시 25점 등)
+SCORING_TYPE_GRADE = 2       # 등급환산형 (S=5점, A=4점, B=3점 등)
+SCORING_TYPE_RANGE = 3       # 구간점수형 (TOEIC 800 이상 30점, 700~795점 25점 등)
+SCORING_TYPE_TIME = 4        # 시간계산형 (봉사활동 시간 × 0.3점 등)
+SCORING_TYPE_DEDUCT = 5      # 감점형 (출결 기본점수에서 결석/지각 감점)
+SCORING_TYPE_BONUS = 6       # 가산점형 (대회 입상 시 추가 점수)
+SCORING_TYPE_MAX_LIMIT = 7   # 최대점제한형 (여러 자료 합산하되 최대점까지만 인정)
+SCORING_TYPE_BEST_ONLY = 8   # 최상위인정형 (동일 종목 성적 중 가장 높은 점수만 반영)
+
+SCORING_TYPE_NAMES = {
+    1: "고정점수형",
+    2: "등급환산형",
+    3: "구간점수형",
+    4: "시간계산형",
+    5: "감점형",
+    6: "가산점형",
+    7: "최대점제한형",
+    8: "최상위인정형",
+}
 
 
 def round_decimal(value: float | Decimal, places: int = 1) -> float:
@@ -12,6 +34,159 @@ def round_decimal(value: float | Decimal, places: int = 1) -> float:
     d = Decimal(str(value))
     target = Decimal("10") ** -places
     return float(d.quantize(target, rounding=ROUND_HALF_UP))
+
+
+def parse_grade(text: str) -> Optional[str]:
+    """텍스트에서 취득 등급(S, A, B, C, D, 1등급 등) 추출"""
+    if not text:
+        return None
+    m = re.search(r'\b([SABCDsabcd])\b|([1-9])\s*등급', text)
+    if m:
+        if m.group(1):
+            return m.group(1).upper()
+        if m.group(2):
+            return f"{m.group(2)}등급"
+    return None
+
+
+def parse_numeric_score(text: str) -> Optional[float]:
+    """텍스트에서 공인 성적 점수(숫자) 추출 (날짜 형식 제외)"""
+    if not text:
+        return None
+    clean = re.sub(r'\d{4}[-./]\d{1,2}[-./]\d{1,2}', '', text)
+    matches = re.findall(r'(\d+(?:\.\d+)?)\s*(?:점|점수)?', clean)
+    if matches:
+        nums = [float(x) for x in matches if float(x) <= 2000]
+        if nums:
+            return nums[-1]
+    return None
+
+
+def parse_hours(text: str) -> Optional[float]:
+    """텍스트에서 활동 시간(시간 단위 숫자) 추출"""
+    if not text:
+        return None
+    m = re.search(r'(\d+(?:\.\d+)?)\s*(?:시간|hr|hours|h)\b', text, re.IGNORECASE)
+    if m:
+        return float(m.group(1))
+    clean = re.sub(r'\d{4}[-./]\d{1,2}[-./]\d{1,2}', '', text)
+    nums = re.findall(r'\b(\d+(?:\.\d+)?)\b', clean)
+    if nums:
+        return float(nums[0])
+    return None
+
+
+def match_range_condition(val: float, condition: str) -> bool:
+    """수치 점수가 조건식(>=800, 700~795, 700-795 등)에 일치하는지 판정"""
+    if not condition:
+        return False
+    cond = condition.strip().replace(" ", "").replace("점", "")
+    if ">=" in cond or "이상" in cond:
+        m_num = re.search(r'(\d+(?:\.\d+)?)', cond)
+        if m_num and val >= float(m_num.group(1)):
+            return True
+    if "<=" in cond or "이하" in cond:
+        m_num = re.search(r'(\d+(?:\.\d+)?)', cond)
+        if m_num and val <= float(m_num.group(1)):
+            return True
+    m_range = re.search(r'(\d+(?:\.\d+)?)[~-](\d+(?:\.\d+)?)', cond)
+    if m_range:
+        low, high = float(m_range.group(1)), float(m_range.group(2))
+        if low <= val <= high:
+            return True
+    try:
+        if float(cond) == val:
+            return True
+    except ValueError:
+        pass
+    return False
+
+
+def calculate_recommended_score(
+    scoring_type: Optional[int],
+    item_max_score: float,
+    detail_text: Optional[str] = None,
+    scoring_rules: Optional[List[Dict[str, Any]]] = None,
+    rule_config: Optional[Dict[str, Any]] = None,
+) -> float:
+    """
+    8대 배점 유형 및 상세 배점 규칙(scoring_rules / rule_config)에 따라
+    단일 제출 증빙의 추천 취득 점수를 정밀 산출합니다.
+    """
+    sc_type = int(scoring_type or 1)
+    max_score = float(item_max_score) if item_max_score is not None else 100.0
+    rules = scoring_rules or []
+    config = rule_config or {}
+
+    # 1. 고정점수형: 설정된 배점(기본 max_score 또는 조건 일치 배점)
+    if sc_type == SCORING_TYPE_FIXED:
+        if rules and detail_text:
+            text_clean = detail_text.strip().lower()
+            for r in rules:
+                c_val = str(r.get("condition_value") or "").strip().lower()
+                if c_val and c_val in text_clean:
+                    return min(float(r.get("score", max_score)), max_score)
+        return max_score
+
+    # 2. 등급환산형: 등급(S, A, B 등) 파싱 후 배점 환산
+    elif sc_type == SCORING_TYPE_GRADE:
+        grade = parse_grade(detail_text or "")
+        if grade and rules:
+            for r in rules:
+                c_val = str(r.get("condition_value") or "").strip().upper()
+                if c_val == grade.upper() or c_val.replace(" ", "") == grade.replace(" ", ""):
+                    return min(float(r.get("score", 0.0)), max_score)
+        # 기본 디폴트 규칙 (규칙 테이블이 비어있을 때)
+        if grade:
+            grade_defaults = {"S": 1.0, "A": 0.8, "B": 0.6, "C": 0.4, "D": 0.2, "1등급": 1.0, "2등급": 0.8, "3등급": 0.6}
+            ratio = grade_defaults.get(grade, 0.5)
+            return round_decimal(min(max_score * ratio, max_score), 1)
+        return max_score
+
+    # 3. 구간점수형: 수치 점수 파싱 후 구간 매핑
+    elif sc_type == SCORING_TYPE_RANGE:
+        num_score = parse_numeric_score(detail_text or "")
+        if num_score is not None and rules:
+            for r in rules:
+                cond = str(r.get("condition_value") or "")
+                if match_range_condition(num_score, cond):
+                    return min(float(r.get("score", 0.0)), max_score)
+        elif num_score is not None:
+            # 규칙이 명시되지 않은 경우 수치 점수를 max_score 내로 비율 환산/클램핑
+            return round_decimal(min(num_score, max_score), 1)
+        return max_score
+
+    # 4. 시간계산형: 활동 시간 × 단위 시간당 배점
+    elif sc_type == SCORING_TYPE_TIME:
+        hours = parse_hours(detail_text or "")
+        unit_rate = float(config.get("unit_rate") or (rules[0].get("score") if rules else 0.3))
+        if hours is not None:
+            calc = hours * unit_rate
+            return round_decimal(min(calc, max_score), 1)
+        return max_score
+
+    # 5. 감점형: 기본점수에서 차감 (최하 0점 클램핑)
+    elif sc_type == SCORING_TYPE_DEDUCT:
+        penalty_per_unit = float(config.get("penalty_per_unit") or (rules[0].get("score") if rules else 2.0))
+        violations = parse_numeric_score(detail_text or "") or 1.0
+        calc = max_score - (violations * penalty_per_unit)
+        return round_decimal(max(0.0, min(calc, max_score)), 1)
+
+    # 6. 가산점형: 기준 점수 + 가산점
+    elif sc_type == SCORING_TYPE_BONUS:
+        base = float(config.get("base_score") or 0.0)
+        bonus = float(config.get("bonus") or (rules[0].get("score") if rules else 5.0))
+        calc = base + bonus
+        return round_decimal(min(calc, max_score), 1)
+
+    # 7. 최대점제한형 & 8. 최상위인정형
+    elif sc_type in (SCORING_TYPE_MAX_LIMIT, SCORING_TYPE_BEST_ONLY):
+        num_score = parse_numeric_score(detail_text or "")
+        if num_score is not None:
+            return round_decimal(min(num_score, max_score), 1)
+        return max_score
+
+    return max_score
 
 
 def calculate_area_grade(score: float, max_score: float) -> str:
@@ -85,12 +260,16 @@ def evaluate_composite_rule(
             return round_decimal(total, 1)
 
     # 기본 평가 분기
-    if scoring_type == 8:  # 8: 최상위인정형
+    if scoring_type == SCORING_TYPE_BEST_ONLY:  # 8: 최상위인정형
         best = sorted_scores[0]
         if item_max_limit is not None:
             best = min(best, item_max_limit)
         return round_decimal(best, 1)
-    else:  # 일반 누적 합산형
+    elif scoring_type == SCORING_TYPE_DEDUCT:  # 5: 감점형
+        base = item_max_limit if item_max_limit is not None else 100.0
+        total = max(0.0, base - sum(sorted_scores))
+        return round_decimal(total, 1)
+    else:  # 일반 누적 합산형 (1: 고정점수, 2: 등급환산, 3: 구간점수, 4: 시간계산, 6: 가산점, 7: 최대점제한)
         item_sum = sum(sorted_scores)
         if item_max_limit is not None:
             item_sum = min(item_sum, item_max_limit)

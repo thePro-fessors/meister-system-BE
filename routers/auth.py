@@ -403,7 +403,8 @@ async def login(
                     u.uuid, u.id, u.password, u.role, u.email,
                     st.student_id, st.name AS student_name,
                     sar.grade AS student_grade, sar.class AS student_class, sar.number AS student_number,
-                    t.teachers_id, t.name AS teacher_name, t.grade AS teacher_grade, t.class AS teacher_class
+                    t.teachers_id, t.name AS teacher_name, t.grade AS teacher_grade, t.class AS teacher_class,
+                    t.position AS teacher_position, t.department AS teacher_department, t.subject AS teacher_subject
                 FROM users u
                 LEFT JOIN students st ON st.uuid = u.uuid AND st.is_deleted = FALSE
                 LEFT JOIN academic_years ay ON ay.year = %s
@@ -473,6 +474,26 @@ async def login(
         teacher_name if (user["role"] in (1, 2)) and teacher_name else user["id"]
     )
     homeroom_str = f"{teacher_grade}-{teacher_class}" if (user["role"] in (1, 2)) and teacher_grade and teacher_class else None
+    teacher_pos = (user.get("teacher_position") or "").strip() if user.get("teacher_position") else None
+    teacher_dept = (user.get("teacher_department") or "").strip() if user.get("teacher_department") else None
+    teacher_subj = (user.get("teacher_subject") or "").strip() if user.get("teacher_subject") else None
+    teacher_duty = None
+    teacher_scope = None
+    if user["role"] in (1, 2):
+        if teacher_pos == "학년부장":
+            teacher_duty = "grade_head"
+            teacher_scope = {"grade": teacher_grade} if teacher_grade else None
+        elif teacher_pos == "부서부장" and teacher_dept in ("마이스터부", "교무기획부"):
+            teacher_duty = "vice_principal"
+            teacher_scope = {"schoolWide": True}
+        elif teacher_pos in ("정담임", "임시담임"):
+            teacher_duty = "homeroom"
+            teacher_scope = {"classrooms": [homeroom_str]} if homeroom_str else None
+        elif teacher_pos == "부담임":
+            teacher_duty = "assistant_homeroom"
+            teacher_scope = {"classrooms": [homeroom_str]} if homeroom_str else None
+        elif teacher_pos:
+            teacher_duty = "subject_teacher"
 
     token = create_access_token(
         data={
@@ -481,6 +502,21 @@ async def login(
             "role": role_str,
         }
     )
+
+    try:
+        from core.audit import record_audit_log
+        await record_audit_log(
+            conn=conn,
+            actor={"uuid": user["uuid"], "id": user["id"], "name": user_name, "role": role_str},
+            action_type="LOGIN",
+            target_type="AUTH",
+            target_id=user["id"],
+            target_name=user_name,
+            ip_address=client_ip,
+            details={"role": role_str},
+        )
+    except Exception as audit_err:
+        logger.warning(f"Failed to record login audit log: {audit_err}")
 
     return SrFormat(
         status_code=200,
@@ -495,11 +531,16 @@ async def login(
                 "email": user["email"],
                 "role": role_str,
                 "studentId": student_id_val if user["role"] == 0 else None,
-                "grade": student_grade if user["role"] == 0 else None,
-                "classNo": student_class if user["role"] == 0 else None,
+                "grade": student_grade if user["role"] == 0 else teacher_grade,
+                "classNo": student_class if user["role"] == 0 else teacher_class,
                 "number": student_number if user["role"] == 0 else None,
                 "teacherId": teacher_id_val if (user["role"] in (1, 2)) else None,
                 "homeroom": homeroom_str,
+                "position": teacher_pos,
+                "department": teacher_dept,
+                "subject": teacher_subj,
+                "teacherDuty": teacher_duty,
+                "teacherScope": teacher_scope,
             }
         }
     ).model_dump()
@@ -589,6 +630,29 @@ async def get_my_info(
 
     user_name = students["name"] if students else (teachers["name"] if teachers else user["id"])
 
+    t_pos = (teachers.get("position") or "").strip() if teachers and teachers.get("position") else None
+    t_dept = (teachers.get("department") or "").strip() if teachers and teachers.get("department") else None
+    t_subj = (teachers.get("subject") or "").strip() if teachers and teachers.get("subject") else None
+    t_grade = teachers.get("grade") if teachers else None
+    t_class = teachers.get("class") if teachers else None
+    t_duty = None
+    t_scope = None
+    if teachers:
+        if t_pos == "학년부장":
+            t_duty = "grade_head"
+            t_scope = {"grade": t_grade} if t_grade else None
+        elif t_pos == "부서부장" and t_dept in ("마이스터부", "교무기획부"):
+            t_duty = "vice_principal"
+            t_scope = {"schoolWide": True}
+        elif t_pos in ("정담임", "임시담임"):
+            t_duty = "homeroom"
+            t_scope = {"classrooms": [f"{t_grade}-{t_class}"]} if (t_grade and t_class) else None
+        elif t_pos == "부담임":
+            t_duty = "assistant_homeroom"
+            t_scope = {"classrooms": [f"{t_grade}-{t_class}"]} if (t_grade and t_class) else None
+        elif t_pos:
+            t_duty = "subject_teacher"
+
     return SrFormat(
         status_code=200,
         success=True,
@@ -601,11 +665,16 @@ async def get_my_info(
                 "schoolEmail": students["email"] if students else (teachers["email"] if teachers else None),
                 "role": role_str,
                 "studentId": students["student_id"] if students else None,
-                "grade": students["grade"] if students else None,
-                "classNo": students["class"] if students else None,
+                "grade": students["grade"] if students else t_grade,
+                "classNo": students["class"] if students else t_class,
                 "number": students["number"] if students else None,
                 "teacherId": teachers["teachers_id"] if teachers else None,
-                "homeroom": f"{teachers['grade']}-{teachers['class']}" if teachers and teachers['grade'] and teachers['class'] else None
+                "homeroom": f"{teachers['grade']}-{teachers['class']}" if teachers and teachers['grade'] and teachers['class'] else None,
+                "position": t_pos,
+                "department": t_dept,
+                "subject": t_subj,
+                "teacherDuty": t_duty,
+                "teacherScope": t_scope,
             }
         }
     ).model_dump()

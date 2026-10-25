@@ -19,7 +19,9 @@ except (ImportError, ModuleNotFoundError):
     DictCursor = Any  # type: ignore
 
 from core.academic import get_current_academic_year
+from core.audit import record_audit_log
 import core.authorization as authz
+from core.calculator import calculate_recommended_score, SCORING_TYPE_NAMES
 from core.logger import logger
 from core.security import error_response, normalize_role, get_current_user
 from core.storage import cleanup_old_file_on_resubmit, delete_uploaded_file, save_upload_file
@@ -323,6 +325,15 @@ async def resubmit_evidence(
                     (submission_id, user_uuid, existing["status_code"], existing.get("granted_score"), new_desc),
                 )
             await conn.commit()
+            await record_audit_log(
+                conn=conn,
+                actor=current_user,
+                action_type="RESUBMIT",
+                target_type="SUBMISSION",
+                target_id=submission_id,
+                target_name=f"증빙 #{submission_id}",
+                details={"student_id": existing.get("student_id"), "description": new_desc},
+            )
         except Exception as e:
             await conn.rollback()
             # 트랜잭션 실패 시 방금 업로드된 새 파일 즉시 롤백 삭제 (고아 파일 방지)
@@ -520,6 +531,15 @@ async def delete_submission(
                 (submission_id, user_uuid, row["status_code"], row["status_code"], row.get("granted_score")),
             )
         await conn.commit()
+        await record_audit_log(
+            conn=conn,
+            actor=current_user,
+            action_type="SUBMISSION_DELETE",
+            target_type="SUBMISSION",
+            target_id=submission_id,
+            target_name=f"증빙 #{submission_id}",
+            details={"student_id": row.get("student_id")},
+        )
     except Exception:
         await conn.rollback()
         raise
@@ -578,6 +598,8 @@ async def get_submission_detail(
                 s.status_code AS statusCode,
                 s.granted_score AS grantedScore,
                 ei.max_score AS maxScore,
+                ei.scoring_type AS scoringType,
+                ei.rule_config AS ruleConfig,
                 s.reviewer_id AS reviewerId,
                 t.name AS reviewerName,
                 s.reviewed_at AS reviewedAt,
@@ -613,6 +635,49 @@ async def get_submission_detail(
         row["grantedScore"] = float(row["grantedScore"])
     if row.get("maxScore") is not None:
         row["maxScore"] = float(row["maxScore"])
+
+    # 8대 배점 유형 규칙 및 추천 인정 점수 산출
+    item_id = row.get("itemId")
+    scoring_rules = []
+    if item_id:
+        try:
+            async with conn.cursor(cursor=DictCursor) as r_cur:
+                await r_cur.execute(
+                    "SELECT rule_id AS ruleId, condition_value AS conditionValue, score FROM scoring_rules WHERE item_id = %s ORDER BY rule_id ASC",
+                    (item_id,),
+                )
+                scoring_rules = await r_cur.fetchall() or []
+                for sr in scoring_rules:
+                    if "score" in sr and sr["score"] is not None:
+                        sr["score"] = float(sr["score"])
+        except Exception:
+            scoring_rules = []
+
+    raw_rc = row.get("ruleConfig")
+    parsed_rc = None
+    if isinstance(raw_rc, (dict, list)):
+        parsed_rc = raw_rc
+    elif isinstance(raw_rc, str) and raw_rc.strip():
+        try:
+            import json
+            parsed_rc = json.loads(raw_rc)
+        except Exception:
+            parsed_rc = None
+
+    sc_type = row.get("scoringType") or 1
+    row["scoringType"] = sc_type
+    row["scoringTypeName"] = SCORING_TYPE_NAMES.get(sc_type, "고정점수형")
+    row["scoringRules"] = scoring_rules
+    row["ruleConfig"] = parsed_rc
+
+    rec_score = calculate_recommended_score(
+        scoring_type=sc_type,
+        item_max_score=float(row.get("maxScore") or 100.0),
+        detail_text=row.get("detail"),
+        scoring_rules=scoring_rules,
+        rule_config=parsed_rc,
+    )
+    row["recommendedScore"] = rec_score
 
     return SrFormat(
         status_code=200,
@@ -735,8 +800,8 @@ async def approve_submission(
     async with conn.cursor(cursor=DictCursor) as cur:
         await cur.execute(
             """
-            SELECT s.submission_id, s.student_id, s.status_code, s.granted_score, 
-                   ei.max_score, ca.year_id, ay.year
+            SELECT s.submission_id, s.student_id, s.status_code, s.granted_score, s.detail, s.description,
+                   ei.item_id, ei.max_score, ei.scoring_type, ei.rule_config, ca.year_id, ay.year
             FROM submissions s
             JOIN evaluation_items ei ON s.item_id = ei.item_id
             JOIN certification_areas ca ON ei.area_id = ca.area_id
@@ -757,7 +822,25 @@ async def approve_submission(
     max_score = float(row["max_score"]) if row.get("max_score") is not None else float(row.get("item_max_score", 100.0))
     score = req.score if req.score is not None else (req.granted_score if req.granted_score is not None else req.grantedScore)
     if score is None:
-        score = max_score
+        try:
+            async with conn.cursor(cursor=DictCursor) as r_cur:
+                await r_cur.execute(
+                    "SELECT rule_id AS ruleId, condition_value AS conditionValue, score FROM scoring_rules WHERE item_id = %s",
+                    (row["item_id"],),
+                )
+                s_rules = await r_cur.fetchall() or []
+                for sr in s_rules:
+                    if "score" in sr and sr["score"] is not None:
+                        sr["score"] = float(sr["score"])
+            score = calculate_recommended_score(
+                scoring_type=row.get("scoring_type") or 1,
+                item_max_score=max_score,
+                detail_text=row.get("detail"),
+                scoring_rules=s_rules,
+                rule_config=row.get("rule_config"),
+            )
+        except Exception:
+            score = max_score
 
     if score < 0 or score > max_score:
         return error_response(400, "VALIDATION_ERROR", f"인정 점수는 0 이상 {max_score} 이하이어야 합니다.")
@@ -803,6 +886,20 @@ async def approve_submission(
                 (submission_id, user_uuid, row["status_code"], row.get("granted_score"), score, comment),
             )
         await conn.commit()
+        await record_audit_log(
+            conn=conn,
+            actor=current_user,
+            action_type="APPROVE",
+            target_type="SUBMISSION",
+            target_id=submission_id,
+            target_name=f"증빙 #{submission_id}",
+            details={
+                "student_id": row["student_id"],
+                "score": score,
+                "comment": comment,
+                "reviewer_id": reviewer_id,
+            },
+        )
     except Exception:
         await conn.rollback()
         raise
@@ -939,6 +1036,20 @@ async def reject_submission(
                 (submission_id, user_uuid, act_type, row["status_code"], target_status, row.get("granted_score"), comment),
             )
         await conn.commit()
+        await record_audit_log(
+            conn=conn,
+            actor=current_user,
+            action_type=act_type,
+            target_type="SUBMISSION",
+            target_id=submission_id,
+            target_name=f"증빙 #{submission_id}",
+            details={
+                "student_id": row["student_id"],
+                "status_code": target_status,
+                "comment": comment,
+                "reviewer_id": reviewer_id,
+            },
+        )
     except Exception:
         await conn.rollback()
         raise
@@ -1082,6 +1193,21 @@ async def modify_submission_score(
                 (submission_id, user_uuid, row.get("granted_score"), score, comment),
             )
         await conn.commit()
+        await record_audit_log(
+            conn=conn,
+            actor=current_user,
+            action_type="SCORE_MODIFY",
+            target_type="SUBMISSION",
+            target_id=submission_id,
+            target_name=f"증빙 #{submission_id}",
+            details={
+                "student_id": row["student_id"],
+                "old_score": float(row.get("granted_score")) if row.get("granted_score") is not None else None,
+                "new_score": score,
+                "reason": comment,
+                "reviewer_id": reviewer_id,
+            },
+        )
     except Exception:
         await conn.rollback()
         raise
@@ -1191,6 +1317,15 @@ async def submit_submission_appeal(
                 (submission_id, user_uuid, reason),
             )
         await conn.commit()
+        await record_audit_log(
+            conn=conn,
+            actor=current_user,
+            action_type="APPEAL_SUBMIT",
+            target_type="SUBMISSION",
+            target_id=submission_id,
+            target_name=f"증빙 #{submission_id}",
+            details={"student_id": row["student_id"], "reason": reason},
+        )
     except Exception:
         await conn.rollback()
         raise
@@ -1310,6 +1445,22 @@ async def review_submission_appeal(
                 (submission_id, user_uuid, action_type, new_status, score, comment),
             )
         await conn.commit()
+        await record_audit_log(
+            conn=conn,
+            actor=current_user,
+            action_type="APPEAL_PROCESS",
+            target_type="SUBMISSION",
+            target_id=submission_id,
+            target_name=f"증빙 #{submission_id}",
+            details={
+                "student_id": row["student_id"],
+                "decision": decision,
+                "new_status": new_status,
+                "score": score,
+                "comment": comment,
+                "reviewer_id": reviewer_id,
+            },
+        )
     except Exception:
         await conn.rollback()
         raise

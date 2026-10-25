@@ -114,6 +114,26 @@ CREATE TABLE scoring_rules
   PRIMARY KEY (rule_id)
 ) COMMENT '상세 점수 기준 테이블';
 
+CREATE TABLE system_audit_logs
+(
+  log_id      INT          NOT NULL AUTO_INCREMENT COMMENT '감사 로그 고유 ID',
+  actor_uuid  VARCHAR(36)  NULL     COMMENT '행위자 UUID',
+  actor_id    VARCHAR(50)  NULL     COMMENT '행위자 계정 ID',
+  actor_name  VARCHAR(50)  NULL     COMMENT '행위자 이름',
+  actor_role  VARCHAR(20)  NOT NULL COMMENT 'student, teacher, admin, system',
+  action_type VARCHAR(50)  NOT NULL COMMENT '액션 유형',
+  target_type VARCHAR(50)  NOT NULL COMMENT '대상 엔티티 유형',
+  target_id   VARCHAR(100) NULL     COMMENT '대상 식별자',
+  target_name VARCHAR(100) NULL     COMMENT '대상 명칭',
+  ip_address  VARCHAR(45)  NULL     COMMENT 'IP 주소',
+  details     JSON         NULL     COMMENT '상세 내역',
+  created_at  DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '발생 시각',
+  PRIMARY KEY (log_id),
+  INDEX idx_audit_action (action_type),
+  INDEX idx_audit_role (actor_role),
+  INDEX idx_audit_created_at (created_at)
+) COMMENT '시스템 전방위 종합 감사 로그';
+
 CREATE TABLE student_academic_records
 (
   record_id  INT     NOT NULL AUTO_INCREMENT,

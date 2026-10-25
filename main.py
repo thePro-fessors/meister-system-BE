@@ -52,6 +52,15 @@ async def lifespan(app: FastAPI):
     # MySQL 및 Redis 커넥션 풀 초기화
     try:
         await init_db_pool()
+        try:
+            import database
+            if database.pool:
+                async with database.pool.acquire() as conn:
+                    async with conn.cursor() as cur:
+                        await cur.execute("ALTER TABLE submissions_logs MODIFY COLUMN modifier_uuid VARCHAR(36) NULL COMMENT '수정자 UUID'")
+                        await cur.execute("ALTER TABLE merits_log MODIFY COLUMN modifier_uuid VARCHAR(36) NULL COMMENT '부여자 UUID (교원/관리자)'")
+        except Exception as e:
+            logger.warning(f"[STARTUP] Schema nullability migration notice: {e}")
     except Exception as e:
         logger.critical(f"[FATAL] DB 커넥션 풀 초기화 실패 - 서버를 시작할 수 없습니다: {e}")
         raise

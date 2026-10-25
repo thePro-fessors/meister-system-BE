@@ -24,6 +24,7 @@ except (ImportError, ModuleNotFoundError):
     DictCursor = Any  # type: ignore
 
 from core.academic import clear_year_cache, get_current_academic_year, get_current_year
+from core.audit import record_audit_log
 from core.calculator import calculate_student_certification
 from core.excel_parser import (
     EMAIL_REGEX,
@@ -117,6 +118,8 @@ class CreateItemRequest(BaseModel):
     teacherIds: Optional[List[int]] = None
     rule_config: Optional[Dict[str, Any]] = None
     ruleConfig: Optional[Dict[str, Any]] = None
+    scoring_rules: Optional[List[Dict[str, Any]]] = None
+    scoringRules: Optional[List[Dict[str, Any]]] = None
 
 
 class UpdateItemRequest(BaseModel):
@@ -133,7 +136,8 @@ class UpdateItemRequest(BaseModel):
     requiresEvidence: Optional[bool] = None
     rule_config: Optional[Dict[str, Any]] = None
     ruleConfig: Optional[Dict[str, Any]] = None
-    requiresEvidence: Optional[bool] = None
+    scoring_rules: Optional[List[Dict[str, Any]]] = None
+    scoringRules: Optional[List[Dict[str, Any]]] = None
     is_active: Optional[bool] = None
     isActive: Optional[bool] = None
     teacher_ids: Optional[List[int]] = None
@@ -286,6 +290,15 @@ async def create_year(
 
         await conn.commit()
         clear_year_cache()
+        await record_audit_log(
+            conn=conn,
+            actor=current_user,
+            action_type="YEAR_CREATE",
+            target_type="YEAR",
+            target_id=year_id,
+            target_name=f"{req.year}학년도",
+            details={"year": req.year, "isActivated": is_act, "status": req_status},
+        )
     except Exception:
         await conn.rollback()
         raise
@@ -354,6 +367,15 @@ async def toggle_year_active(
 
         await conn.commit()
         clear_year_cache()
+        await record_audit_log(
+            conn=conn,
+            actor=current_user,
+            action_type="YEAR_STATUS_CHANGE",
+            target_type="YEAR",
+            target_id=year,
+            target_name=f"{year}학년도",
+            details={"year": year, "isActivated": is_act, "status": req_status},
+        )
     except Exception:
         await conn.rollback()
         raise
@@ -364,6 +386,106 @@ async def toggle_year_active(
         status_code=200,
         success=True,
         data={"year": year, "isActivated": is_act, "status": req_status},
+    ).model_dump()
+
+
+@years_router.delete("/{year}", summary="학년도 삭제 (API-03)", response_model=SrFormat)
+async def delete_year(
+    year: int,
+    conn: Any = Depends(get_db),
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    admin_err = check_admin_access(current_user)
+    if admin_err:
+        return admin_err
+
+    if year < 1900 or year > 2100:
+        return error_response(400, "VALIDATION_ERROR", "유효하지 않은 학년도입니다 (1900~2100).")
+
+    async with conn.cursor(cursor=DictCursor) as cur:
+        await cur.execute(
+            "SELECT year_id, year, is_activated, status FROM academic_years WHERE year = %s LIMIT 1",
+            (year,),
+        )
+        ay = await cur.fetchone()
+        if not ay:
+            return error_response(404, "ITEM_NOT_FOUND", f"{year} 학년도를 찾을 수 없습니다.")
+
+        # 활성화된 학년도 삭제 방지
+        is_act = bool(ay.get("is_activated") or ay.get("status") == "ACTIVE")
+        if is_act:
+            return error_response(
+                400,
+                "CANNOT_DELETE_ACTIVE_YEAR",
+                "현재 활성화된 학년도는 삭제할 수 없습니다. 다른 학년도를 활성화하거나 비활성화한 후 삭제해주세요.",
+            )
+
+        year_id = ay["year_id"]
+
+        # 1. 학생 학적 이력 존재 여부 확인
+        await cur.execute("SELECT COUNT(*) AS cnt FROM student_academic_records WHERE year_id = %s", (year_id,))
+        sar_row = await cur.fetchone()
+        if sar_row and (sar_row.get("cnt") or 0) > 0:
+            return error_response(409, "YEAR_IN_USE", f"{year} 학년도에 등록된 학생 학적 이력이 존재하여 삭제할 수 없습니다.")
+
+        # 2. 해당 학년도 평가 항목에 제출된 학생 신청 내역 존재 여부 확인
+        await cur.execute(
+            """
+            SELECT COUNT(*) AS cnt
+            FROM submissions s
+            JOIN evaluation_items ei ON s.item_id = ei.item_id
+            JOIN certification_areas ca ON ei.area_id = ca.area_id
+            WHERE ca.year_id = %s
+            """,
+            (year_id,),
+        )
+        sub_row = await cur.fetchone()
+        if sub_row and (sub_row.get("cnt") or 0) > 0:
+            return error_response(409, "YEAR_IN_USE", f"{year} 학년도에 제출된 활동 내역이 존재하여 삭제할 수 없습니다.")
+
+    try:
+        await conn.autocommit(False)
+        async with conn.cursor(cursor=DictCursor) as cur:
+            # 연관 평가 기준(점수 규칙, 담당교사 매핑, 평가항목, 영역) 단계적 정리
+            await cur.execute("SELECT area_id FROM certification_areas WHERE year_id = %s", (year_id,))
+            area_rows = await cur.fetchall() or []
+            area_ids = [r["area_id"] for r in area_rows]
+            if area_ids:
+                placeholders = ", ".join(["%s"] * len(area_ids))
+                await cur.execute(f"SELECT item_id FROM evaluation_items WHERE area_id IN ({placeholders})", tuple(area_ids))
+                item_rows = await cur.fetchall() or []
+                item_ids = [r["item_id"] for r in item_rows]
+                if item_ids:
+                    item_ph = ", ".join(["%s"] * len(item_ids))
+                    await cur.execute(f"DELETE FROM scoring_rules WHERE item_id IN ({item_ph})", tuple(item_ids))
+                    await cur.execute(f"DELETE FROM evaluation_item_teachers WHERE item_id IN ({item_ph})", tuple(item_ids))
+                    await cur.execute(f"DELETE FROM evaluation_items WHERE area_id IN ({placeholders})", tuple(area_ids))
+                await cur.execute(f"DELETE FROM certification_area_teachers WHERE area_id IN ({placeholders})", tuple(area_ids))
+                await cur.execute("DELETE FROM certification_areas WHERE year_id = %s", (year_id,))
+
+            await cur.execute("DELETE FROM academic_years WHERE year_id = %s", (year_id,))
+
+        await conn.commit()
+        clear_year_cache()
+        await record_audit_log(
+            conn=conn,
+            actor=current_user,
+            action_type="YEAR_DELETE",
+            target_type="YEAR",
+            target_id=year_id,
+            target_name=f"{year}학년도",
+            details={"year": year},
+        )
+    except Exception:
+        await conn.rollback()
+        raise
+    finally:
+        await conn.autocommit(True)
+
+    return SrFormat(
+        status_code=200,
+        success=True,
+        data={"year": year, "deleted": True},
     ).model_dump()
 
 
@@ -562,6 +684,20 @@ async def copy_year_criteria(
                                 logger.warning(f"전담 교사 매핑 복제 생략: {te_err}")
 
         await conn.commit()
+        await record_audit_log(
+            conn=conn,
+            actor=current_user,
+            action_type="CRITERIA_COPY",
+            target_type="CRITERIA",
+            target_id=target_year,
+            target_name=f"{target_year}학년도 기준 복제",
+            details={
+                "sourceYear": source_year,
+                "targetYear": target_year,
+                "copiedAreas": copied_areas_count,
+                "copiedItems": copied_items_count,
+            },
+        )
     except Exception:
         await conn.rollback()
         raise
@@ -772,6 +908,31 @@ async def get_criteria(
             except Exception:
                 pass
 
+        # 세부 점수 기준(scoring_rules) 매핑 조회
+        item_scoring_rules_map: Dict[int, List[Dict[str, Any]]] = {}
+        if items:
+            try:
+                await cur.execute(
+                    f"""
+                    SELECT rule_id AS ruleId, item_id AS itemId, condition_value AS conditionValue, score
+                    FROM scoring_rules
+                    WHERE item_id IN ({it_placeholders})
+                    ORDER BY rule_id ASC
+                    """,
+                    tuple(item_ids),
+                )
+                sr_rows = await cur.fetchall() or []
+                for sr in sr_rows:
+                    iid = sr.get("itemId") or sr.get("item_id")
+                    sc_val = float(sr.get("score") if sr.get("score") is not None else 0.0)
+                    item_scoring_rules_map.setdefault(iid, []).append({
+                        "ruleId": sr.get("ruleId") or sr.get("rule_id"),
+                        "conditionValue": sr.get("conditionValue") or sr.get("condition_value") or "",
+                        "score": sc_val,
+                    })
+            except Exception:
+                pass
+
     items_by_area: Dict[int, List[Dict[str, Any]]] = {}
     for it in items:
         it_area_id = it.get("areaId") or it.get("area_id")
@@ -801,6 +962,8 @@ async def get_criteria(
             "requiresEvidence": bool(it.get("requiresEvidence") if "requiresEvidence" in it else it.get("requires_evidence", False)),
             "ruleConfig": parsed_rc,
             "rule_config": parsed_rc,
+            "scoringRules": item_scoring_rules_map.get(it_id, []),
+            "scoring_rules": item_scoring_rules_map.get(it_id, []),
             "isActive": bool(it.get("isActive") if "isActive" in it else it.get("is_active", True)),
             "teacherIds": item_teacher_ids_map.get(it_id, []),
             "assignedTeachers": item_teachers_map.get(it_id, []),
@@ -928,6 +1091,22 @@ async def patch_criteria_area(
                 })
         except Exception:
             pass
+
+    await record_audit_log(
+        conn=conn,
+        actor=current_user,
+        action_type="CRITERIA_UPDATE",
+        target_type="CRITERIA",
+        target_id=area_id,
+        target_name=f"영역: {updated_name}",
+        details={
+            "area_id": area_id,
+            "name": updated_name,
+            "max_score": updated_score,
+            "subject": updated_subject,
+            "department": updated_department,
+        },
+    )
 
     return SrFormat(
         status_code=200,
@@ -1079,6 +1258,40 @@ async def create_criteria_item(
         except Exception:
             pass
 
+        # 세부 점수 기준(scoring_rules) 등록
+        rules_in = req.scoring_rules if req.scoring_rules is not None else req.scoringRules
+        created_scoring_rules = []
+        if rules_in and isinstance(rules_in, list):
+            for r in rules_in:
+                c_val = str(r.get("conditionValue") or r.get("condition_value") or "").strip()
+                s_val = float(r.get("score") or 0.0)
+                try:
+                    await cur.execute(
+                        "INSERT INTO scoring_rules (item_id, condition_value, score) VALUES (%s, %s, %s)",
+                        (item_id, c_val, s_val),
+                    )
+                    r_id = cur.lastrowid
+                    created_scoring_rules.append({"ruleId": r_id, "conditionValue": c_val, "score": s_val})
+                except Exception:
+                    pass
+
+    await record_audit_log(
+        conn=conn,
+        actor=current_user,
+        action_type="CRITERIA_CREATE",
+        target_type="CRITERIA",
+        target_id=item_id,
+        target_name=f"항목: {clean_name}",
+        details={
+            "item_id": item_id,
+            "area_id": area_id,
+            "name": clean_name,
+            "max_score": max_score,
+            "scoring_type": scoring_type,
+            "target_grade": target_grade,
+        },
+    )
+
     return JSONResponse(
         status_code=201,
         content=SrFormat(
@@ -1096,6 +1309,8 @@ async def create_criteria_item(
                 "requiresEvidence": requires_ev,
                 "ruleConfig": rule_config_val,
                 "rule_config": rule_config_val,
+                "scoringRules": created_scoring_rules,
+                "scoring_rules": created_scoring_rules,
                 "teacherIds": assigned_teacher_ids,
                 "assignedTeachers": assigned_teachers,
             },
@@ -1280,6 +1495,54 @@ async def update_criteria_item(
         except Exception:
             pass
 
+        # 세부 점수 기준(scoring_rules) 갱신
+        rules_in = req.scoring_rules if req.scoring_rules is not None else req.scoringRules
+        if rules_in is not None and isinstance(rules_in, list):
+            try:
+                await cur.execute("DELETE FROM scoring_rules WHERE item_id = %s", (item_id,))
+                for r in rules_in:
+                    c_val = str(r.get("conditionValue") or r.get("condition_value") or "").strip()
+                    s_val = float(r.get("score") or 0.0)
+                    await cur.execute(
+                        "INSERT INTO scoring_rules (item_id, condition_value, score) VALUES (%s, %s, %s)",
+                        (item_id, c_val, s_val),
+                    )
+            except Exception:
+                pass
+
+        # 현재 scoring_rules 조회
+        current_scoring_rules = []
+        try:
+            await cur.execute(
+                "SELECT rule_id AS ruleId, condition_value AS conditionValue, score FROM scoring_rules WHERE item_id = %s ORDER BY rule_id ASC",
+                (item_id,),
+            )
+            s_rows = await cur.fetchall() or []
+            for sr in s_rows:
+                current_scoring_rules.append({
+                    "ruleId": sr.get("ruleId") or sr.get("rule_id"),
+                    "conditionValue": sr.get("conditionValue") or sr.get("condition_value") or "",
+                    "score": float(sr.get("score") if sr.get("score") is not None else 0.0),
+                })
+        except Exception:
+            pass
+
+    await record_audit_log(
+        conn=conn,
+        actor=current_user,
+        action_type="CRITERIA_UPDATE",
+        target_type="CRITERIA",
+        target_id=item_id,
+        target_name=f"항목: {new_name}",
+        details={
+            "item_id": item_id,
+            "name": new_name,
+            "max_score": new_max_score,
+            "scoring_type": new_type,
+            "target_grade": new_grade,
+        },
+    )
+
     return SrFormat(
         status_code=200,
         success=True,
@@ -1294,6 +1557,8 @@ async def update_criteria_item(
             "requiresEvidence": bool(new_req_ev),
             "ruleConfig": effective_rule_config,
             "rule_config": effective_rule_config,
+            "scoringRules": current_scoring_rules,
+            "scoring_rules": current_scoring_rules,
             "isActive": bool(new_active),
             "teacherIds": assigned_teacher_ids,
             "assignedTeachers": assigned_teachers,
@@ -1316,6 +1581,15 @@ async def delete_criteria_item(
         await cur.execute("UPDATE evaluation_items SET is_active = FALSE WHERE item_id = %s", (item_id,))
         if cur.rowcount == 0:
             return error_response(404, "ITEM_NOT_FOUND", "해당 평가 항목을 찾을 수 없습니다.")
+
+    await record_audit_log(
+        conn=conn,
+        actor=current_user,
+        action_type="CRITERIA_DELETE",
+        target_type="CRITERIA",
+        target_id=item_id,
+        target_name=f"항목 #{item_id}",
+    )
 
     return SrFormat(
         status_code=200,

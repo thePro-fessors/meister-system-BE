@@ -20,6 +20,7 @@ except (ImportError, ModuleNotFoundError):
     DictCursor = Any  # type: ignore
 
 from core.academic import clear_year_cache, get_current_academic_year, get_current_year
+from core.audit import record_audit_log
 from core.calculator import calculate_student_certification
 from core.excel_parser import (
     EMAIL_REGEX,
@@ -326,11 +327,12 @@ AUDIT_SUBMISSION_STATUS_MAP = {
 
 @admin_router.get("/audit-logs", summary="시스템 종합 감사 로그 조회 (4.8)", response_model=SrFormat)
 async def get_system_audit_logs(
-    log_type: Optional[str] = Query("ALL", description="로그 유형 필터 ('ALL', 'SUBMISSION', 'MERIT')"),
+    log_type: Optional[str] = Query("ALL", description="로그 유형 필터 ('ALL', 'SUBMISSION', 'MERIT', 'SYSTEM', 'USER')"),
     action_type: Optional[str] = Query(None, description="행위 구분 필터 ('CREATE', 'UPDATE', 'DELETE', 'APPROVE', 'REJECT', 등)"),
     student_id: Optional[int] = Query(None, description="학생 고유 ID 필터"),
     student_name: Optional[str] = Query(None, description="학생 성명 부분 일치 검색"),
     modifier_name: Optional[str] = Query(None, description="수정/처리자 성명 부분 일치 검색"),
+    role: Optional[str] = Query(None, description="역할 필터 ('ALL', 'STUDENT', 'TEACHER', 'ADMIN')"),
     start_date: Optional[str] = Query(None, description="조회 시작 일시 (YYYY-MM-DD 또는 ISO8601)"),
     end_date: Optional[str] = Query(None, description="조회 종료 일시 (YYYY-MM-DD 또는 ISO8601)"),
     page: int = Query(1, ge=1, description="페이지 번호 (1부터 시작)"),
@@ -341,7 +343,7 @@ async def get_system_audit_logs(
     """
     시스템 종합 감사 로그 조회 엔드포인트 (TODO.md 4.8 & Tech_spec.md 4.8)
     - 관리자 전용 (check_admin_access)
-    - submissions_logs(증빙 심사 이력) 및 merits_log(상벌점 변경 이력) 통합/필터링 조회
+    - submissions_logs(증빙 심사 이력), merits_log(상벌점 변경 이력), system_audit_logs(시스템/유저 활동) 3자 통합 조회
     - 동적 SQL 파라미터 바인딩으로 SQL Injection 방어
     - 최신 발생 순(created_at DESC, log_id DESC) 정렬 및 페이지네이션
     """
@@ -351,8 +353,8 @@ async def get_system_audit_logs(
 
     # 1. log_type 정규화
     normalized_log_type = (log_type or "ALL").strip().upper()
-    if normalized_log_type not in ("ALL", "SUBMISSION", "MERIT"):
-        return error_response(400, "INVALID_LOG_TYPE", "log_type은 'ALL', 'SUBMISSION', 'MERIT' 중 하나여야 합니다.")
+    if normalized_log_type not in ("ALL", "SUBMISSION", "MERIT", "SYSTEM", "USER"):
+        return error_response(400, "INVALID_LOG_TYPE", "log_type은 'ALL', 'SUBMISSION', 'MERIT', 'SYSTEM', 'USER' 중 하나여야 합니다.")
 
     # 2. 날짜 파라미터 유효성 검사 및 정규화
     norm_start_date = None
@@ -535,16 +537,75 @@ async def get_system_audit_logs(
     {merit_where_clause}
     """
 
-    # 5. log_type에 따른 UNION 또는 단일 쿼리 구성
+    # 5. system_audit_logs 서브쿼리 구성
+    sys_conditions = []
+    sys_params: List[Any] = []
+
+    if action_type:
+        sys_conditions.append("sal.action_type = %s")
+        sys_params.append(action_type.strip())
+    if student_id is not None:
+        sys_conditions.append("(sal.target_id = %s OR sal.target_name LIKE %s)")
+        sys_params.extend([str(student_id), f"%{student_id}%"])
+    if student_name:
+        sys_conditions.append("(sal.target_name LIKE %s OR sal.actor_name LIKE %s)")
+        sys_params.extend([f"%{student_name.strip()}%", f"%{student_name.strip()}%"])
+    if modifier_name:
+        sys_conditions.append("(sal.actor_name LIKE %s OR sal.actor_id LIKE %s)")
+        sys_params.extend([f"%{modifier_name.strip()}%", f"%{modifier_name.strip()}%"])
+    if norm_start_date:
+        sys_conditions.append("sal.created_at >= %s")
+        sys_params.append(norm_start_date)
+    if norm_end_date:
+        sys_conditions.append("sal.created_at <= %s")
+        sys_params.append(norm_end_date)
+    if role and role.strip().upper() != "ALL":
+        sys_conditions.append("sal.actor_role = %s")
+        sys_params.append(role.strip().lower())
+
+    sys_where_clause = f"WHERE {' AND '.join(sys_conditions)}" if sys_conditions else ""
+
+    sys_query = f"""
+    SELECT
+        CONCAT('SYS_', sal.log_id) AS unified_id,
+        sal.log_id AS original_log_id,
+        sal.target_type AS log_type,
+        sal.action_type,
+        sal.target_id,
+        NULL AS student_id,
+        sal.target_name AS student_name,
+        NULL AS student_grade,
+        NULL AS student_class,
+        NULL AS student_number,
+        sal.actor_uuid AS modifier_uuid,
+        COALESCE(sal.actor_name, sal.actor_id, '관리자') AS modifier_name,
+        sal.actor_role AS modifier_role,
+        NULL AS old_status_code,
+        NULL AS new_status_code,
+        NULL AS old_score,
+        NULL AS new_score,
+        NULL AS old_points,
+        NULL AS new_points,
+        sal.details AS reason,
+        sal.target_name AS target_title,
+        sal.created_at
+    FROM system_audit_logs sal
+    {sys_where_clause}
+    """
+
+    # 6. log_type에 따른 UNION 또는 단일 쿼리 구성
     if normalized_log_type == "SUBMISSION":
         base_query = sub_query
         base_params = list(sub_params)
     elif normalized_log_type == "MERIT":
         base_query = merit_query
         base_params = list(merit_params)
+    elif normalized_log_type in ("SYSTEM", "USER"):
+        base_query = sys_query
+        base_params = list(sys_params)
     else:  # ALL
-        base_query = f"{sub_query}\nUNION ALL\n{merit_query}"
-        base_params = list(sub_params) + list(merit_params)
+        base_query = f"{sub_query}\nUNION ALL\n{merit_query}\nUNION ALL\n{sys_query}"
+        base_params = list(sub_params) + list(merit_params) + list(sys_params)
 
     count_query = f"SELECT COUNT(*) AS total_count FROM ({base_query}) AS combined_logs"
 
@@ -1263,6 +1324,19 @@ async def recalculate_student_certifications(
         avg_score = round(total_scores_sum / total_st_cnt, 1) if total_st_cnt > 0 else 0.0
         duration_ms = round((time.perf_counter() - start_time) * 1000, 2)
 
+        try:
+            await record_audit_log(
+                conn=conn,
+                actor=current_user,
+                action_type="RECALCULATE",
+                target_type="SYSTEM",
+                target_id=target_year,
+                target_name=f"{target_year}학년도 전체 데이터 재계산",
+                details={"totalProcessedStudents": total_st_cnt, "anomaliesFixed": fixed_count, "isDryRun": is_dry_run},
+            )
+        except Exception:
+            pass
+
         return SrFormat(
             status_code=200,
             success=True,
@@ -1655,6 +1729,19 @@ async def soft_delete_user(
             await cur.execute("UPDATE teachers SET is_deleted = TRUE WHERE uuid = %s", (clean_uuid,))
         if hasattr(conn, "commit"):
             await conn.commit()
+
+        try:
+            await record_audit_log(
+                conn=conn,
+                actor=current_user,
+                action_type="USER_DELETE",
+                target_type="USER",
+                target_id=clean_uuid,
+                target_name=target_user.get("id"),
+                details={"action": "soft_delete", "role": target_user.get("role")},
+            )
+        except Exception:
+            pass
     except Exception:
         if hasattr(conn, "rollback"):
             await conn.rollback()
@@ -1707,6 +1794,19 @@ async def restore_user(
             await cur.execute("UPDATE teachers SET is_deleted = FALSE WHERE uuid = %s", (clean_uuid,))
         if hasattr(conn, "commit"):
             await conn.commit()
+
+        try:
+            await record_audit_log(
+                conn=conn,
+                actor=current_user,
+                action_type="USER_RESTORE",
+                target_type="USER",
+                target_id=clean_uuid,
+                target_name=target_user.get("id"),
+                details={"action": "restore", "role": target_user.get("role")},
+            )
+        except Exception:
+            pass
     except Exception:
         if hasattr(conn, "rollback"):
             await conn.rollback()
@@ -1833,6 +1933,19 @@ async def purge_deleted_users(
 
         if hasattr(conn, "commit"):
             await conn.commit()
+
+        try:
+            await record_audit_log(
+                conn=conn,
+                actor=current_user,
+                action_type="USER_PURGE",
+                target_type="USER",
+                target_id=user_uuid or "ALL",
+                target_name=f"{len(target_uuids)}건 유저 계정",
+                details={"purgedCount": len(target_uuids), "purged_uuids": target_uuids},
+            )
+        except Exception:
+            pass
     except Exception:
         if hasattr(conn, "rollback"):
             await conn.rollback()
@@ -1856,6 +1969,1060 @@ async def purge_deleted_users(
             "purgedUuids": target_uuids,
             "message": f"{len(target_uuids)}명의 유저가 영구 삭제되었습니다.",
         },
+    ).model_dump()
+
+
+# ==============================================================================
+# 학생 및 교원 명단 단건 추가/수정/삭제/복구/완전삭제 관리 (Roster Management)
+# ==============================================================================
+
+class AdminStudentCreate(BaseModel):
+    name: str = Field(..., min_length=1, max_length=30)
+    email: str = Field(..., min_length=3, max_length=320)
+    grade: int = Field(..., ge=1, le=3)
+    class_no: int = Field(..., ge=1, le=20, alias="class")
+    student_no: int = Field(..., ge=1, le=50, alias="number")
+    year: Optional[int] = Field(default=None)
+
+    model_config = {"populate_by_name": True}
+
+
+class AdminStudentUpdate(BaseModel):
+    name: Optional[str] = Field(default=None, min_length=1, max_length=30)
+    email: Optional[str] = Field(default=None, min_length=3, max_length=320)
+    grade: Optional[int] = Field(default=None, ge=1, le=3)
+    class_no: Optional[int] = Field(default=None, ge=1, le=20, alias="class")
+    student_no: Optional[int] = Field(default=None, ge=1, le=50, alias="number")
+    year: Optional[int] = Field(default=None)
+
+    model_config = {"populate_by_name": True}
+
+
+class AdminTeacherCreate(BaseModel):
+    name: str = Field(..., min_length=1, max_length=20)
+    email: str = Field(..., min_length=3, max_length=255)
+    subject: Optional[str] = Field(default=None, max_length=20)
+    department: Optional[str] = Field(default=None, max_length=40)
+    position: Optional[str] = Field(default="교과전담", max_length=30)
+    grade: Optional[int] = Field(default=None, ge=1, le=3)
+    class_no: Optional[int] = Field(default=None, ge=1, le=20, alias="class")
+
+    model_config = {"populate_by_name": True}
+
+
+class AdminTeacherUpdate(BaseModel):
+    name: Optional[str] = Field(default=None, min_length=1, max_length=20)
+    email: Optional[str] = Field(default=None, min_length=3, max_length=255)
+    subject: Optional[str] = Field(default=None, max_length=20)
+    department: Optional[str] = Field(default=None, max_length=40)
+    position: Optional[str] = Field(default=None, max_length=30)
+    grade: Optional[int] = Field(default=None, ge=1, le=3)
+    class_no: Optional[int] = Field(default=None, ge=1, le=20, alias="class")
+
+    model_config = {"populate_by_name": True}
+
+
+@admin_router.get("/roster/students", summary="학생 명단 전체 조회 및 필터링")
+async def list_admin_roster_students(
+    search: Optional[str] = Query(None, description="이름, 이메일, 계정ID 검색"),
+    grade: Optional[int] = Query(None, ge=1, le=3, description="학년 필터"),
+    class_no: Optional[int] = Query(None, ge=1, le=20, description="반 필터"),
+    year: Optional[int] = Query(None, description="대상 학년도"),
+    status_filter: Optional[str] = Query("all", alias="status", description="active, deleted, all"),
+    page: int = Query(1, ge=1, description="페이지 번호"),
+    limit: int = Query(20, ge=1, le=100, description="페이지당 개수"),
+    current_user: Dict[str, Any] = Depends(get_current_user),
+    conn: Any = Depends(get_db),
+):
+    admin_guard = check_admin_access(current_user)
+    if admin_guard:
+        return admin_guard
+
+    async with conn.cursor(cursor=DictCursor) as cur:
+        # 대상 학년도 결정
+        target_year_id = None
+        target_year = year
+        if target_year is not None:
+            await cur.execute("SELECT year_id, year FROM academic_years WHERE year = %s LIMIT 1", (target_year,))
+            y_row = await cur.fetchone()
+            if y_row:
+                target_year_id = y_row["year_id"]
+                target_year = y_row["year"]
+        if target_year_id is None:
+            await cur.execute("SELECT year_id, year FROM academic_years ORDER BY is_activated DESC, year DESC LIMIT 1")
+            y_row = await cur.fetchone()
+            if y_row:
+                target_year_id = y_row["year_id"]
+                target_year = y_row["year"]
+
+        where_clauses: List[str] = []
+        params: List[Any] = []
+
+        # 상태 필터
+        clean_status = (status_filter or "all").strip().lower()
+        if clean_status == "active":
+            where_clauses.append("st.is_deleted = FALSE")
+        elif clean_status == "deleted":
+            where_clauses.append("st.is_deleted = TRUE")
+
+        # 학년/반 필터
+        if grade is not None:
+            where_clauses.append("sar.grade = %s")
+            params.append(grade)
+        if class_no is not None:
+            where_clauses.append("sar.class = %s")
+            params.append(class_no)
+
+        # 검색
+        if search and search.strip():
+            kw = f"%{search.strip()}%"
+            where_clauses.append("(st.name LIKE %s OR st.email LIKE %s OR u.id LIKE %s)")
+            params.extend([kw, kw, kw])
+
+        where_sql = ("WHERE " + " AND ".join(where_clauses)) if where_clauses else ""
+
+        # 전체 일치 개수
+        count_sql = f"""
+            SELECT COUNT(DISTINCT st.student_id) AS total
+            FROM students st
+            LEFT JOIN student_academic_records sar ON sar.student_id = st.student_id AND sar.year_id = %s
+            LEFT JOIN users u ON u.uuid = st.uuid
+            {where_sql}
+        """
+        await cur.execute(count_sql, (target_year_id, *params))
+        total_row = await cur.fetchone()
+        total = total_row["total"] if total_row else 0
+
+        # 삭제 대기 학생 수
+        await cur.execute("SELECT COUNT(*) AS deleted_count FROM students WHERE is_deleted = TRUE")
+        del_row = await cur.fetchone()
+        deleted_count = del_row["deleted_count"] if del_row else 0
+
+        offset = (page - 1) * limit
+        data_sql = f"""
+            SELECT 
+                st.student_id,
+                st.uuid,
+                st.name,
+                st.email,
+                st.status,
+                st.is_deleted,
+                sar.grade,
+                sar.class AS class_no,
+                sar.number AS student_no,
+                sar.year_id,
+                u.id AS user_account_id,
+                CASE WHEN u.uuid IS NOT NULL THEN TRUE ELSE FALSE END AS has_account
+            FROM students st
+            LEFT JOIN student_academic_records sar ON sar.student_id = st.student_id AND sar.year_id = %s
+            LEFT JOIN users u ON u.uuid = st.uuid
+            {where_sql}
+            ORDER BY sar.grade ASC, sar.class ASC, sar.number ASC, st.student_id ASC
+            LIMIT %s OFFSET %s
+        """
+        await cur.execute(data_sql, (target_year_id, *params, limit, offset))
+        rows = await cur.fetchall() or []
+
+        return SrFormat(
+            status_code=200,
+            success=True,
+            data={
+                "students": rows,
+                "total": total,
+                "deletedCount": deleted_count,
+                "page": page,
+                "limit": limit,
+                "year": target_year,
+            },
+        ).model_dump()
+
+
+@admin_router.post("/roster/students", summary="학생 명단 개별 추가", status_code=status.HTTP_201_CREATED)
+async def create_admin_roster_student(
+    req: AdminStudentCreate,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+    conn: Any = Depends(get_db),
+):
+    admin_guard = check_admin_access(current_user)
+    if admin_guard:
+        return admin_guard
+
+    clean_name = sanitize_text(req.name)
+    clean_email = req.email.strip().lower()
+
+    if not clean_name:
+        return error_response(400, "INVALID_NAME", "학생 이름을 입력해주세요.")
+    if not EMAIL_REGEX.match(clean_email):
+        return error_response(400, "INVALID_EMAIL", f"올바르지 않은 이메일 형식입니다: {clean_email}")
+
+    async with conn.cursor(cursor=DictCursor) as cur:
+        # 교사 이메일 중복 체크 (Role Confusion 방지)
+        await cur.execute("SELECT teachers_id FROM teachers WHERE email = %s AND is_deleted = FALSE LIMIT 1", (clean_email,))
+        if await cur.fetchone():
+            return error_response(400, "ROLE_CONFUSION", "교사 명단에 이미 등록된 이메일입니다.")
+
+        # 활성 학생 이메일 중복 체크
+        await cur.execute("SELECT student_id, is_deleted FROM students WHERE email = %s LIMIT 1", (clean_email,))
+        ex_st = await cur.fetchone()
+        if ex_st and not ex_st["is_deleted"]:
+            return error_response(409, "DUPLICATE_EMAIL", "이미 등록된 학생 이메일입니다.")
+
+        # 대상 학년도 결정
+        target_year_id = None
+        target_year = req.year
+        if target_year is not None:
+            await cur.execute("SELECT year_id, year FROM academic_years WHERE year = %s LIMIT 1", (target_year,))
+            y_row = await cur.fetchone()
+            if y_row:
+                target_year_id = y_row["year_id"]
+                target_year = y_row["year"]
+        if target_year_id is None:
+            await cur.execute("SELECT year_id, year FROM academic_years ORDER BY is_activated DESC, year DESC LIMIT 1")
+            y_row = await cur.fetchone()
+            if not y_row:
+                return error_response(400, "NO_ACTIVE_YEAR", "등록된 활성 학년도가 없습니다.")
+            target_year_id = y_row["year_id"]
+            target_year = y_row["year"]
+
+        # 동일 학년도 학년/반/번호 중복 체크
+        chk_sql = """
+            SELECT sar.record_id 
+            FROM student_academic_records sar
+            JOIN students st ON st.student_id = sar.student_id
+            WHERE sar.year_id = %s AND sar.grade = %s AND sar.class = %s AND sar.number = %s AND st.is_deleted = FALSE
+            LIMIT 1
+        """
+        await cur.execute(chk_sql, (target_year_id, req.grade, req.class_no, req.student_no))
+        if await cur.fetchone():
+            return error_response(409, "DUPLICATE_STUDENT_NUMBER", f"{req.grade}학년 {req.class_no}반 {req.student_no}번에 이미 등록된 학생이 있습니다.")
+
+        await conn.autocommit(False)
+        try:
+            if ex_st and ex_st["is_deleted"]:
+                student_id = ex_st["student_id"]
+                await cur.execute(
+                    "UPDATE students SET name = %s, is_deleted = FALSE WHERE student_id = %s",
+                    (clean_name, student_id),
+                )
+            else:
+                await cur.execute(
+                    "INSERT INTO students (name, email, status, is_deleted) VALUES (%s, %s, 0, FALSE)",
+                    (clean_name, clean_email),
+                )
+                student_id = cur.lastrowid
+
+            # 학적 추가/갱신
+            await cur.execute(
+                """
+                INSERT INTO student_academic_records (student_id, year_id, grade, class, number)
+                VALUES (%s, %s, %s, %s, %s)
+                ON DUPLICATE KEY UPDATE grade = VALUES(grade), class = VALUES(class), number = VALUES(number)
+                """,
+                (student_id, target_year_id, req.grade, req.class_no, req.student_no),
+            )
+            await conn.commit()
+
+            try:
+                await record_audit_log(
+                    conn=conn,
+                    actor=current_user,
+                    action_type="USER_CREATE",
+                    target_type="STUDENT",
+                    target_id=student_id,
+                    target_name=clean_name,
+                    details={"email": clean_email, "grade": req.grade, "class": req.class_no, "number": req.student_no, "year": target_year},
+                )
+            except Exception:
+                pass
+        except Exception:
+            await conn.rollback()
+            raise
+        finally:
+            await conn.autocommit(True)
+
+        return SrFormat(
+            status_code=201,
+            success=True,
+            data={
+                "studentId": student_id,
+                "name": clean_name,
+                "email": clean_email,
+                "grade": req.grade,
+                "classNo": req.class_no,
+                "studentNo": req.student_no,
+                "year": target_year,
+                "message": "학생이 성공적으로 등록되었습니다.",
+            },
+        ).model_dump()
+
+
+@admin_router.patch("/roster/students/{student_id}", summary="학생 정보 수정")
+async def update_admin_roster_student(
+    student_id: int,
+    req: AdminStudentUpdate,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+    conn: Any = Depends(get_db),
+):
+    admin_guard = check_admin_access(current_user)
+    if admin_guard:
+        return admin_guard
+
+    async with conn.cursor(cursor=DictCursor) as cur:
+        await cur.execute("SELECT student_id, uuid, name, email, is_deleted FROM students WHERE student_id = %s LIMIT 1", (student_id,))
+        st = await cur.fetchone()
+        if not st:
+            return error_response(404, "STUDENT_NOT_FOUND", "해당 학생을 찾을 수 없습니다.")
+
+        new_name = sanitize_text(req.name) if req.name is not None else st["name"]
+        new_email = req.email.strip().lower() if req.email is not None else st["email"]
+
+        if req.email is not None and not EMAIL_REGEX.match(new_email):
+            return error_response(400, "INVALID_EMAIL", f"올바르지 않은 이메일 형식입니다: {new_email}")
+
+        if new_email != st["email"]:
+            await cur.execute("SELECT teachers_id FROM teachers WHERE email = %s AND is_deleted = FALSE LIMIT 1", (new_email,))
+            if await cur.fetchone():
+                return error_response(400, "ROLE_CONFUSION", "교사 명단에 이미 등록된 이메일입니다.")
+            await cur.execute("SELECT student_id FROM students WHERE email = %s AND student_id != %s AND is_deleted = FALSE LIMIT 1", (new_email, student_id))
+            if await cur.fetchone():
+                return error_response(409, "DUPLICATE_EMAIL", "다른 학생이 이미 사용 중인 이메일입니다.")
+
+        # 학적 정보 수정 요청 처리
+        target_year_id = None
+        target_year = req.year
+        if target_year is not None:
+            await cur.execute("SELECT year_id, year FROM academic_years WHERE year = %s LIMIT 1", (target_year,))
+            y_row = await cur.fetchone()
+            if y_row:
+                target_year_id = y_row["year_id"]
+        if target_year_id is None:
+            await cur.execute("SELECT year_id, year FROM academic_years ORDER BY is_activated DESC, year DESC LIMIT 1")
+            y_row = await cur.fetchone()
+            if y_row:
+                target_year_id = y_row["year_id"]
+
+        await cur.execute(
+            "SELECT record_id, grade, class, number FROM student_academic_records WHERE student_id = %s AND year_id = %s LIMIT 1",
+            (student_id, target_year_id),
+        )
+        cur_sar = await cur.fetchone()
+
+        new_grade = req.grade if req.grade is not None else (cur_sar["grade"] if cur_sar else None)
+        new_class = req.class_no if req.class_no is not None else (cur_sar["class"] if cur_sar else None)
+        new_number = req.student_no if req.student_no is not None else (cur_sar["number"] if cur_sar else None)
+
+        if new_grade is not None and new_class is not None and new_number is not None:
+            chk_sql = """
+                SELECT sar.record_id 
+                FROM student_academic_records sar
+                JOIN students s ON s.student_id = sar.student_id
+                WHERE sar.year_id = %s AND sar.grade = %s AND sar.class = %s AND sar.number = %s 
+                  AND sar.student_id != %s AND s.is_deleted = FALSE
+                LIMIT 1
+            """
+            await cur.execute(chk_sql, (target_year_id, new_grade, new_class, new_number, student_id))
+            if await cur.fetchone():
+                return error_response(409, "DUPLICATE_STUDENT_NUMBER", f"{new_grade}학년 {new_class}반 {new_number}번에 이미 다른 학생이 존재합니다.")
+
+        await conn.autocommit(False)
+        try:
+            await cur.execute(
+                "UPDATE students SET name = %s, email = %s WHERE student_id = %s",
+                (new_name, new_email, student_id),
+            )
+            if st["uuid"]:
+                await cur.execute("UPDATE users SET email = %s WHERE uuid = %s", (new_email, st["uuid"]))
+
+            if new_grade is not None and new_class is not None and new_number is not None and target_year_id:
+                if cur_sar:
+                    await cur.execute(
+                        "UPDATE student_academic_records SET grade = %s, class = %s, number = %s WHERE record_id = %s",
+                        (new_grade, new_class, new_number, cur_sar["record_id"]),
+                    )
+                else:
+                    await cur.execute(
+                        "INSERT INTO student_academic_records (student_id, year_id, grade, class, number) VALUES (%s, %s, %s, %s, %s)",
+                        (student_id, target_year_id, new_grade, new_class, new_number),
+                    )
+
+            await conn.commit()
+
+            try:
+                await record_audit_log(
+                    conn=conn,
+                    actor=current_user,
+                    action_type="USER_UPDATE",
+                    target_type="STUDENT",
+                    target_id=student_id,
+                    target_name=new_name,
+                    details={"email": new_email, "grade": new_grade, "class": new_class, "number": new_number},
+                )
+            except Exception:
+                pass
+        except Exception:
+            await conn.rollback()
+            raise
+        finally:
+            await conn.autocommit(True)
+
+        return SrFormat(
+            status_code=200,
+            success=True,
+            data={
+                "studentId": student_id,
+                "name": new_name,
+                "email": new_email,
+                "grade": new_grade,
+                "classNo": new_class,
+                "studentNo": new_number,
+                "message": "학생 정보가 수정되었습니다.",
+            },
+        ).model_dump()
+
+
+@admin_router.patch("/roster/students/{student_id}/soft-delete", summary="학생 명단 소프트 삭제")
+async def soft_delete_admin_roster_student(
+    student_id: int,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+    conn: Any = Depends(get_db),
+):
+    admin_guard = check_admin_access(current_user)
+    if admin_guard:
+        return admin_guard
+
+    async with conn.cursor(cursor=DictCursor) as cur:
+        await cur.execute("SELECT student_id, uuid, name, is_deleted FROM students WHERE student_id = %s LIMIT 1", (student_id,))
+        st = await cur.fetchone()
+        if not st:
+            return error_response(404, "STUDENT_NOT_FOUND", "해당 학생을 찾을 수 없습니다.")
+
+        await conn.autocommit(False)
+        try:
+            await cur.execute("UPDATE students SET is_deleted = TRUE WHERE student_id = %s", (student_id,))
+            if st["uuid"]:
+                await cur.execute("UPDATE users SET is_deleted = TRUE WHERE uuid = %s", (st["uuid"],))
+            await conn.commit()
+
+            try:
+                await record_audit_log(
+                    conn=conn,
+                    actor=current_user,
+                    action_type="USER_DELETE",
+                    target_type="STUDENT",
+                    target_id=student_id,
+                    target_name=st["name"],
+                    details={"action": "soft_delete"},
+                )
+            except Exception:
+                pass
+        except Exception:
+            await conn.rollback()
+            raise
+        finally:
+            await conn.autocommit(True)
+
+    return SrFormat(
+        status_code=200,
+        success=True,
+        data={"studentId": student_id, "isDeleted": True, "message": f"학생 '{st['name']}'이(가) 삭제 대기 상태로 전환되었습니다."},
+    ).model_dump()
+
+
+@admin_router.patch("/roster/students/{student_id}/restore", summary="학생 명단 복원")
+async def restore_admin_roster_student(
+    student_id: int,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+    conn: Any = Depends(get_db),
+):
+    admin_guard = check_admin_access(current_user)
+    if admin_guard:
+        return admin_guard
+
+    async with conn.cursor(cursor=DictCursor) as cur:
+        await cur.execute("SELECT student_id, uuid, name, is_deleted FROM students WHERE student_id = %s LIMIT 1", (student_id,))
+        st = await cur.fetchone()
+        if not st:
+            return error_response(404, "STUDENT_NOT_FOUND", "해당 학생을 찾을 수 없습니다.")
+
+        await conn.autocommit(False)
+        try:
+            await cur.execute("UPDATE students SET is_deleted = FALSE WHERE student_id = %s", (student_id,))
+            if st["uuid"]:
+                await cur.execute("UPDATE users SET is_deleted = FALSE WHERE uuid = %s", (st["uuid"],))
+            await conn.commit()
+
+            try:
+                await record_audit_log(
+                    conn=conn,
+                    actor=current_user,
+                    action_type="USER_RESTORE",
+                    target_type="STUDENT",
+                    target_id=student_id,
+                    target_name=st["name"],
+                    details={"action": "restore"},
+                )
+            except Exception:
+                pass
+        except Exception:
+            await conn.rollback()
+            raise
+        finally:
+            await conn.autocommit(True)
+
+    return SrFormat(
+        status_code=200,
+        success=True,
+        data={"studentId": student_id, "isDeleted": False, "message": f"학생 '{st['name']}'이(가) 정상 복구되었습니다."},
+    ).model_dump()
+
+
+@admin_router.delete("/roster/students/purge", summary="삭제 대기 학생 영구 삭제")
+async def purge_admin_roster_students(
+    student_id: Optional[int] = Query(None, description="특정 학생만 영구 삭제 시 지정"),
+    current_user: Dict[str, Any] = Depends(get_current_user),
+    conn: Any = Depends(get_db),
+    redis: aioredis.Redis = Depends(get_redis),
+):
+    admin_guard = check_admin_access(current_user)
+    if admin_guard:
+        return admin_guard
+
+    async with conn.cursor(cursor=DictCursor) as cur:
+        if student_id is not None:
+            await cur.execute("SELECT student_id, uuid FROM students WHERE student_id = %s AND is_deleted = TRUE", (student_id,))
+        else:
+            await cur.execute("SELECT student_id, uuid FROM students WHERE is_deleted = TRUE")
+        targets = await cur.fetchall() or []
+
+        if not targets:
+            return SrFormat(status_code=200, success=True, data={"purgedCount": 0, "message": "삭제할 대상 학생이 없습니다."}).model_dump()
+
+        target_sids = [t["student_id"] for t in targets]
+        target_uuids = [t["uuid"] for t in targets if t.get("uuid")]
+
+        await conn.autocommit(False)
+        try:
+            chunk_size = 200
+            for i in range(0, len(target_sids), chunk_size):
+                chunk = target_sids[i:i + chunk_size]
+                ph = ",".join(["%s"] * len(chunk))
+
+                # 1. 학적 삭제
+                await cur.execute(f"DELETE FROM student_academic_records WHERE student_id IN ({ph})", tuple(chunk))
+                # 2. 상벌점 로그 및 상벌점 삭제
+                await cur.execute(f"DELETE FROM merits_log WHERE merits_point_id IN (SELECT merits_point_id FROM merits WHERE student_id IN ({ph}))", tuple(chunk))
+                await cur.execute(f"DELETE FROM merits WHERE student_id IN ({ph})", tuple(chunk))
+                # 3. 제출물 로그 및 제출물 삭제
+                await cur.execute(f"DELETE FROM submissions_logs WHERE submission_id IN (SELECT submission_id FROM submissions WHERE student_id IN ({ph}))", tuple(chunk))
+                await cur.execute(f"DELETE FROM submissions WHERE student_id IN ({ph})", tuple(chunk))
+                # 4. 학생 삭제
+                await cur.execute(f"DELETE FROM students WHERE student_id IN ({ph})", tuple(chunk))
+
+            # 연동된 계정 중 is_deleted=TRUE인 계정도 정리
+            if target_uuids:
+                u_ph = ",".join(["%s"] * len(target_uuids))
+                await cur.execute(
+                    f"""
+                    DELETE cm FROM chat_messages cm
+                    JOIN chat_conversations cc ON cm.conversation_id = cc.conversation_id
+                    WHERE cc.user_uuid IN ({u_ph})
+                    """,
+                    tuple(target_uuids),
+                )
+                await cur.execute(f"DELETE FROM chat_conversations WHERE user_uuid IN ({u_ph})", tuple(target_uuids))
+                await cur.execute(f"UPDATE submissions_logs SET modifier_uuid = NULL WHERE modifier_uuid IN ({u_ph})", tuple(target_uuids))
+                await cur.execute(f"UPDATE merits_log SET modifier_uuid = NULL WHERE modifier_uuid IN ({u_ph})", tuple(target_uuids))
+                await cur.execute(f"DELETE FROM users WHERE uuid IN ({u_ph}) AND is_deleted = TRUE", tuple(target_uuids))
+
+            await conn.commit()
+
+            try:
+                await record_audit_log(
+                    conn=conn,
+                    actor=current_user,
+                    action_type="USER_PURGE",
+                    target_type="STUDENT",
+                    target_id=student_id or "ALL",
+                    target_name=f"{len(target_sids)}명의 학생",
+                    details={"purgedCount": len(target_sids), "purged_ids": target_sids},
+                )
+            except Exception:
+                pass
+        except Exception:
+            await conn.rollback()
+            raise
+        finally:
+            await conn.autocommit(True)
+
+    try:
+        for u in target_uuids:
+            await revoke_all_user_tokens(redis, u)
+    except Exception:
+        pass
+
+    return SrFormat(
+        status_code=200,
+        success=True,
+        data={"purgedCount": len(target_sids), "message": f"{len(target_sids)}명의 학생 명단이 영구 삭제되었습니다."},
+    ).model_dump()
+
+
+# ==============================================================================
+# 교원 명단 관리 (Roster - Teachers)
+# ==============================================================================
+
+@admin_router.get("/roster/teachers", summary="교원 명단 전체 조회 및 필터링")
+async def list_admin_roster_teachers(
+    search: Optional[str] = Query(None, description="이름, 이메일, 과목, 계정ID 검색"),
+    department: Optional[str] = Query(None, description="소속 부서 필터"),
+    position: Optional[str] = Query(None, description="직책 필터"),
+    status_filter: Optional[str] = Query("all", alias="status", description="active, deleted, all"),
+    page: int = Query(1, ge=1, description="페이지 번호"),
+    limit: int = Query(20, ge=1, le=100, description="페이지당 개수"),
+    current_user: Dict[str, Any] = Depends(get_current_user),
+    conn: Any = Depends(get_db),
+):
+    admin_guard = check_admin_access(current_user)
+    if admin_guard:
+        return admin_guard
+
+    async with conn.cursor(cursor=DictCursor) as cur:
+        where_clauses: List[str] = []
+        params: List[Any] = []
+
+        clean_status = (status_filter or "all").strip().lower()
+        if clean_status == "active":
+            where_clauses.append("t.is_deleted = FALSE")
+        elif clean_status == "deleted":
+            where_clauses.append("t.is_deleted = TRUE")
+
+        if department and department.strip():
+            where_clauses.append("t.department = %s")
+            params.append(department.strip())
+
+        if position and position.strip():
+            where_clauses.append("t.position = %s")
+            params.append(position.strip())
+
+        if search and search.strip():
+            kw = f"%{search.strip()}%"
+            where_clauses.append("(t.name LIKE %s OR t.email LIKE %s OR t.subject LIKE %s OR u.id LIKE %s)")
+            params.extend([kw, kw, kw, kw])
+
+        where_sql = ("WHERE " + " AND ".join(where_clauses)) if where_clauses else ""
+
+        count_sql = f"""
+            SELECT COUNT(DISTINCT t.teachers_id) AS total
+            FROM teachers t
+            LEFT JOIN users u ON u.uuid = t.uuid
+            {where_sql}
+        """
+        await cur.execute(count_sql, tuple(params))
+        total_row = await cur.fetchone()
+        total = total_row["total"] if total_row else 0
+
+        await cur.execute("SELECT COUNT(*) AS deleted_count FROM teachers WHERE is_deleted = TRUE")
+        del_row = await cur.fetchone()
+        deleted_count = del_row["deleted_count"] if del_row else 0
+
+        offset = (page - 1) * limit
+        data_sql = f"""
+            SELECT 
+                t.teachers_id,
+                t.uuid,
+                t.name,
+                t.email,
+                t.subject,
+                t.department,
+                t.position,
+                t.grade,
+                t.class AS class_no,
+                t.is_deleted,
+                u.id AS user_account_id,
+                CASE WHEN u.uuid IS NOT NULL THEN TRUE ELSE FALSE END AS has_account
+            FROM teachers t
+            LEFT JOIN users u ON u.uuid = t.uuid
+            {where_sql}
+            ORDER BY t.teachers_id ASC
+            LIMIT %s OFFSET %s
+        """
+        await cur.execute(data_sql, (*params, limit, offset))
+        rows = await cur.fetchall() or []
+
+        return SrFormat(
+            status_code=200,
+            success=True,
+            data={
+                "teachers": rows,
+                "total": total,
+                "deletedCount": deleted_count,
+                "page": page,
+                "limit": limit,
+            },
+        ).model_dump()
+
+
+@admin_router.post("/roster/teachers", summary="교원 명단 개별 추가", status_code=status.HTTP_201_CREATED)
+async def create_admin_roster_teacher(
+    req: AdminTeacherCreate,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+    conn: Any = Depends(get_db),
+):
+    admin_guard = check_admin_access(current_user)
+    if admin_guard:
+        return admin_guard
+
+    clean_name = sanitize_text(req.name)
+    clean_email = req.email.strip().lower()
+
+    if not clean_name:
+        return error_response(400, "INVALID_NAME", "교사 이름을 입력해주세요.")
+    if not EMAIL_REGEX.match(clean_email):
+        return error_response(400, "INVALID_EMAIL", f"올바르지 않은 이메일 형식입니다: {clean_email}")
+
+    clean_subject = sanitize_text(req.subject) if req.subject else None
+    clean_dept = sanitize_text(req.department) if req.department else None
+    clean_pos = sanitize_text(req.position) if req.position else "교과전담"
+
+    async with conn.cursor(cursor=DictCursor) as cur:
+        # 학생 이메일 중복 체크 (Role Confusion 방지)
+        await cur.execute("SELECT student_id FROM students WHERE email = %s AND is_deleted = FALSE LIMIT 1", (clean_email,))
+        if await cur.fetchone():
+            return error_response(400, "ROLE_CONFUSION", "학생 명단에 이미 등록된 이메일입니다.")
+
+        # 활성 교원 이메일 중복 체크
+        await cur.execute("SELECT teachers_id, is_deleted FROM teachers WHERE email = %s LIMIT 1", (clean_email,))
+        ex_t = await cur.fetchone()
+        if ex_t and not ex_t["is_deleted"]:
+            return error_response(409, "DUPLICATE_EMAIL", "이미 등록된 교사 이메일입니다.")
+
+        await conn.autocommit(False)
+        try:
+            if ex_t and ex_t["is_deleted"]:
+                teachers_id = ex_t["teachers_id"]
+                await cur.execute(
+                    """
+                    UPDATE teachers 
+                    SET name = %s, subject = %s, department = %s, position = %s, grade = %s, class = %s, is_deleted = FALSE
+                    WHERE teachers_id = %s
+                    """,
+                    (clean_name, clean_subject, clean_dept, clean_pos, req.grade, req.class_no, teachers_id),
+                )
+            else:
+                await cur.execute(
+                    """
+                    INSERT INTO teachers (name, email, subject, department, position, grade, class, is_deleted)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, FALSE)
+                    """,
+                    (clean_name, clean_email, clean_subject, clean_dept, clean_pos, req.grade, req.class_no),
+                )
+                teachers_id = cur.lastrowid
+            await conn.commit()
+
+            try:
+                await record_audit_log(
+                    conn=conn,
+                    actor=current_user,
+                    action_type="USER_CREATE",
+                    target_type="TEACHER",
+                    target_id=teachers_id,
+                    target_name=clean_name,
+                    details={"email": clean_email, "department": clean_dept, "position": clean_pos, "subject": clean_subject},
+                )
+            except Exception:
+                pass
+        except Exception:
+            await conn.rollback()
+            raise
+        finally:
+            await conn.autocommit(True)
+
+        return SrFormat(
+            status_code=201,
+            success=True,
+            data={
+                "teacherId": teachers_id,
+                "name": clean_name,
+                "email": clean_email,
+                "subject": clean_subject,
+                "department": clean_dept,
+                "position": clean_pos,
+                "grade": req.grade,
+                "classNo": req.class_no,
+                "message": "교원이 성공적으로 등록되었습니다.",
+            },
+        ).model_dump()
+
+
+@admin_router.patch("/roster/teachers/{teacher_id}", summary="교원 정보 수정")
+async def update_admin_roster_teacher(
+    teacher_id: int,
+    req: AdminTeacherUpdate,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+    conn: Any = Depends(get_db),
+):
+    admin_guard = check_admin_access(current_user)
+    if admin_guard:
+        return admin_guard
+
+    async with conn.cursor(cursor=DictCursor) as cur:
+        await cur.execute("SELECT teachers_id, uuid, name, email, subject, department, position, grade, class, is_deleted FROM teachers WHERE teachers_id = %s LIMIT 1", (teacher_id,))
+        t = await cur.fetchone()
+        if not t:
+            return error_response(404, "TEACHER_NOT_FOUND", "해당 교사를 찾을 수 없습니다.")
+
+        new_name = sanitize_text(req.name) if req.name is not None else t["name"]
+        new_email = req.email.strip().lower() if req.email is not None else t["email"]
+
+        if req.email is not None and not EMAIL_REGEX.match(new_email):
+            return error_response(400, "INVALID_EMAIL", f"올바르지 않은 이메일 형식입니다: {new_email}")
+
+        if new_email != t["email"]:
+            await cur.execute("SELECT student_id FROM students WHERE email = %s AND is_deleted = FALSE LIMIT 1", (new_email,))
+            if await cur.fetchone():
+                return error_response(400, "ROLE_CONFUSION", "학생 명단에 이미 등록된 이메일입니다.")
+            await cur.execute("SELECT teachers_id FROM teachers WHERE email = %s AND teachers_id != %s AND is_deleted = FALSE LIMIT 1", (new_email, teacher_id))
+            if await cur.fetchone():
+                return error_response(409, "DUPLICATE_EMAIL", "다른 교사가 이미 사용 중인 이메일입니다.")
+
+        new_subject = sanitize_text(req.subject) if req.subject is not None else t["subject"]
+        new_dept = sanitize_text(req.department) if req.department is not None else t["department"]
+        new_pos = sanitize_text(req.position) if req.position is not None else t["position"]
+        new_grade = req.grade if req.grade is not None else t["grade"]
+        new_class = req.class_no if req.class_no is not None else t["class"]
+
+        await conn.autocommit(False)
+        try:
+            await cur.execute(
+                """
+                UPDATE teachers 
+                SET name = %s, email = %s, subject = %s, department = %s, position = %s, grade = %s, class = %s
+                WHERE teachers_id = %s
+                """,
+                (new_name, new_email, new_subject, new_dept, new_pos, new_grade, new_class, teacher_id),
+            )
+            if t["uuid"]:
+                await cur.execute("UPDATE users SET email = %s WHERE uuid = %s", (new_email, t["uuid"]))
+            await conn.commit()
+
+            try:
+                await record_audit_log(
+                    conn=conn,
+                    actor=current_user,
+                    action_type="USER_UPDATE",
+                    target_type="TEACHER",
+                    target_id=teacher_id,
+                    target_name=new_name,
+                    details={"email": new_email, "department": new_dept, "position": new_pos, "subject": new_subject},
+                )
+            except Exception:
+                pass
+        except Exception:
+            await conn.rollback()
+            raise
+        finally:
+            await conn.autocommit(True)
+
+        return SrFormat(
+            status_code=200,
+            success=True,
+            data={
+                "teacherId": teacher_id,
+                "name": new_name,
+                "email": new_email,
+                "subject": new_subject,
+                "department": new_dept,
+                "position": new_pos,
+                "grade": new_grade,
+                "classNo": new_class,
+                "message": "교원 정보가 수정되었습니다.",
+            },
+        ).model_dump()
+
+
+@admin_router.patch("/roster/teachers/{teacher_id}/soft-delete", summary="교원 명단 소프트 삭제")
+async def soft_delete_admin_roster_teacher(
+    teacher_id: int,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+    conn: Any = Depends(get_db),
+):
+    admin_guard = check_admin_access(current_user)
+    if admin_guard:
+        return admin_guard
+
+    async with conn.cursor(cursor=DictCursor) as cur:
+        await cur.execute("SELECT teachers_id, uuid, name, is_deleted FROM teachers WHERE teachers_id = %s LIMIT 1", (teacher_id,))
+        t = await cur.fetchone()
+        if not t:
+            return error_response(404, "TEACHER_NOT_FOUND", "해당 교사를 찾을 수 없습니다.")
+
+        await conn.autocommit(False)
+        try:
+            await cur.execute("UPDATE teachers SET is_deleted = TRUE WHERE teachers_id = %s", (teacher_id,))
+            if t["uuid"]:
+                await cur.execute("UPDATE users SET is_deleted = TRUE WHERE uuid = %s", (t["uuid"],))
+            await conn.commit()
+
+            try:
+                await record_audit_log(
+                    conn=conn,
+                    actor=current_user,
+                    action_type="USER_DELETE",
+                    target_type="TEACHER",
+                    target_id=teacher_id,
+                    target_name=t["name"],
+                    details={"action": "soft_delete"},
+                )
+            except Exception:
+                pass
+        except Exception:
+            await conn.rollback()
+            raise
+        finally:
+            await conn.autocommit(True)
+
+    return SrFormat(
+        status_code=200,
+        success=True,
+        data={"teacherId": teacher_id, "isDeleted": True, "message": f"교원 '{t['name']}'이(가) 삭제 대기 상태로 전환되었습니다."},
+    ).model_dump()
+
+
+@admin_router.patch("/roster/teachers/{teacher_id}/restore", summary="교원 명단 복원")
+async def restore_admin_roster_teacher(
+    teacher_id: int,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+    conn: Any = Depends(get_db),
+):
+    admin_guard = check_admin_access(current_user)
+    if admin_guard:
+        return admin_guard
+
+    async with conn.cursor(cursor=DictCursor) as cur:
+        await cur.execute("SELECT teachers_id, uuid, name, is_deleted FROM teachers WHERE teachers_id = %s LIMIT 1", (teacher_id,))
+        t = await cur.fetchone()
+        if not t:
+            return error_response(404, "TEACHER_NOT_FOUND", "해당 교사를 찾을 수 없습니다.")
+
+        await conn.autocommit(False)
+        try:
+            await cur.execute("UPDATE teachers SET is_deleted = FALSE WHERE teachers_id = %s", (teacher_id,))
+            if t["uuid"]:
+                await cur.execute("UPDATE users SET is_deleted = FALSE WHERE uuid = %s", (t["uuid"],))
+            await conn.commit()
+
+            try:
+                await record_audit_log(
+                    conn=conn,
+                    actor=current_user,
+                    action_type="USER_RESTORE",
+                    target_type="TEACHER",
+                    target_id=teacher_id,
+                    target_name=t["name"],
+                    details={"action": "restore"},
+                )
+            except Exception:
+                pass
+        except Exception:
+            await conn.rollback()
+            raise
+        finally:
+            await conn.autocommit(True)
+
+    return SrFormat(
+        status_code=200,
+        success=True,
+        data={"teacherId": teacher_id, "isDeleted": False, "message": f"교원 '{t['name']}'이(가) 정상 복구되었습니다."},
+    ).model_dump()
+
+
+@admin_router.delete("/roster/teachers/purge", summary="삭제 대기 교원 영구 삭제")
+async def purge_admin_roster_teachers(
+    teacher_id: Optional[int] = Query(None, description="특정 교원만 영구 삭제 시 지정"),
+    current_user: Dict[str, Any] = Depends(get_current_user),
+    conn: Any = Depends(get_db),
+    redis: aioredis.Redis = Depends(get_redis),
+):
+    admin_guard = check_admin_access(current_user)
+    if admin_guard:
+        return admin_guard
+
+    async with conn.cursor(cursor=DictCursor) as cur:
+        if teacher_id is not None:
+            await cur.execute("SELECT teachers_id, uuid FROM teachers WHERE teachers_id = %s AND is_deleted = TRUE", (teacher_id,))
+        else:
+            await cur.execute("SELECT teachers_id, uuid FROM teachers WHERE is_deleted = TRUE")
+        targets = await cur.fetchall() or []
+
+        if not targets:
+            return SrFormat(status_code=200, success=True, data={"purgedCount": 0, "message": "삭제할 대상 교원이 없습니다."}).model_dump()
+
+        target_tids = [t["teachers_id"] for t in targets]
+        target_uuids = [t["uuid"] for t in targets if t.get("uuid")]
+
+        await conn.autocommit(False)
+        try:
+            chunk_size = 200
+            for i in range(0, len(target_tids), chunk_size):
+                chunk = target_tids[i:i + chunk_size]
+                ph = ",".join(["%s"] * len(chunk))
+
+                # 1. 평가 영역/항목 전담 매핑 삭제
+                await cur.execute(f"DELETE FROM certification_area_teachers WHERE teacher_id IN ({ph})", tuple(chunk))
+                await cur.execute(f"DELETE FROM evaluation_item_teachers WHERE teacher_id IN ({ph})", tuple(chunk))
+                # 2. 상벌점 및 제출물 담당 교사 NULL 처리
+                await cur.execute(f"UPDATE merits SET teachers_id = NULL WHERE teachers_id IN ({ph})", tuple(chunk))
+                await cur.execute(f"UPDATE submissions SET reviewer_id = NULL WHERE reviewer_id IN ({ph})", tuple(chunk))
+                await cur.execute(f"UPDATE submissions SET appeal_reviewer_id = NULL WHERE appeal_reviewer_id IN ({ph})", tuple(chunk))
+                # 3. 교원 삭제
+                await cur.execute(f"DELETE FROM teachers WHERE teachers_id IN ({ph})", tuple(chunk))
+
+            # 연동된 계정 중 is_deleted=TRUE인 계정도 정리
+            if target_uuids:
+                u_ph = ",".join(["%s"] * len(target_uuids))
+                await cur.execute(
+                    f"""
+                    DELETE cm FROM chat_messages cm
+                    JOIN chat_conversations cc ON cm.conversation_id = cc.conversation_id
+                    WHERE cc.user_uuid IN ({u_ph})
+                    """,
+                    tuple(target_uuids),
+                )
+                await cur.execute(f"DELETE FROM chat_conversations WHERE user_uuid IN ({u_ph})", tuple(target_uuids))
+                await cur.execute(f"UPDATE submissions_logs SET modifier_uuid = NULL WHERE modifier_uuid IN ({u_ph})", tuple(target_uuids))
+                await cur.execute(f"UPDATE merits_log SET modifier_uuid = NULL WHERE modifier_uuid IN ({u_ph})", tuple(target_uuids))
+                await cur.execute(f"DELETE FROM users WHERE uuid IN ({u_ph}) AND is_deleted = TRUE", tuple(target_uuids))
+
+            await conn.commit()
+
+            try:
+                await record_audit_log(
+                    conn=conn,
+                    actor=current_user,
+                    action_type="USER_PURGE",
+                    target_type="TEACHER",
+                    target_id=teacher_id or "ALL",
+                    target_name=f"{len(target_tids)}명의 교원",
+                    details={"purgedCount": len(target_tids), "purged_ids": target_tids},
+                )
+            except Exception:
+                pass
+        except Exception:
+            await conn.rollback()
+            raise
+        finally:
+            await conn.autocommit(True)
+
+    try:
+        for u in target_uuids:
+            await revoke_all_user_tokens(redis, u)
+    except Exception:
+        pass
+
+    return SrFormat(
+        status_code=200,
+        success=True,
+        data={"purgedCount": len(target_tids), "message": f"{len(target_tids)}명의 교원 명단이 영구 삭제되었습니다."},
     ).model_dump()
 
 

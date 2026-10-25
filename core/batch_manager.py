@@ -20,6 +20,32 @@ class BatchTaskManager:
         self._events: Dict[str, asyncio.Event] = {}
         self._ttl_seconds = ttl_seconds
 
+    def _get_redis(self):
+        try:
+            import database
+            return database.redis_client
+        except Exception:
+            return None
+
+    async def _redis_save(self, task_id: str) -> None:
+        redis = self._get_redis()
+        task = self._tasks.get(task_id)
+        if redis and task:
+            try:
+                import json
+                data_str = json.dumps(task, ensure_ascii=False)
+                await redis.set(f"batch_task:{task_id}", data_str, ex=self._ttl_seconds)
+                await redis.publish(f"batch_task_channel:{task_id}", json.dumps(self._task_summary(task), ensure_ascii=False))
+            except Exception:
+                pass
+
+    def _trigger_redis_save(self, task_id: str) -> None:
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(self._redis_save(task_id))
+        except RuntimeError:
+            pass
+
     def create_task(self, mode: str, total_count: int, filename: Optional[str] = None) -> str:
         task_id = f"task_{uuid.uuid4().hex[:12]}"
         self._tasks[task_id] = {
@@ -40,6 +66,7 @@ class BatchTaskManager:
         }
         self._events[task_id] = asyncio.Event()
         self._cleanup_expired_tasks()
+        self._trigger_redis_save(task_id)
         return task_id
 
     def update_progress(
@@ -70,6 +97,7 @@ class BatchTaskManager:
         event = self._events.get(task_id)
         if event:
             event.set()
+        self._trigger_redis_save(task_id)
 
     def complete_task(
         self,
@@ -96,6 +124,7 @@ class BatchTaskManager:
         event = self._events.get(task_id)
         if event:
             event.set()
+        self._trigger_redis_save(task_id)
 
     def fail_task(self, task_id: str, error_msg: str) -> None:
         task = self._tasks.get(task_id)
@@ -109,13 +138,38 @@ class BatchTaskManager:
         event = self._events.get(task_id)
         if event:
             event.set()
+        self._trigger_redis_save(task_id)
 
     def get_task(self, task_id: str) -> Optional[Dict[str, Any]]:
         return self._tasks.get(task_id)
 
+    async def get_task_async(self, task_id: str) -> Optional[Dict[str, Any]]:
+        task = self._tasks.get(task_id)
+        if task:
+            return task
+        redis = self._get_redis()
+        if redis:
+            try:
+                import json
+                raw = await redis.get(f"batch_task:{task_id}")
+                if raw:
+                    task = json.loads(raw)
+                    self._tasks[task_id] = task
+                    return task
+            except Exception:
+                pass
+        return None
+
     async def subscribe_progress(self, task_id: str) -> AsyncGenerator[str, None]:
         """SSE 규격 (data: {JSON}\n\n) 실시간 스트림 생성기"""
-        task = self._tasks.get(task_id)
+        task = await self.get_task_async(task_id)
+        if not task:
+            for _ in range(15):
+                await asyncio.sleep(0.2)
+                task = await self.get_task_async(task_id)
+                if task:
+                    break
+
         if not task:
             import json
             yield f"data: {json.dumps({'error': 'TASK_NOT_FOUND', 'status': 'NOT_FOUND'})}\n\n"
@@ -125,6 +179,48 @@ class BatchTaskManager:
 
         # 최초 상태 즉시 전송
         yield f"data: {json.dumps(self._task_summary(task), ensure_ascii=False)}\n\n"
+
+        if task["status"] in ("COMPLETED", "FAILED"):
+            return
+
+        redis = self._get_redis()
+        if redis:
+            pubsub = None
+            try:
+                pubsub = redis.pubsub()
+                await pubsub.subscribe(f"batch_task_channel:{task_id}")
+                while True:
+                    try:
+                        msg = await asyncio.wait_for(pubsub.get_message(ignore_subscribe_messages=True, timeout=1.0), timeout=3.0)
+                        if msg and msg.get("data"):
+                            yield f"data: {msg['data']}\n\n"
+                            cur_task = await self.get_task_async(task_id)
+                            if cur_task and cur_task["status"] in ("COMPLETED", "FAILED"):
+                                break
+                        else:
+                            yield ": keep-alive\n\n"
+                            cur_task = await self.get_task_async(task_id)
+                            if cur_task:
+                                yield f"data: {json.dumps(self._task_summary(cur_task), ensure_ascii=False)}\n\n"
+                                if cur_task["status"] in ("COMPLETED", "FAILED"):
+                                    break
+                    except asyncio.TimeoutError:
+                        yield ": keep-alive\n\n"
+                        cur_task = await self.get_task_async(task_id)
+                        if cur_task:
+                            yield f"data: {json.dumps(self._task_summary(cur_task), ensure_ascii=False)}\n\n"
+                            if cur_task["status"] in ("COMPLETED", "FAILED"):
+                                break
+            except Exception:
+                pass
+            finally:
+                if pubsub:
+                    try:
+                        await pubsub.unsubscribe(f"batch_task_channel:{task_id}")
+                        await pubsub.aclose()
+                    except Exception:
+                        pass
+            return
 
         while True:
             event = self._events.get(task_id)
@@ -156,6 +252,26 @@ class BatchTaskManager:
 
         output = io.StringIO()
         output.write("\ufeff")  # Excel 한글 깨짐 방지 BOM
+        writer = csv.writer(output)
+        writer.writerow(["행 번호", "성명", "실패 사유"])
+
+        for err in task.get("parsingErrors", []):
+            writer.writerow([
+                err.get("row", "-"),
+                err.get("name", "-"),
+                err.get("reason", "알 수 없는 오류"),
+            ])
+
+        return output.getvalue()
+
+    async def generate_csv_report_async(self, task_id: str) -> str:
+        """실패 행 상세 사유 CSV 리포트 비동기 생성 (Redis 지원)"""
+        task = await self.get_task_async(task_id)
+        if not task:
+            return "\ufeff행 번호,성명,실패 사유\n"
+
+        output = io.StringIO()
+        output.write("\ufeff")
         writer = csv.writer(output)
         writer.writerow(["행 번호", "성명", "실패 사유"])
 

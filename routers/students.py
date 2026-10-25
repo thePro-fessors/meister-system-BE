@@ -485,9 +485,11 @@ async def handle_submit_evidence(
             return error_response(status.HTTP_400_BAD_REQUEST, "VALIDATION_ERROR", "비활성화된 평가 항목에는 증빙자료를 제출할 수 없습니다.")
 
         # DATA-04: 신규 제출은 ACTIVE 상태의 학년도에만 허용 (GRACE_PERIOD는 정산 전용)
-        yr_st = eval_item.get("year_status") or ("ACTIVE" if eval_item.get("year_is_activated") in (1, True, "1") else "CLOSED")
-        if yr_st == "GRACE_PERIOD":
+        is_activated = eval_item.get("year_is_activated") in (1, True, "1")
+        raw_st = eval_item.get("year_status")
+        if raw_st == "GRACE_PERIOD":
             return error_response(status.HTTP_400_BAD_REQUEST, "ACADEMIC_YEAR_GRACE_PERIOD", "해당 학년도는 정산 마감 유예 기간으로, 신규 증빙 제출이 마감되었습니다. 기존 제출 건의 보완만 가능합니다.")
+        yr_st = "ACTIVE" if is_activated else (raw_st or "CLOSED")
         if yr_st != "ACTIVE":
             return error_response(status.HTTP_400_BAD_REQUEST, "ACADEMIC_YEAR_INACTIVE", "현재 운영 중인 활성 학년도에만 신규 증빙자료를 제출할 수 있습니다.")
 
@@ -664,6 +666,20 @@ async def handle_submit_evidence(
                 )
 
             await conn.commit()
+
+            try:
+                from core.audit import record_audit_log
+                await record_audit_log(
+                    conn=conn,
+                    actor=current_user,
+                    action_type="SUBMIT",
+                    target_type="SUBMISSION",
+                    target_id=new_submission_id,
+                    target_name=detail_val or str(new_submission_id),
+                    details={"itemId": item_id_val, "area": area_val, "activityDate": activity_date_val},
+                )
+            except Exception:
+                pass
         except Exception as e:
             await conn.rollback()
             # 트랜잭션 실패 시 방금 생성된 디스크 파일 롤백 삭제 (고아 파일 방지)
