@@ -574,12 +574,12 @@ class TestAuditV2SecurityAndPermissions(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(resp.status_code, 200)
 
-        # all 파라미터 없이 타 학년(2학년) 조회 시 -> 403 차단
+        # all 파라미터 없이 타 학년(2학년) 조회 시에도 전교생 열람 정책에 따라 200 허용
         resp_block = self.client.get(
             "/api/teacher/students?grade=2",
             headers={"Authorization": f"Bearer {token}"},
         )
-        self.assertEqual(resp_block.status_code, 403)
+        self.assertEqual(resp_block.status_code, 200)
 
 
 if __name__ == "__main__":

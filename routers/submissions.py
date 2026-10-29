@@ -10,7 +10,7 @@ import os
 from datetime import date, datetime
 from typing import Any, Dict, Optional, Union
 
-from fastapi import APIRouter, Depends, File, Form, Query, UploadFile
+from fastapi import APIRouter, Depends, File, Form, Query, UploadFile, Request
 from fastapi.responses import JSONResponse
 
 try:
@@ -174,6 +174,9 @@ async def submit_evidence_direct(
 )
 async def resubmit_evidence(
     submission_id: int,
+    request: Request,
+    detail: Optional[str] = Form(None),
+    activity_date: Optional[str] = Form(None),
     description: Optional[str] = Form(None),
     link_url: Optional[str] = Form(None),
     link: Optional[str] = Form(None),
@@ -216,7 +219,7 @@ async def resubmit_evidence(
             try:
                 await cur.execute(
                     """
-                    SELECT s.submission_id, s.student_id, s.status_code, s.granted_score, s.file_path, s.link_url, s.description, st.uuid,
+                    SELECT s.submission_id, s.student_id, s.status_code, s.granted_score, s.file_path, s.link_url, s.description, s.detail, s.activity_date, st.uuid,
                            ay.status AS year_status, ay.is_activated AS year_is_activated
                     FROM submissions s
                     JOIN students st ON s.student_id = st.student_id
@@ -232,7 +235,7 @@ async def resubmit_evidence(
             except Exception:
                 await cur.execute(
                     """
-                    SELECT s.submission_id, s.student_id, s.status_code, s.granted_score, s.file_path, s.link_url, s.description, st.uuid
+                    SELECT s.submission_id, s.student_id, s.status_code, s.granted_score, s.file_path, s.link_url, s.description, s.detail, s.activity_date, st.uuid
                     FROM submissions s
                     JOIN students st ON s.student_id = st.student_id
                     WHERE s.submission_id = %s AND s.is_deleted = FALSE
@@ -270,9 +273,24 @@ async def resubmit_evidence(
                 if len(raw_link) > 500:
                     return error_response(400, "VALIDATION_ERROR", "외부 링크는 최대 500자까지 입력 가능합니다.")
 
-        raw_desc = (description or "").strip()
+        req_json: Dict[str, Any] = {}
+        content_type = request.headers.get("content-type", "")
+        if "application/json" in content_type:
+            try:
+                req_json = await request.json()
+            except Exception:
+                req_json = {}
+
+        final_detail = detail or req_json.get("detail")
+        final_act_date = activity_date or req_json.get("activity_date") or req_json.get("activityDate")
+        final_desc = description or req_json.get("description")
+        final_link = link_url or link or req_json.get("link_url") or req_json.get("link")
+
+        raw_desc = (final_desc or "").strip()
         new_desc = raw_desc if raw_desc else existing["description"]
-        target_link = (link_url or link or "").strip() or existing["link_url"]
+        target_link = (final_link or "").strip() or existing["link_url"]
+        new_detail = (final_detail or "").strip() or existing.get("detail")
+        new_act_date = (final_act_date or "").strip() or existing.get("activity_date")
         old_file_path = existing["file_path"]
 
         new_file_path = old_file_path
@@ -292,7 +310,9 @@ async def resubmit_evidence(
                 await cur.execute(
                     """
                     UPDATE submissions
-                    SET description = %s,
+                    SET detail = COALESCE(%s, detail),
+                        activity_date = COALESCE(%s, activity_date),
+                        description = %s,
                         file_path = %s,
                         original_filename = COALESCE(%s, original_filename),
                         link_url = %s,
@@ -304,7 +324,7 @@ async def resubmit_evidence(
                         updated_at = NOW()
                     WHERE submission_id = %s AND status_code IN (4, 5)
                     """,
-                    (new_desc, new_file_path, new_orig_filename, target_link, submission_id),
+                    (new_detail, new_act_date, new_desc, new_file_path, new_orig_filename, target_link, submission_id),
                 )
 
                 if cur.rowcount == 0:

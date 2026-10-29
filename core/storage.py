@@ -35,6 +35,12 @@ ALLOWED_EXTENSIONS: Set[str] = {
     # 문서 및 압축
     ".pdf",
     ".zip",
+    ".hwp",
+    ".hwpx",
+    ".docx",
+    ".xlsx",
+    ".pptx",
+    ".txt",
 }
 
 # 최대 허용 파일 용량: 50MB (52,428,800 Bytes)
@@ -158,6 +164,12 @@ MAGIC_BYTES_SIGNATURES: Dict[str, List[bytes]] = {
     ".webp": [],  # RIFF 컨테이너 내 WEBP 청크 12바이트 필수 검증 (OPS-03)
     ".pdf": [b"%PDF-"],
     ".zip": [b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08"],
+    ".hwp": [b"\xD0\xCF\x11\xE0\xA1\xB1\x1A\xE1"],
+    ".hwpx": [b"PK\x03\x04"],
+    ".docx": [b"PK\x03\x04"],
+    ".xlsx": [b"PK\x03\x04"],
+    ".pptx": [b"PK\x03\x04"],
+    ".txt": [],
     # MP4 / MOV (ISO Base Media file: ....ftyp)
     ".mp4": [b"ftyp"],
     ".mov": [b"ftyp", b"moov", b"free", b"mdat", b"wide"],

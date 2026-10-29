@@ -276,18 +276,38 @@ async def seed_data(
                 ]
 
                 for t in sample_teachers:
-                    await cur.execute("SELECT teachers_id FROM teachers WHERE email = %s", (t["email"],))
-                    row = await cur.fetchone()
-                    if not row:
-                        t_uuid = str(uuid.uuid4())
+                    # 1) 유저 계정 확인 및 갱신/생성
+                    await cur.execute("SELECT uuid FROM users WHERE id = %s", (t["id"],))
+                    u_row = await cur.fetchone()
+                    if u_row:
+                        t_uuid = u_row["uuid"]
                         await cur.execute(
-                            """
-                            INSERT INTO users (id, password, role, uuid)
-                            VALUES (%s, %s, 1, %s)
-                            ON DUPLICATE KEY UPDATE password = VALUES(password)
-                            """,
-                            (t["id"], hash_password(teacher_pass), t_uuid),
+                            "UPDATE users SET password = %s, role = 1 WHERE uuid = %s",
+                            (hash_password(teacher_pass), t_uuid),
                         )
+                    else:
+                        await cur.execute("SELECT uuid FROM users WHERE email = %s", (t["email"],))
+                        u_by_email = await cur.fetchone()
+                        if u_by_email:
+                            t_uuid = u_by_email["uuid"]
+                            await cur.execute(
+                                "UPDATE users SET id = %s, password = %s, role = 1 WHERE uuid = %s",
+                                (t["id"], hash_password(teacher_pass), t_uuid),
+                            )
+                        else:
+                            t_uuid = str(uuid.uuid4())
+                            await cur.execute(
+                                "INSERT INTO users (id, password, role, uuid) VALUES (%s, %s, 1, %s)",
+                                (t["id"], hash_password(teacher_pass), t_uuid),
+                            )
+
+                    # 2) 교사 프로필 확인 및 갱신/생성
+                    await cur.execute(
+                        "SELECT teachers_id FROM teachers WHERE uuid = %s OR email = %s LIMIT 1",
+                        (t_uuid, t["email"]),
+                    )
+                    t_row = await cur.fetchone()
+                    if not t_row:
                         await cur.execute(
                             """
                             INSERT INTO teachers (name, subject, position, department, grade, class, email, uuid)
@@ -298,16 +318,12 @@ async def seed_data(
                         print(f"  [+] 교사 생성: ID='{t['id']}', 성명='{t['name']}', 직책='{t['position']}', 담당='{t['grade'] or '전'}학년 {t['class'] or '전'}반'")
                     else:
                         await cur.execute(
-                            "UPDATE users SET password = %s WHERE id = %s",
-                            (hash_password(teacher_pass), t["id"]),
-                        )
-                        await cur.execute(
                             """
                             UPDATE teachers 
-                            SET name = %s, subject = %s, position = %s, department = %s, grade = %s, class = %s
-                            WHERE email = %s
+                            SET name = %s, subject = %s, position = %s, department = %s, grade = %s, class = %s, email = %s, uuid = %s
+                            WHERE teachers_id = %s
                             """,
-                            (t["name"], t["subject"], t["position"], t["department"], t["grade"], t["class"], t["email"]),
+                            (t["name"], t["subject"], t["position"], t["department"], t["grade"], t["class"], t["email"], t_uuid, t_row["teachers_id"]),
                         )
                         print(f"  [*] 교사 갱신: ID='{t['id']}', 성명='{t['name']}' ({t['position']})")
 
@@ -334,18 +350,38 @@ async def seed_data(
                 ]
 
                 for s in sample_students:
-                    await cur.execute("SELECT student_id FROM students WHERE email = %s", (s["email"],))
+                    # 1) 유저 계정 확인 및 갱신/생성
+                    await cur.execute("SELECT uuid FROM users WHERE id = %s", (s["id"],))
+                    u_row = await cur.fetchone()
+                    if u_row:
+                        s_uuid = u_row["uuid"]
+                        await cur.execute(
+                            "UPDATE users SET password = %s, role = 0 WHERE uuid = %s",
+                            (hash_password(student_pass), s_uuid),
+                        )
+                    else:
+                        await cur.execute("SELECT uuid FROM users WHERE email = %s", (s["email"],))
+                        u_by_email = await cur.fetchone()
+                        if u_by_email:
+                            s_uuid = u_by_email["uuid"]
+                            await cur.execute(
+                                "UPDATE users SET id = %s, password = %s, role = 0 WHERE uuid = %s",
+                                (s["id"], hash_password(student_pass), s_uuid),
+                            )
+                        else:
+                            s_uuid = str(uuid.uuid4())
+                            await cur.execute(
+                                "INSERT INTO users (id, password, role, uuid) VALUES (%s, %s, 0, %s)",
+                                (s["id"], hash_password(student_pass), s_uuid),
+                            )
+
+                    # 2) 학생 프로필 확인 및 갱신/생성
+                    await cur.execute(
+                        "SELECT student_id FROM students WHERE uuid = %s OR email = %s LIMIT 1",
+                        (s_uuid, s["email"]),
+                    )
                     st_row = await cur.fetchone()
                     if not st_row:
-                        s_uuid = str(uuid.uuid4())
-                        await cur.execute(
-                            """
-                            INSERT INTO users (id, password, role, uuid)
-                            VALUES (%s, %s, 0, %s)
-                            ON DUPLICATE KEY UPDATE password = VALUES(password)
-                            """,
-                            (s["id"], hash_password(student_pass), s_uuid),
-                        )
                         await cur.execute(
                             """
                             INSERT INTO students (name, email, uuid)
@@ -354,6 +390,26 @@ async def seed_data(
                             (s["name"], s["email"], s_uuid),
                         )
                         st_id = cur.lastrowid
+                        print(f"  [+] 학생 생성: ID='{s['id']}', 성명='{s['name']}', 학적='{s['grade']}학년 {s['class']}반 {s['number']}번'")
+                    else:
+                        st_id = st_row["student_id"]
+                        await cur.execute(
+                            """
+                            UPDATE students 
+                            SET name = %s, email = %s, uuid = %s
+                            WHERE student_id = %s
+                            """,
+                            (s["name"], s["email"], s_uuid, st_id),
+                        )
+                        print(f"  [*] 학생 갱신: ID='{s['id']}', 성명='{s['name']}' ({s['grade']}학년 {s['class']}반 {s['number']}번)")
+
+                    # 3) 학적 레코드 확인 및 갱신/생성
+                    await cur.execute(
+                        "SELECT record_id FROM student_academic_records WHERE student_id = %s AND year_id = %s LIMIT 1",
+                        (st_id, year_id),
+                    )
+                    sar_row = await cur.fetchone()
+                    if not sar_row:
                         await cur.execute(
                             """
                             INSERT INTO student_academic_records (student_id, year_id, grade, class, number)
@@ -361,22 +417,15 @@ async def seed_data(
                             """,
                             (st_id, year_id, s["grade"], s["class"], s["number"]),
                         )
-                        print(f"  [+] 학생 생성: ID='{s['id']}', 성명='{s['name']}', 학적='{s['grade']}학년 {s['class']}반 {s['number']}번'")
                     else:
-                        st_id = st_row["student_id"]
-                        await cur.execute(
-                            "UPDATE users SET password = %s WHERE id = %s",
-                            (hash_password(student_pass), s["id"]),
-                        )
                         await cur.execute(
                             """
                             UPDATE student_academic_records 
                             SET grade = %s, class = %s, number = %s
-                            WHERE student_id = %s AND year_id = %s
+                            WHERE record_id = %s
                             """,
-                            (s["grade"], s["class"], s["number"], st_id, year_id),
+                            (s["grade"], s["class"], s["number"], sar_row["record_id"]),
                         )
-                        print(f"  [*] 학생 갱신: ID='{s['id']}', 성명='{s['name']}' ({s['grade']}학년 {s['class']}반 {s['number']}번)")
             else:
                 print("\n[4/4] 샘플 데이터 주입 건너뜀 (필요 시 --with-sample-data 옵션 사용)")
 
@@ -397,7 +446,7 @@ async def seed_data(
 def main():
     parser = argparse.ArgumentParser(description="마이스터역량인증제 초기 데이터 시드 주입")
     parser.add_argument("--admin-id", default=os.getenv("ADMIN_ID", "admin"), help="최초 관리자 아이디 (기본: admin)")
-    parser.add_argument("--admin-pass", default=os.getenv("ADMIN_PASSWORD", "admin1234!"), help="최초 관리자 비밀번호")
+    parser.add_argument("--admin-pass", default=os.getenv("ADMIN_PASSWORD", "admin123!"), help="최초 관리자 비밀번호 (기본: admin123!)")
     parser.add_argument("--teacher-pass", default=os.getenv("TEACHER_PASSWORD", "password123!"), help="샘플 교사 비밀번호")
     parser.add_argument("--student-pass", default=os.getenv("STUDENT_PASSWORD", "password123!"), help="샘플 학생 비밀번호")
     parser.add_argument("--year", type=int, default=2026, help="최초 활성화 학년도 (기본: 2026)")

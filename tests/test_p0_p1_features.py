@@ -371,13 +371,13 @@ class TestP0P1Features(unittest.TestCase):
         self.assertEqual(res_subs.status_code, 403)
         self.assertEqual(res_subs.json()["error"]["code"], "FORBIDDEN")
 
-        # 3. 상벌점 내역 조회 차단
+        # 3. 상벌점 내역 조회 허용 (모든 교사 전교생 상벌점 조회 및 부여 허용 정책)
         res_pts = self.client.get(
             "/api/points?studentId=2&year=2026",
             headers={"Authorization": f"Bearer {self.token_teacher10}"},
         )
-        self.assertEqual(res_pts.status_code, 403)
-        self.assertEqual(res_pts.json()["error"]["code"], "FORBIDDEN")
+        self.assertEqual(res_pts.status_code, 200)
+        self.assertTrue(res_pts.json()["success"])
 
     def test_homeroom_teacher_own_student_allowed(self):
         """[SEC-01] 1-1 담임교사가 1-1 학생(홍길동, student_id=1)의 리소스 조회 허용(200)"""
@@ -471,7 +471,8 @@ class TestP0P1Features(unittest.TestCase):
             },
             headers={"Authorization": f"Bearer {self.token_teacher10}"},
         )
-        self.assertEqual(res_cross_point.status_code, 403)
+        self.assertEqual(res_cross_point.status_code, 201)
+        self.assertTrue(res_cross_point.json()["success"])
 
     # ==========================================================================
     # 5. API-03: 학년도 및 평가 기준 관리 API

@@ -329,8 +329,8 @@ class TestTeacherStudentsAPI(unittest.TestCase):
         self.assertEqual(st2["pendingCount"], 0)
         self.assertEqual(st2["pointTotal"], 0.0)
 
-    def test_homeroom_scope_bypass_blocked(self):
-        """담임교사(2-3)가 쿼리 파라미터로 타 학급(grade=1) 요청 시 우회 차단(403 FORBIDDEN) 검증"""
+    def test_homeroom_scope_cross_class_allowed(self):
+        """담임교사(2-3)가 쿼리 파라미터로 타 학급(grade=1) 요청 시 200 OK 정상 조회 검증"""
         token = create_access_token(data={"uuid": "teacher-uuid-10", "id": "teacher10", "role": "teacher"})
         cursor = TeacherStudentsMockCursor(teacher_row=self.teacher_homeroom)
         app.dependency_overrides[get_db] = lambda: TeacherStudentsMockConnection(cursor)
@@ -339,15 +339,15 @@ class TestTeacherStudentsAPI(unittest.TestCase):
             "/api/teacher/students?grade=1",
             headers={"Authorization": f"Bearer {token}"},
         )
-        self.assertEqual(resp.status_code, 403)
-        self.assertEqual(resp.json()["error"]["code"], "FORBIDDEN")
+        self.assertEqual(resp.status_code, 200)
+        self.assertTrue(resp.json()["success"])
 
         resp_class = self.client.get(
             "/api/teacher/students?classNo=2",
             headers={"Authorization": f"Bearer {token}"},
         )
-        self.assertEqual(resp_class.status_code, 403)
-        self.assertEqual(resp_class.json()["error"]["code"], "FORBIDDEN")
+        self.assertEqual(resp_class.status_code, 200)
+        self.assertTrue(resp_class.json()["success"])
 
     def test_admin_custom_filtering(self):
         """관리자 권한으로 타 학급(1학년 1반) 학생 검색 및 복수형 URL(/api/teachers/students) 검증"""

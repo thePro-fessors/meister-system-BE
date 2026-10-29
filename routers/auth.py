@@ -486,7 +486,7 @@ async def login(
         elif teacher_pos == "부서부장" and teacher_dept in ("마이스터부", "교무기획부"):
             teacher_duty = "vice_principal"
             teacher_scope = {"schoolWide": True}
-        elif teacher_pos in ("정담임", "임시담임"):
+        elif teacher_pos in ("담임", "정담임", "임시담임"):
             teacher_duty = "homeroom"
             teacher_scope = {"classrooms": [homeroom_str]} if homeroom_str else None
         elif teacher_pos == "부담임":
@@ -644,7 +644,7 @@ async def get_my_info(
         elif t_pos == "부서부장" and t_dept in ("마이스터부", "교무기획부"):
             t_duty = "vice_principal"
             t_scope = {"schoolWide": True}
-        elif t_pos in ("정담임", "임시담임"):
+        elif t_pos in ("담임", "정담임", "임시담임"):
             t_duty = "homeroom"
             t_scope = {"classrooms": [f"{t_grade}-{t_class}"]} if (t_grade and t_class) else None
         elif t_pos == "부담임":

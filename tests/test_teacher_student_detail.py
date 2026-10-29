@@ -256,24 +256,24 @@ class TestTeacherStudentDetailAPI(unittest.TestCase):
         self.assertEqual(resp.status_code, 404)
         self.assertEqual(resp.json()["error"]["code"], "USER_NOT_FOUND")
 
-    def test_homeroom_teacher_cross_grade_blocked(self):
-        """담임교사(2학년 3반)가 타 학년(1학년 1반) 학생 상세 조회 시 403 FORBIDDEN 차단 검증"""
+    def test_homeroom_teacher_cross_grade_allowed(self):
+        """담임교사(2학년 3반)가 타 학년(1학년 1반) 학생 상세 조회 시 200 OK 정상 허용 검증"""
         token = create_access_token(data={"uuid": "teacher-uuid-10", "id": "teacher10", "role": "teacher"})
         cursor = TeacherStudentDetailMockCursor(
             teacher_row=self.teacher_homeroom,
             student_row=self.student_1_1,
             academic_record=self.academic_record_1_1,
             year_id=101,
+            areas=self.areas_fixture,
         )
         app.dependency_overrides[get_db] = lambda: TeacherStudentDetailMockConnection(cursor)
 
         resp = self.client.get("/api/teacher/students/2", headers={"Authorization": f"Bearer {token}"})
-        self.assertEqual(resp.status_code, 403)
-        self.assertEqual(resp.json()["error"]["code"], "FORBIDDEN")
-        self.assertIn("담당 학급", resp.json()["error"]["message"])
+        self.assertEqual(resp.status_code, 200)
+        self.assertTrue(resp.json()["success"])
 
-    def test_homeroom_teacher_cross_class_blocked(self):
-        """담임교사(2학년 3반)가 같은 학년 타 학급(2학년 1반) 학생 상세 조회 시 403 FORBIDDEN 차단 검증"""
+    def test_homeroom_teacher_cross_class_allowed(self):
+        """담임교사(2학년 3반)가 같은 학년 타 학급(2학년 1반) 학생 상세 조회 시 200 OK 정상 허용 검증"""
         token = create_access_token(data={"uuid": "teacher-uuid-10", "id": "teacher10", "role": "teacher"})
         student_2_1 = {"student_id": 3, "uuid": "st-3", "name": "홍길동", "email": "st3@school.hs.kr", "is_deleted": False}
         academic_2_1 = {"grade": 2, "class_no": 1, "number": 10}
@@ -283,12 +283,13 @@ class TestTeacherStudentDetailAPI(unittest.TestCase):
             student_row=student_2_1,
             academic_record=academic_2_1,
             year_id=101,
+            areas=self.areas_fixture,
         )
         app.dependency_overrides[get_db] = lambda: TeacherStudentDetailMockConnection(cursor)
 
         resp = self.client.get("/api/teacher/students/3", headers={"Authorization": f"Bearer {token}"})
-        self.assertEqual(resp.status_code, 403)
-        self.assertEqual(resp.json()["error"]["code"], "FORBIDDEN")
+        self.assertEqual(resp.status_code, 200)
+        self.assertTrue(resp.json()["success"])
 
     def test_homeroom_teacher_own_student_success(self):
         """담임교사(2학년 3반)가 본인 학급 학생(2학년 3반) 상세 정상 조회 (200 OK, 영역별 점수/등급 및 제출목록 반환)"""

@@ -602,20 +602,19 @@ async def get_teacher_students(
 
     allow_cross_class = is_admin or is_dept_head or (scope in ("all", "school")) or (all is True)
 
-    if is_grade_head and not allow_cross_class:
-        if grade is not None and grade != teacher_grade:
-            return error_response(status.HTTP_403_FORBIDDEN, "FORBIDDEN", f"{teacher_grade}학년 학생의 데이터만 조회할 수 있습니다.")
-        target_grade = teacher_grade
+    if grade is not None or req_class is not None or allow_cross_class:
+        # 특정 학년/반을 지정하거나 전체 조회 요청 시 모든 교사에게 자유로운 조회 허용
+        target_grade = grade
         target_class = req_class
-    elif has_homeroom and not allow_cross_class:
-        # 클라이언트가 본인 담임 학급 이외의 학년 또는 반을 지정하여 우회 조회를 시도하는 경우 403 Forbidden 차단
-        if (grade is not None and grade != teacher_grade) or (req_class is not None and req_class != teacher_class):
-            return error_response(status.HTTP_403_FORBIDDEN, "FORBIDDEN", "담당 학급 외의 학생 목록은 조회할 수 없습니다.")
+    elif is_grade_head:
+        target_grade = teacher_grade
+        target_class = None
+    elif has_homeroom:
         target_grade = teacher_grade
         target_class = teacher_class
     else:
-        target_grade = grade
-        target_class = req_class
+        target_grade = None
+        target_class = None
 
     # 5. 학생 학적 기본 정보 조회
     student_sql = """
@@ -977,13 +976,7 @@ async def get_teacher_student_detail(
     st_class = academic_record["class_no"]
     st_number = academic_record["number"]
 
-    # 5. 담임/학년부장 권한 범위 검증 (Scope Isolation & IDOR 방어)
-    if is_grade_head:
-        if st_grade != teacher_grade:
-            return error_response(status.HTTP_403_FORBIDDEN, "FORBIDDEN", f"{teacher_grade}학년 학생만 상세 조회할 수 있습니다.")
-    elif has_homeroom:
-        if st_grade != teacher_grade or st_class != teacher_class:
-            return error_response(status.HTTP_403_FORBIDDEN, "FORBIDDEN", "담당 학급 학생만 상세 조회할 수 있습니다.")
+    # 5. 모든 교사 전교생 열람 허용 (교사 및 관리자는 전교생 상세 조회 가능)
 
     # 6. 대상 학년/학년도 인증 영역, 학생 제출건, 상벌점 조회
     async with conn.cursor(cursor=DictCursor) as cur:

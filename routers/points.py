@@ -412,11 +412,11 @@ async def update_point(
             await record_audit_log(
                 conn=conn,
                 actor=current_user,
-                action_type="POINT_DELETE",
+                action_type="POINT_MODIFY",
                 target_type="MERIT",
                 target_id=point_id,
-                target_name=f"{existing['type']} {existing['points']}점 삭제",
-                details={"student_id": existing["student_id"], "points": existing["points"], "reason": del_reason},
+                target_name=f"{new_type} {new_points}점 수정",
+                details={"student_id": existing["student_id"], "old_points": old_points, "new_points": new_points, "reason": new_reason},
             )
         except Exception:
             pass

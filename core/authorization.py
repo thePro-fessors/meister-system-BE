@@ -229,12 +229,9 @@ async def authorize_student_access(
         t_department = (t_row.get("department") or "").strip()
         t_subject = (t_row.get("subject") or "").strip()
 
-        # [정책 1] 상벌점 관리(manage_points 및 read_points):
-        # 교무분장 체계: 직책(position) 또는 부서(department)가 부여된 교사(또는 비담임 교과교사)는 전교생 상벌점 관리 허용
-        # 직책/부서가 미지정된 레거시 담임교사는 담임 학급 스코프 격리 유지
+        # [정책 1] 모든 교사에게 전교생 상벌점 부여 및 조회 허용
         if action in ("manage_points", "read_points"):
-            if t_position or t_department or (t_grade is None and t_class is None):
-                return None
+            return None
 
         # [정책 2] 총괄 부서장: 전교생 접근 허용
         if t_position == "부서부장" and t_department in ("마이스터부", "교무기획부"):

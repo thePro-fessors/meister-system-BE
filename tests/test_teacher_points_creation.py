@@ -251,15 +251,15 @@ class TestTeacherPointsCreationAPI(unittest.TestCase):
         self.assertEqual(res.status_code, 403)
         self.assertEqual(res.json()["error"]["code"], "FORBIDDEN")
 
-    def test_cross_class_teacher_cannot_create_point_forbidden(self):
-        """타 학급 담임교사(2-3)가 1-1 학생에게 상벌점 등록 시도 시 403 FORBIDDEN 차단 (Scope Isolation)"""
+    def test_cross_class_teacher_can_create_point_success(self):
+        """타 학급 담임교사(2-3)가 1-1 학생에게 상벌점 등록 시 201 CREATED 정상 성공 (전교생 부여 허용)"""
         res = self.client.post(
             "/api/points",
             json={"studentId": 1, "type": "상점", "score": 5.0, "reason": "타학급 학생 상점 부여 시도"},
             headers={"Authorization": f"Bearer {self.token_other_teacher}"},
         )
-        self.assertEqual(res.status_code, 403)
-        self.assertEqual(res.json()["error"]["code"], "FORBIDDEN")
+        self.assertEqual(res.status_code, 201)
+        self.assertTrue(res.json()["success"])
 
     def test_missing_student_id_validation_error(self):
         """학생 식별자(studentId) 누락 시 400 VALIDATION_ERROR 거절"""
