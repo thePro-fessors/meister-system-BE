@@ -449,3 +449,16 @@ CREATE INDEX idx_submissions_status_review_perf
 
 CREATE INDEX idx_sar_year_grade_class_perf
   ON student_academic_records (year_id, grade, class);
+
+-- ============================================================================
+-- 초기 기본 관리자 계정 시드 (최초 Docker 기동 시 1회 생성)
+-- ID: admin / PW: admin123! (bcrypt rounds=12)
+-- ============================================================================
+INSERT INTO users (uuid, id, password, email, role)
+VALUES ('00000000-0000-0000-0000-000000000001', 'admin', '$2b$12$NZeM4CUITKDgTpiXZez2k.DxVFux/6i9hDz5CgIAbt52B7Mrk.s2O', 'admin@bssm.hs.kr', 2)
+ON DUPLICATE KEY UPDATE id = VALUES(id);
+
+INSERT INTO teachers (uuid, name, email, department, position, grade, class, is_deleted)
+VALUES ('00000000-0000-0000-0000-000000000001', '관리자', 'admin@bssm.hs.kr', '마이스터부', '부서부장', 0, 0, FALSE)
+ON DUPLICATE KEY UPDATE name = VALUES(name);
+
